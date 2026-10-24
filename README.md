@@ -3,7 +3,6 @@
 这个 APK 是从各机型「OpenWrt 一键刷入包」移植来的手机版安装器。在手机上选择完整安装包 ZIP，APK 会先校验、再提取安装文件，然后调用安装包自带的设备端脚本完成安装，全程不需要电脑。
 
 - APK：`dist/OpenWrt-Installer-Android-1.3.0.apk`（包名 `top.linote.owrtinstaller`，Android 8.0+，versionCode 4，签名与之前各版相同，可以直接覆盖升级）
-- **尚未在真机上验证**，详见文末「验证情况」。
 
 ## 1.3.0：USB 有线连接、关于页、适配更多机型
 
