@@ -50,11 +50,17 @@ final class JobManager {
 
     /** Install methods, as in the desktop installer menu (TF = 1, PART = 2, IMAGE = 7). */
     enum Method {
-        TF("TF 卡安装", "清空所选 TF 卡并写入 OpenWrt；内部存储与 Android 数据不变"),
-        PART("缩容 userdata 安装", "保留 Android 数据：下次启动时离线缩小 userdata，新建 e5root 分区写入 OpenWrt（仅限未加密 userdata）"),
-        IMAGE("userdata 镜像安装【实验性】", "在 /data/e5linux 中创建 openwrt.ext4 镜像，不格式化 userdata（仅限未加密 userdata）");
-        final String title, summary;
-        Method(String t, String s) { title = t; summary = s; }
+        TF("TF 卡安装", "清空所选 TF 卡并写入 OpenWrt；内部存储与 Android 数据不变",
+                "TF 卡安装", "清空所选 TF 卡并写入 OpenWrt；内部存储与 Android 数据不变"),
+        PART("缩容 userdata 安装", "保留 Android 数据：下次启动时离线缩小 userdata，新建 e5root 分区写入 OpenWrt（仅限未加密 userdata）",
+                "独立内置分区安装", "优先使用 eMMC 未分配空间（不动 Android 数据）；空间不够时离线缩小 userdata 并保留数据"
+                        + "（仅限未加密 userdata），首次开机自动重启一次"),
+        IMAGE("userdata 镜像安装【实验性】", "在 /data/e5linux 中创建 openwrt.ext4 镜像，不格式化 userdata（仅限未加密 userdata）",
+                "userdata 镜像安装【实验性】", "在 /data/mu300linux 中创建 OpenWrt 镜像，不格式化 userdata（仅限未加密）；可能损坏 Android 的 F2FS 文件系统"),
+        REPART("重装已有内置分区【高级】", "",
+                "重装已有内置分区【高级】", "清空已有的 mu300root 分区（含 OpenWrt 设置）并重新写入；不改分区表，不动 Android 数据");
+        final String title, summary, muTitle, muSummary;
+        Method(String t, String s, String mt, String ms) { title = t; summary = s; muTitle = mt; muSummary = ms; }
     }
 
     static final class Device {
@@ -105,6 +111,10 @@ final class JobManager {
     long udataMib, usedMib, freeMib, rangeMin, rangeMax, rangeDefault;
     long chosenMib;
     boolean growFs = true;
+    // MU300 internal-storage methods (ported computer-side flows)
+    Mu300Internal.Plan muPlan;
+    Mu300Internal.Outcome muOutcome;
+    String muBackup;
     String lastJob = "none";       // none | running | done N | lost
     String hotspot;                // "SSID / key" from the installer log
     boolean installOk;
@@ -160,14 +170,39 @@ final class JobManager {
 
     boolean packageReady() { return pkg != null && pkg.fingerprint.equals(stagedFingerprint); }
     private String checkKey() { return pkg == null ? null : pkg.fingerprint + ":" + method.name(); }
-    boolean checkPassed() { return packageReady() && checkKey() != null && checkKey().equals(checkedFingerprint); }
+    boolean checkPassed() {
+        return (packageReady() || (muInternal(method) && muLocalReady())) && checkKey() != null && checkKey().equals(checkedFingerprint);
+    }
+
+    /** MU300 internal-storage methods run the ported computer-side flow from the app-side copy. */
+    boolean muInternal(Method m) { return m != Method.TF && pkg != null && pkg.isMu300(); }
+    File muLocal() { return new File(app.getFilesDir(), "mu300-local"); }
+    boolean muLocalReady() {
+        if (pkg == null) return false;
+        File f = new File(muLocal(), "FINGERPRINT");
+        try { return f.isFile() && new String(Mu300Internal.readAll(f), java.nio.charset.StandardCharsets.UTF_8).trim().equals(pkg.fingerprint); }
+        catch (IOException e) { return false; }
+    }
+    String titleOf(Method m) { return pkg != null && pkg.isMu300() ? m.muTitle : m.title; }
+    String summaryOf(Method m) { return pkg != null && pkg.isMu300() ? m.muSummary : m.summary; }
+    /** PART on MU300: true when the chosen size fits unallocated eMMC space (no shrink). */
+    boolean muUsesFree() { return muPlan != null && Mu300Internal.usesFreeSpace(muPlan, chosenMib); }
+    /** PART on MU300 with shrinking: userdata size after the offline shrink, or -1. */
+    long muShrinkTargetMib(long mib) {
+        if (muPlan == null) return -1;
+        try { return Mu300Gpt.allocation(muPlan.s.size, mib)[0] / 2048; } catch (IllegalArgumentException e) { return -1; }
+    }
     boolean localCopyAvailable() {
         return new File(localPkgDir(), "files/magisk-tf-install.sh").isFile()
                 || new File(localPkgDir(), "payload/tf-install-worker.sh").isFile();
     }
 
-    /** MU300 packages only port the package's own TF worker. */
-    boolean methodAllowed(Method m) { return m == Method.TF || pkg == null || !pkg.tfOnly; }
+    boolean methodAllowed(Method m) {
+        if (m == Method.TF) return true;
+        if (pkg == null) return m != Method.REPART;
+        if (pkg.isMu300()) return pkg.internalProblem == null;
+        return m != Method.REPART && !pkg.tfOnly;
+    }
 
     String adminUrl() { return pkg != null ? pkg.adminUrl : "http://192.168.9.1"; }
     String logDir() { return pkg != null ? pkg.logDir : "/data/adb/e5-tf-install"; }
@@ -193,6 +228,7 @@ final class JobManager {
     }
 
     private void clearDataCheck() {
+        muPlan = null;
         dataNode = crypto = null;
         udataMib = usedMib = freeMib = rangeMin = rangeMax = rangeDefault = chosenMib = 0;
     }
@@ -200,12 +236,12 @@ final class JobManager {
     void setMethod(Method m) {
         if (busy != null) { append("正在执行：" + busy + "，完成后再切换安装方式"); return; }
         if (method == m) return;
-        if (!methodAllowed(m)) { append("该安装包（" + pkg.title + "）只支持 TF 卡安装"); changed(); return; }
+        if (!methodAllowed(m)) { append("该安装包（" + (pkg != null ? pkg.title : "?") + "）不提供“" + titleOf(m) + "”"); changed(); return; }
         method = m;
         checkedFingerprint = null;
         checkTarget = checkCard = null;
         clearDataCheck();
-        append("安装方式：" + m.title + "（需要重新做只读检查）");
+        append("安装方式：" + titleOf(m) + "（需要重新做只读检查）");
         changed();
     }
 
@@ -574,18 +610,184 @@ final class JobManager {
             append("  已提取安装文件 " + r.extractedFiles + " 个，共 " + mib(r.extractedBytes)
                     + (r.prefix.isEmpty() ? "" : "（包目录 " + r.prefix + "）"));
             for (String w : r.warnings) append("  提示：" + w);
+            if (r.isMu300()) prepareMu300Internal(r);
             append("  版本：" + r.version + "；适用机型：" + r.title + " " + r.androidModels + "（profile " + r.profile
                     + (r.board != null ? "，主板 " + r.board : "") + (r.unlockRequired ? "，需已解锁" : "，不要求 orange") + "）");
-            if (r.tfOnly && method != Method.TF) {
+            if (!methodAllowed(method)) {
                 method = Method.TF;
                 checkedFingerprint = null;
                 clearDataCheck();
-                append("  该安装包只支持 TF 卡安装，已切换到“" + Method.TF.title + "”");
+                append("  该安装包不提供之前选择的安装方式，已切换到“" + Method.TF.title + "”");
             }
             String why = problemFor(r, target());
             if (why != null) append("✗ " + why + "：安装包脚本会拒绝安装。不要跨机型刷入。");
             changed();
         });
+    }
+
+    /** Builds the app-side copy for the MU300 internal methods; TF stays available if this fails. */
+    private void prepareMu300Internal(PackageInspector.Result r) {
+        File out = muLocal();
+        PackageInspector.deleteTree(out);
+        if (r.internalProblem == null) {
+            append("  准备内置存储安装文件（按原安装器剔除构建机基带运行时与非公开固件，并试生成启动镜像）……");
+            try {
+                Mu300Internal.prepareLocal(localPkgDir(), r.internalSrc, out, r.listedMap, (what, pct) -> {
+                    if (pct != progress) { progress = pct; lastLine = what + " " + pct + "%"; changed(); }
+                });
+                Mu300Internal.writeAll(new File(out, "FINGERPRINT"), (r.fingerprint + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                append("  ✓ 内置存储安装文件已就绪（启动镜像生成自检通过，未连接任何设备）");
+            } catch (IOException | RuntimeException e) {
+                PackageInspector.deleteTree(out);
+                r.internalProblem = "内置安装文件准备失败：" + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
+            } catch (OutOfMemoryError e) {
+                PackageInspector.deleteTree(out);
+                r.internalProblem = "内存不足，无法生成启动镜像";
+            }
+        }
+        if (r.internalSrc != null) PackageInspector.deleteTree(r.internalSrc);
+        progress = -1;
+        r.tfOnly = r.internalProblem != null;
+        if (r.internalProblem != null) append("  提示：内置存储安装不可用（" + r.internalProblem + "），只能用 TF 卡安装");
+        else append("  可用安装方式：TF 卡 / 独立内置分区 / 重装已有内置分区 / userdata 镜像（实验性）");
+    }
+
+    /** Target access for the ported MU300 computer-side flow. */
+    private Mu300Internal.Io muIo() {
+        return new Mu300Internal.Io() {
+            @Override public String sh(String script, boolean root) throws IOException {
+                StringBuilder b = new StringBuilder();
+                RootShell.LineSink sink = l -> b.append(l).append('\n');
+                int rc;
+                if (mode == Mode.LOCAL) rc = RootShell.run(script, sink, 1800);
+                else if (root) rc = rootRun(script, sink, 1800);
+                else rc = adb().shell(script, sink::line);
+                if (rc != 0) {
+                    String[] ls = b.toString().trim().split("\n");
+                    throw new IOException("目标设备命令失败（" + rc + "）" + (ls.length > 0 && !ls[ls.length - 1].isEmpty() ? "：" + ls[ls.length - 1] : ""));
+                }
+                return b.toString();
+            }
+
+            @Override public void pull(String remote, File dest) throws IOException {
+                try (OutputStream o = new FileOutputStream(dest)) {
+                    if (mode == Mode.LOCAL) {
+                        int rc = RootShell.readBinary("cat " + RootShell.q(remote), o, 1800);
+                        if (rc != 0) throw new IOException("读取失败（" + rc + "）：" + remote);
+                    } else {
+                        adb().execRaw("cat " + RootShell.q(remote), o);
+                    }
+                }
+            }
+
+            @Override public void push(File local, String remote) throws IOException {
+                if (mode == Mode.LOCAL) {
+                    int rc = RootShell.run("cat " + RootShell.q(local.getAbsolutePath()) + " > " + RootShell.q(remote), JobManager.this::append, 1800);
+                    if (rc != 0) throw new IOException("复制失败：" + remote);
+                    return;
+                }
+                final long total = Math.max(1, local.length());
+                final boolean big = total > (4L << 20);
+                adb().push(new File[]{local}, new String[]{remote}, new int[]{0644}, new AdbConnection.Progress() {
+                    @Override public void bytes(long done) {
+                        if (!big) return;
+                        int pct = (int) (done * 100 / total);
+                        String l = "上传 " + local.getName() + " " + pct + "%";
+                        if (!l.equals(lastLine)) { lastLine = l; changed(); }
+                    }
+                    @Override public boolean cancelled() { return false; }   // never abandon a half-written stage
+                });
+            }
+
+            @Override public void reboot() throws IOException {
+                if (mode == Mode.LOCAL) {
+                    RootShell.run("sync; (sleep 2; svc power reboot || reboot) >/dev/null 2>&1 &", JobManager.this::append, 60);
+                    return;
+                }
+                adb().reboot();
+                if (adb != null) adb.close();
+                adb = null;
+            }
+
+            @Override public void log(String line) {
+                if (!line.trim().isEmpty()) lastLine = line;
+                append(line);
+                changed();
+            }
+
+            @Override public void progress(int percent) { progress = percent; changed(); }
+
+            @Override public File cacheDir() { return app.getCacheDir(); }
+        };
+    }
+
+    private static Mu300Internal.Kind kind(Method m) {
+        return m == Method.PART ? Mu300Internal.Kind.PART : m == Method.REPART ? Mu300Internal.Kind.REPART : Mu300Internal.Kind.IMAGE;
+    }
+
+    private void checkMu300(Method m) throws IOException {
+        if (!targetReady()) throw new IOException(mode == Mode.LOCAL ? "本机没有 root" : "请先连接目标设备（USB 或局域网）并取得 root");
+        if (!muLocalReady()) throw new IOException("本机已没有内置安装文件，请重新选择安装包");
+        String why = problemFor(pkg, target());
+        if (why != null) throw new IOException(why + "；不要跨机型刷入");
+        lastLine = "只读检查 eMMC、GPT 与 userdata";
+        changed();
+        Mu300Internal.Plan p = Mu300Internal.check(muIo(), kind(m));
+        muPlan = p;
+        checkSlots = p.slot + "," + p.linux;
+        dataNode = "/dev/block/" + p.s.node;
+        crypto = p.encryptedNote != null ? p.encryptedNote : "未加密（" + p.s.state + "）";
+        udataMib = p.s.size / 2048;
+        freeMib = p.s.free / 1024;
+        usedMib = Math.max(0, udataMib - freeMib);
+        if (m == Method.REPART) {
+            rangeMin = rangeMax = rangeDefault = chosenMib = p.rootMib;
+        } else {
+            rangeMin = p.min;
+            rangeMax = p.maximum;
+            rangeDefault = p.def;
+            chosenMib = p.def;
+        }
+        checkedFingerprint = checkKey();
+        append("✓ 检查通过，未修改任何分区。设备 " + p.model + "（" + p.profile + "），Android 槽 " + p.slot + "，Linux 槽 " + p.linux);
+        append("  " + p.summary + (m == Method.REPART ? "" : "；大小可选 " + rangeMin + "–" + rangeMax + " MiB（默认 " + rangeDefault + " MiB）"));
+    }
+
+    private void installMu300(Method m) throws IOException {
+        if (muPlan == null) throw new IOException("请先完成只读检查");
+        if (m != Method.REPART && (chosenMib < rangeMin || chosenMib > rangeMax))
+            throw new IOException("所选大小不在检查给出的范围内（" + rangeMin + "–" + rangeMax + " MiB）");
+        Boolean expectFree = m == Method.PART ? muUsesFree() : null;
+        installOk = false;
+        installRc = null;
+        hotspot = null;
+        muOutcome = null;
+        installedMethod = m;
+        lastJob = "running";
+        changed();
+        File ext = app.getExternalFilesDir(null);
+        File backups = new File(ext != null ? ext : app.getFilesDir(), "mu300-backup");
+        Device d = target();
+        try {
+            Mu300Internal.Outcome o = Mu300Internal.install(muIo(), muLocal(), pkg.kernelFamily, kind(m), chosenMib, backups,
+                    d != null && d.serial != null && !d.serial.isEmpty() ? d.serial : Build.MODEL, expectFree, path -> muBackup = path);
+            muOutcome = o;
+            installOk = true;
+            installRc = "0";
+            lastJob = "done 0";
+            append("✓ " + o.message);
+            append("  " + o.next);
+            if (muBackup != null) append("  分区备份（GPT、misc、两槽启动链）：" + muBackup);
+            append("  管理地址：" + adminUrl() + "  用户 root，初始密码 root（请尽快修改）");
+        } catch (IOException | RuntimeException e) {
+            installRc = "1";
+            lastJob = "done 1";
+            changed();
+            throw e;
+        } finally {
+            progress = -1;
+        }
+        changed();
     }
 
     /** Puts the verified subset onto the current target (move locally, wireless-ADB push for LAN). */
@@ -671,11 +873,12 @@ final class JobManager {
     // ------------------------------------------------------------ check / install
     void runCheck() {
         final Method m = method;
-        submit("只读检查（" + m.title + "）", true, () -> {
-            ensureStaged();
+        submit("只读检查（" + titleOf(m) + "）", true, () -> {
             checkedFingerprint = null;
             checkTarget = checkCard = checkSlots = null;
             clearDataCheck();
+            if (muInternal(m)) { checkMu300(m); return; }
+            ensureStaged();
             if (m == Method.TF) checkTf(); else checkData(m);
         });
     }
@@ -748,8 +951,9 @@ final class JobManager {
 
     void runInstall() {
         final Method m = method;
-        submit("传输及安装系统（" + m.title + "）", true, () -> {
+        submit("传输及安装系统（" + titleOf(m) + "）", true, () -> {
             if (!checkPassed()) throw new IOException("请先对当前安装包和安装方式完成只读检查");
+            if (muInternal(m)) { installMu300(m); return; }
             String args;
             if (m == Method.TF) {
                 long need = pkg.rawBytes + pkg.bootBytes + (256L << 20);
@@ -830,6 +1034,7 @@ final class JobManager {
     void clean() {
         submit("清理暂存文件", false, () -> {
             PackageInspector.deleteTree(new File(app.getFilesDir(), "stage"));
+            PackageInspector.deleteTree(muLocal());
             append("已删除本机解出的安装文件");
             if (targetReady()) {
                 helperRunIfPresent("clean");

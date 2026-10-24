@@ -364,6 +364,29 @@ final class AdbConnection {
         return rc;
     }
 
+    /** Runs a command through "exec:" (raw, binary-safe, no stdin) and copies its stdout to out. */
+    long execRaw(String command, OutputStream out) throws IOException {
+        Stream s = open("exec:" + command);
+        long n = 0;
+        try {
+            byte[] d;
+            while ((d = s.next()) != null) { out.write(d); n += d.length; }
+        } finally {
+            s.close();
+        }
+        return n;
+    }
+
+    /** adb reboot: the service may drop the link before acknowledging. */
+    void reboot() {
+        try {
+            Stream s = open("reboot:");
+            try { while (s.next() != null) { /* drain */ } } finally { s.close(); }
+        } catch (IOException ignored) {
+            // the device is going down
+        }
+    }
+
     /** Runs a command and returns its whole output (for short queries). */
     String shellText(String command) throws IOException {
         StringBuilder b = new StringBuilder();

@@ -23,7 +23,7 @@ public final class AboutActivity extends Activity {
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         ui = new Ui(this);
-        setTitle("关于");
+        setTitle("使用说明");
         if (Build.VERSION.SDK_INT >= 21) getWindow().setStatusBarColor(ui.bg);
         LinearLayout root = ui.col();
         root.setBackgroundColor(ui.bg);
@@ -37,7 +37,7 @@ public final class AboutActivity extends Activity {
         back.setBackground(ui.ripple(ui.circle(ui.bg, 0)));
         back.setOnClickListener(v -> finish());
         head.addView(back, new LinearLayout.LayoutParams(ui.dp(40), ui.dp(40)));
-        TextView t = ui.text("关于", 17, ui.text, true);
+        TextView t = ui.text("使用说明", 17, ui.text, true);
         t.setPadding(ui.dp(6), 0, 0, 0);
         head.addView(t, ui.weight(1));
         root.addView(head, ui.mw(0));
@@ -139,13 +139,16 @@ public final class AboutActivity extends Activity {
         model("VIPME M8", "VIPME M8（需 orange）", all, "http://192.168.9.1");
         model("angelcare K1", "angelcare K1，主板 ums9157_2h10（需 orange）", all, "http://192.168.9.1");
         model("MU300（内核 7.2.8 / 6.18.54 两个包）", "ZTE F50 / MU300 / U30 Air，或 V50 / MU3351（UMS9620 平台）",
-                "仅 TF 卡", "http://192.168.77.1");
+                "TF 卡 / 独立内置分区 / 重装已有内置分区 / userdata 镜像（实验性）", "http://192.168.77.1");
 
         section("注意事项");
         para("• 不要把安装包刷进不在支持列表里的设备（例如用来操作的手机本身）。");
         para("• TF 卡方式会清空 TF 卡上的目标分区或整卡；内部存储和 Android 数据不动。");
         para("• 独立内置分区方式会修改内部存储的分区表，开机时离线缩小 userdata，断电可能损坏数据，请先备份。"
                 + "分区和镜像方式只支持 userdata 未加密的设备，分区方式还要求 userdata 为 F2FS。");
+        para("• MU300 独立内置分区：优先用 eMMC 未分配空间，不动 Android 数据；空间不够时才在首次开机离线缩小 userdata，"
+                + "完成后自动重启一次。开始前会把分区表、misc 和两槽启动链备份到本应用目录。"
+                + "MU300 的 userdata 镜像方式为实验性，可能损坏 Android 的 F2FS 文件系统。");
         para("• 安装会写入另一个槽的 boot 并切换启动槽；连续启动失败两次会自动回到 Android。当前 Android 槽和 NV 不会写入。");
         para("• 安装失败后，同一次开机内不能重试，请先查看日志，并按提示重启或处理。");
         para("• 校验只能保证文件完整、没被改过，不能证明安装包的来源，请只使用可信来源的安装包。");
@@ -154,5 +157,6 @@ public final class AboutActivity extends Activity {
         section("友情链接");
         link(R.drawable.linote_logo, "Lino 笔记", "https://www.linote.top/", false);
         link(R.drawable.github_invertocat, "GitHub 主页", "https://github.com/linote99", true);
+        link(R.drawable.github_invertocat, "开源仓库（本应用源码）", "https://github.com/linote99/openwrt-android-installer", true);
     }
 }

@@ -27,6 +27,7 @@ public class DesktopInspect {
                     + "\nmodule=" + r.moduleName + " / " + r.moduleVersion + " ssid=" + r.defaultSsid
                     + " raw=" + r.rawBytes + " boot=" + r.bootBytes + "\nfingerprint=" + r.fingerprint
                     + "\nwarnings=" + r.warnings);
+            System.out.println("internal=" + (!r.isMu300() ? "-" : r.internalProblem == null ? "available" : r.internalProblem));
         } catch (PackageInspector.PackageException e) {
             System.out.println("REFUSED: " + e.getMessage());
             System.exit(2);

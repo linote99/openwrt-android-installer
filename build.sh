@@ -6,8 +6,8 @@ cd "$(dirname "$0")"
 SDK=${ANDROID_HOME:-$HOME/android-sdk}
 BT=$SDK/build-tools/34.0.0
 JAR=$SDK/platforms/android-34/android.jar
-VERSION_CODE=${VERSION_CODE:-4}
-VERSION_NAME=${VERSION_NAME:-1.3.0}
+VERSION_CODE=${VERSION_CODE:-5}
+VERSION_NAME=${VERSION_NAME:-1.4.0}
 OUT=build
 APP=app/src/main
 SIGN=signing

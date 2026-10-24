@@ -40,7 +40,7 @@ import java.util.Locale;
  */
 public class MainActivity extends Activity implements JobManager.Listener {
     private static final int PICK_ZIP = 7;
-    static final String VERSION = "1.3.0";
+    static final String VERSION = "1.4.0";
 
     static final int T_DEVICE = 0, T_PACKAGE = 1, T_METHOD = 2, T_PLAN = 3, T_INSTALL = 4, T_DONE = 5, T_LOG = 6;
     private static final String[] TAB_NAMES = {"设备", "安装包", "安装方式", "检查与计划", "安装", "完成", "日志"};
@@ -278,12 +278,13 @@ public class MainActivity extends Activity implements JobManager.Listener {
         ht.addView(ui.text("OpenWrt 安装器", 16, ui.text, true));
         ht.addView(ui.text("安装、更新与恢复 · 安卓版 v" + VERSION, 12, ui.muted, false));
         head.addView(ht, ui.weight(1));
-        TextView about = ui.text("ⓘ", 20, ui.text, false);
+        TextView about = ui.text("使用说明", 13, ui.text, true);
         about.setGravity(Gravity.CENTER);
-        about.setContentDescription("关于");
-        about.setBackground(ui.ripple(ui.circle(ui.bg, 0)));
+        about.setContentDescription("使用说明");
+        about.setPadding(ui.dp(12), 0, ui.dp(12), 0);
+        about.setBackground(ui.ripple(ui.round(ui.surface, ui.border, 16)));
         about.setOnClickListener(v -> startActivity(new android.content.Intent(this, AboutActivity.class)));
-        head.addView(about, new LinearLayout.LayoutParams(ui.dp(40), ui.dp(40)));
+        head.addView(about, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ui.dp(34)));
         return head;
     }
 
@@ -549,7 +550,9 @@ public class MainActivity extends Activity implements JobManager.Listener {
                     {"解锁要求", p.unlockRequired ? "需要已解锁（verifiedbootstate=orange）" : "不要求 orange（按安装包规则）"},
                     {"完整性", p.verifiedFiles + "/" + p.listedFiles + " 个文件 SHA-256 一致"
                             + (p.isMu300() ? "（desktop/manifest.json）" : "（files/SHA256SUMS）")},
-                    {"安装方式", p.tfOnly ? "仅 TF 卡（安装包自带 tf-install-worker.sh）" : "TF 卡 / 缩容 userdata / userdata 镜像"},
+                    {"安装方式", p.isMu300() ? (p.tfOnly ? "仅 TF 卡（" + (p.internalProblem != null ? p.internalProblem : "内置存储方式不可用") + "）"
+                            : "TF 卡 / 独立内置分区 / 重装已有内置分区 / userdata 镜像")
+                            : p.tfOnly ? "仅 TF 卡" : "TF 卡 / 缩容 userdata / userdata 镜像"},
                     {"暂存到目标设备", jm.packageReady() ? "已就绪" : "检查时自动暂存"},
             });
             card.addView(kv, ui.mw(6));
@@ -570,7 +573,8 @@ public class MainActivity extends Activity implements JobManager.Listener {
     private void methodPage(boolean idle) {
         pageTitle("步骤 3 · 安装方式", "选择写入位置", "切换方式后需要重新做只读检查。");
         if (jm.pkg != null && jm.pkg.tfOnly)
-            add(ui.notice("i", "仅支持 TF 卡", jm.pkg.title + " 安装包只提供 TF 卡安装（与安装包的 Magisk 安装方式一致）。", 0), 10);
+            add(ui.notice("i", "仅支持 TF 卡", jm.pkg.title + " 安装包在本应用中只能用 TF 卡安装"
+                    + (jm.pkg.internalProblem != null ? "：" + jm.pkg.internalProblem : "") + "。", 0), 10);
         for (JobManager.Method m : JobManager.Method.values()) {
             if (!jm.methodAllowed(m)) continue;
             boolean on = jm.method == m;
@@ -582,8 +586,8 @@ public class MainActivity extends Activity implements JobManager.Listener {
             r.addView(radio);
             LinearLayout tx = ui.col();
             tx.setPadding(ui.dp(10), 0, 0, 0);
-            tx.addView(ui.text(m.title, 15, ui.text, true));
-            TextView ds = ui.text(m.summary, 12.5f, ui.muted, false);
+            tx.addView(ui.text(jm.titleOf(m), 15, ui.text, true));
+            TextView ds = ui.text(jm.summaryOf(m), 12.5f, ui.muted, false);
             ds.setPadding(0, ui.dp(3), 0, 0);
             tx.addView(ds);
             r.addView(tx, ui.weight(1));
@@ -591,8 +595,12 @@ public class MainActivity extends Activity implements JobManager.Listener {
             else r.setAlpha(on ? 1f : 0.6f);
             add(r, 10);
         }
-        add(ui.text("加密 userdata（FBE / 元数据加密）的“两阶段、清空 Android 数据”内置分区安装、重装已有分区、续装和在线更新"
-                + "依赖电脑端在恢复出厂期间保存的事务，本应用不提供；请使用 TF 卡方式或电脑端安装器。", 12, ui.muted, false), 14);
+        if (jm.pkg != null && jm.pkg.isMu300())
+            add(ui.text("独立内置分区：未分配空间足够时直接使用，不缩容、不动 Android 数据；不够时需要未加密的 userdata，首次开机离线缩容后自动重启一次。"
+                    + "需要“清空 Android 数据”的缩容、未完成安装的续装和在线更新依赖电脑端保存的事务，本应用不提供。", 12, ui.muted, false), 14);
+        else
+            add(ui.text("加密 userdata（FBE / 元数据加密）的“两阶段、清空 Android 数据”内置分区安装、重装已有分区、续装和在线更新"
+                    + "依赖电脑端在恢复出厂期间保存的事务，本应用不提供；请使用 TF 卡方式或电脑端安装器。", 12, ui.muted, false), 14);
     }
 
     // ------------------------------------------------------------ 4 检查与计划
@@ -609,12 +617,15 @@ public class MainActivity extends Activity implements JobManager.Listener {
         String why = JobManager.problemFor(p, d);
         boolean match = d != null && why == null;
         LinearLayout card = ui.card();
-        card.addView(ui.text("目标 " + d.model + (d.endpoint != null ? "（" + d.endpoint + "）" : "（本机）") + " · " + jm.method.title, 13, ui.muted, false), ui.mw(12));
+        card.addView(ui.text("目标 " + d.model + (d.endpoint != null ? "（" + d.endpoint + "）" : "（本机）") + " · " + jm.titleOf(jm.method), 13, ui.muted, false), ui.mw(12));
         TextView check = ui.button(jm.checkPassed() ? "重新只读检查" : "只读检查（不写入任何分区）", jm.checkPassed() ? 0 : 1, v -> { confirmed = false; jm.runCheck(); });
-        check.setEnabled(idle && (jm.packageReady() || jm.localCopyAvailable()));
+        check.setEnabled(idle && (jm.packageReady() || jm.localCopyAvailable() || (jm.muInternal(jm.method) && jm.muLocalReady())));
         card.addView(check, ui.mw(8));
         if (!jm.checkPassed()) {
-            card.addView(ui.text("检查会暂存安装文件并运行预检：包完整性、型号、槽位、解锁、启动控制块、启动链"
+            card.addView(ui.text(jm.muInternal(jm.method)
+                    ? "检查只读取设备信息：型号、槽位、eMMC 与 GPT（主备两份）、userdata 文件系统、加密状态与可用空间"
+                            + (jm.method == JobManager.Method.REPART ? "、已有 mu300root 分区。" : "；同时算出可选大小。")
+                    : "检查会暂存安装文件并运行预检：包完整性、型号、槽位、解锁、启动控制块、启动链"
                     + (jm.method == JobManager.Method.TF ? "、TF 卡识别与空间。" : "、userdata 加密状态与可用空间。"), 13, ui.muted, false), ui.mw(8));
             if (!match) card.addView(ui.text(why + "，检查会失败。", 13, ui.danger, true), ui.mw(6));
             View pad = new View(this);
@@ -626,7 +637,22 @@ public class MainActivity extends Activity implements JobManager.Listener {
         String slots = jm.checkSlots == null ? "a,b" : jm.checkSlots;
         String linux = slots.contains(",") ? slots.substring(slots.indexOf(',') + 1) : "b";
         LinearLayout kv = ui.col();
-        if (m == JobManager.Method.TF) {
+        boolean mi = jm.muInternal(m);
+        if (mi) {
+            Mu300Internal.Plan mp = jm.muPlan;
+            String target = m == JobManager.Method.REPART ? "/dev/block/" + (mp != null && mp.s.root != null ? mp.s.root : "?") + "（mu300root，" + jm.chosenMib + " MiB）"
+                    : m == JobManager.Method.IMAGE ? "/data/mu300linux 中的 OpenWrt 镜像"
+                    : "新建 mu300root 分区（未分配空间或缩小 userdata）";
+            ui.addKvs(kv, new String[][]{
+                    {"安装方式", jm.titleOf(m)},
+                    {"设备", mp != null ? mp.model + "（" + mp.profile + "）" : d.model},
+                    {"写入目标", target},
+                    {"userdata", jm.dataNode + " · " + jm.udataMib + " MiB，可用 " + jm.freeMib + " MiB"},
+                    {"加密状态", jm.crypto},
+                    {"检查结果", mp != null ? mp.summary : "-"},
+                    {"Linux 槽", "boot_" + linux + "（写入前备份，写入后回读校验）"},
+            });
+        } else if (m == JobManager.Method.TF) {
             ui.addKvs(kv, new String[][]{
                     {"安装方式", m.title},
                     {"写入目标", jm.checkTarget + "（" + JobManager.gib(jm.checkTargetBytes) + "）"},
@@ -653,13 +679,22 @@ public class MainActivity extends Activity implements JobManager.Listener {
             });
         }
         card.addView(kv, ui.mw(6));
-        if (m != JobManager.Method.TF) addSizePicker(card, m, idle);
+        if (m != JobManager.Method.TF && m != JobManager.Method.REPART) addSizePicker(card, m, idle);
         View pad = new View(this);
         card.addView(pad, new LinearLayout.LayoutParams(1, ui.dp(10)));
         add(card, 12);
 
         String impact;
-        if (m == JobManager.Method.TF && p.isMu300())
+        if (mi && m == JobManager.Method.PART)
+            impact = "先把 GPT、misc 和两槽启动链备份到本应用目录。所选大小放得进 eMMC 未分配空间时，直接在那里新建 mu300root 分区写入 OpenWrt，"
+                    + "不缩容、不动 Android 数据；放不下时在下次开机由 initramfs 离线检查并缩小 userdata（保留数据），再新建分区写入 OpenWrt，"
+                    + "完成后自动重启一次。缩容期间断电可能损坏 userdata——请先备份重要文件并保持供电。";
+        else if (mi && m == JobManager.Method.REPART)
+            impact = "清空已有 mu300root 分区上的全部内容（包括 OpenWrt 的设置）并重新写入；不改分区表，不动 Android 数据。";
+        else if (mi)
+            impact = "在 userdata 中创建 OpenWrt 镜像文件（占用所选大小的空间），不格式化 userdata。此方式为实验性，原安装器提示可能损坏 Android 的 F2FS 文件系统；"
+                    + "请先备份重要文件。";
+        else if (m == JobManager.Method.TF && p.isMu300())
             impact = "清空 TF 目标 " + jm.checkTarget + " 并写入 OpenWrt；同时写入另一槽的 boot、启动链（先备份再校验）和 misc 的 32 字节，"
                     + "不动内部存储与 Android 数据。";
         else if (m == JobManager.Method.TF)
@@ -672,8 +707,13 @@ public class MainActivity extends Activity implements JobManager.Listener {
             impact = "在 userdata 中新建 OpenWrt 镜像文件（占用所选大小的空间），不格式化 userdata；已有镜像会被移到 /data/e5linux/previous.* 保留。"
                     + "此方式为实验性。";
         add(ui.notice("!", "数据影响", impact, 1), 10);
-        add(ui.notice("i", "共同步骤", "提取本机 Wi-Fi / 蓝牙 / 音频固件写入 OpenWrt；启动链有差异时先备份两槽再同步；写入 boot_" + linux
-                + " 并回读校验；当前 Android 槽、NV 均不写入。完成后需手动重启。", 0), 8);
+        if (mi)
+            add(ui.notice("i", "共同步骤", "从本机提取厂商固件放入 OpenWrt；在本应用内为 boot_" + linux + " 生成启动镜像，写入前备份、写入后回读校验，"
+                    + "并设置下次从 Linux 槽启动（失败会回到 Android）；当前 Android 槽、NV 均不写入。"
+                    + (m == JobManager.Method.PART ? "需要缩容时会自动重启，否则需手动重启。" : "完成后需手动重启。"), 0), 8);
+        else
+            add(ui.notice("i", "共同步骤", "提取本机 Wi-Fi / 蓝牙 / 音频固件写入 OpenWrt；启动链有差异时先备份两槽再同步；写入 boot_" + linux
+                    + " 并回读校验；当前 Android 槽、NV 均不写入。完成后需手动重启。", 0), 8);
 
         CheckBox cb = new CheckBox(this);
         cb.setText("我已核对设备、写入目标和数据影响，并已备份需要保留的文件。");
@@ -720,7 +760,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
         card.addView(quick, ui.mw(6));
         sizeInfo = ui.text("", 12.5f, ui.muted, false);
         card.addView(sizeInfo, ui.mw(4));
-        if (m == JobManager.Method.PART) {
+        if (m == JobManager.Method.PART && !jm.muInternal(m)) {
             CheckBox grow = new CheckBox(this);
             grow.setText("将 OpenWrt 文件系统扩展到整个分区（推荐）");
             grow.setTextColor(ui.text);
@@ -742,7 +782,12 @@ public class MainActivity extends Activity implements JobManager.Listener {
         sizeValid = jm.setChosenMib(v);
         if (sizeInfo != null) {
             if (sizeValid) {
-                String extra = jm.method == JobManager.Method.PART
+                String extra;
+                if (jm.method == JobManager.Method.PART && jm.muInternal(jm.method)) {
+                    long t = jm.muShrinkTargetMib(v);
+                    extra = jm.muUsesFree() ? "；使用 eMMC 未分配空间，不缩小 userdata"
+                            : "；未分配空间不够，下次开机离线把 userdata 缩小为 " + (t > 0 ? t + " MiB（约 " + gibStr(t) + "）" : "?");
+                } else extra = jm.method == JobManager.Method.PART
                         ? "；userdata 缩小为 " + (jm.udataMib - v) + " MiB（约 " + gibStr(jm.udataMib - v) + "）" : "";
                 sizeInfo.setText("将使用 " + v + " MiB（约 " + gibStr(v) + "）" + extra);
                 sizeInfo.setTextColor(ui.muted);
@@ -759,7 +804,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
         JobManager.Device d = jm.target();
         boolean match = jm.modelMatches();
         startBtn.setEnabled(jm.busy == null && jm.checkPassed() && match && confirmed
-                && (jm.method == JobManager.Method.TF || sizeValid));
+                && (jm.method == JobManager.Method.TF || jm.method == JobManager.Method.REPART || sizeValid));
     }
 
     // ------------------------------------------------------------ 5 安装
@@ -782,6 +827,9 @@ public class MainActivity extends Activity implements JobManager.Listener {
         card.addView(bar, ui.mw(6));
         if ("running".equals(jm.lastJob) && idle)
             card.addView(ui.notice("i", "有后台安装任务", "安装在目标设备上后台运行，与本界面或网络连接无关。点“继续未完成的安装”查看进度。", 0), ui.mw(8));
+        else if (jm.lastJob.startsWith("done") && !"done 0".equals(jm.lastJob) && idle && jm.muInternal(jm.installedMethod))
+            card.addView(ui.notice("!", "上次安装失败", "启动镜像写入前失败时不会切换启动槽，Android 照常启动。详细原因见下方日志"
+                    + (jm.muBackup != null ? "；分区备份在 " + jm.muBackup : "") + "。检查设备状态后重新做只读检查再试。", 1), ui.mw(8));
         else if (jm.lastJob.startsWith("done") && !"done 0".equals(jm.lastJob) && idle)
             card.addView(ui.notice("!", "上次安装失败", "安装器失败时不会设置启动目标。日志和备份保留在 " + jm.logDir() + "；"
                     + "同一次开机内安装器锁会阻止重试，检查后重启 Android 再试。", 1), ui.mw(8));
@@ -811,15 +859,16 @@ public class MainActivity extends Activity implements JobManager.Listener {
                     v -> go(jm.checkPassed() ? T_PLAN : initialTab())), 12);
             return;
         }
-        boolean part = jm.installedMethod == JobManager.Method.PART;
-        pageTitle("步骤 6 · 完成", part ? "已就绪：重启后离线完成安装" : "安装完成", null);
+        boolean mi = jm.muInternal(jm.installedMethod);
+        boolean part = mi ? jm.muOutcome != null && jm.muOutcome.pending : jm.installedMethod == JobManager.Method.PART;
+        pageTitle("步骤 6 · 完成", part ? (mi ? "设备正在重启并离线完成安装" : "已就绪：重启后离线完成安装") : "安装完成", null);
         LinearLayout card = ui.card();
         LinearLayout r = ui.row();
         TextView ok = ui.text("✓", 18, ui.onPrimary, true);
         ok.setGravity(Gravity.CENTER);
         ok.setBackground(ui.circle(ui.primary, 0));
         r.addView(ok, new LinearLayout.LayoutParams(ui.dp(34), ui.dp(34)));
-        TextView t = ui.text(part ? "载荷、内核与启动槽已写入并校验" : "OpenWrt 已写入并设为下次启动", 15, ui.text, true);
+        TextView t = ui.text(mi && jm.muOutcome != null ? jm.muOutcome.message : part ? "载荷、内核与启动槽已写入并校验" : "OpenWrt 已写入并设为下次启动", 15, ui.text, true);
         t.setPadding(ui.dp(12), 0, 0, 0);
         r.addView(t, ui.weight(1));
         card.addView(r, ui.mw(14));
@@ -831,15 +880,20 @@ public class MainActivity extends Activity implements JobManager.Listener {
         });
         card.addView(kv, ui.mw(6));
         boolean mu = jm.pkg != null && jm.pkg.isMu300();
-        String next = mu
+        String next = mi && jm.muOutcome != null
+                ? "下一步：" + jm.muOutcome.next + (part ? "。离线安装进度可在 http://192.168.77.1:8089/progress.txt 查看。" : "。如果 Linux 启动失败，设备会自动返回 Android。")
+                        + (jm.muBackup != null ? "\n分区备份：" + jm.muBackup + "（建议复制到电脑保存）" : "")
+                : mu
                 ? "下一步：重启进入 OpenWrt。如果 Linux 启动失败，设备会自动返回 Android。"
                 : part
                 ? "下一步：重启。initramfs 会离线缩小 userdata、创建 e5root 并写入 OpenWrt，屏幕显示进度，完成后自动再重启一次进入 OpenWrt；期间不要断电。"
                 : "下一步：重启进入 OpenWrt（首次启动约 2 分钟）。失败两次会自动回到 Android。回 Android：OpenWrt 屏幕“高级 → 系统 → 下次启动 Android”或执行 e5-next-boot android。";
         card.addView(ui.text(next, 13, ui.muted, false), ui.mw(8));
-        TextView rb = ui.button("现在重启目标设备", 1, v -> confirmReboot());
-        rb.setEnabled(jm.busy == null);
-        card.addView(rb, ui.mw(12));
+        if (!(mi && part)) {
+            TextView rb = ui.button("现在重启目标设备", 1, v -> confirmReboot());
+            rb.setEnabled(jm.busy == null);
+            card.addView(rb, ui.mw(12));
+        }
         View pad = new View(this);
         card.addView(pad, new LinearLayout.LayoutParams(1, ui.dp(10)));
         add(card, 12);
@@ -928,19 +982,26 @@ public class MainActivity extends Activity implements JobManager.Listener {
         }
         JobManager.Method m = jm.method;
         String what;
-        if (m == JobManager.Method.TF) what = "清空 TF 目标 " + jm.checkTarget + "（" + JobManager.gib(jm.checkTargetBytes) + "）并写入 OpenWrt";
+        boolean mi = jm.muInternal(m);
+        if (mi && m == JobManager.Method.PART) what = jm.muUsesFree()
+                ? "备份分区表与启动链，在 eMMC 未分配空间新建 " + jm.chosenMib + " MiB 的 mu300root 分区写入 OpenWrt（不缩小 userdata）"
+                : "备份分区表与启动链，随后自动重启，开机时离线把 userdata 缩小到 " + jm.muShrinkTargetMib(jm.chosenMib)
+                        + " MiB，新建 " + jm.chosenMib + " MiB 的 mu300root 分区写入 OpenWrt";
+        else if (mi && m == JobManager.Method.REPART) what = "清空已有 mu300root 分区（" + jm.chosenMib + " MiB）并重新写入 OpenWrt";
+        else if (mi) what = "在 /data/mu300linux 创建 " + jm.chosenMib + " MiB 的 OpenWrt 镜像（实验性）";
+        else if (m == JobManager.Method.TF) what = "清空 TF 目标 " + jm.checkTarget + "（" + JobManager.gib(jm.checkTargetBytes) + "）并写入 OpenWrt";
         else if (m == JobManager.Method.PART) what = "下次启动时把 userdata 从 " + jm.udataMib + " MiB 缩小到 " + (jm.udataMib - jm.chosenMib)
                 + " MiB，并新建 " + jm.chosenMib + " MiB 的 e5root 分区写入 OpenWrt";
         else what = "在 /data/e5linux 创建 " + jm.chosenMib + " MiB 的 OpenWrt 镜像";
         String msg = "目标设备：" + d.model + (d.endpoint != null ? "（" + d.endpoint + "）" : "（本机）")
-                + "\n安装包：" + p.version + "\n安装方式：" + m.title + "\n\n将要：" + what
+                + "\n安装包：" + p.version + "\n安装方式：" + jm.titleOf(m) + "\n\n将要：" + what
                 + "，写入 boot 并设置下次从 OpenWrt 槽试启动。\n\n期间保持供电，不要关机" + (m == JobManager.Method.TF ? "或拔卡" : "")
-                + (jm.mode == JobManager.Mode.LAN ? "；网络或 USB 断开不影响目标设备上的后台任务" : "") + "。\n\n输入 yes 确认：";
+                + (jm.mode == JobManager.Mode.LAN ? (mi ? "；安装期间保持 USB 或网络连接" : "；网络或 USB 断开不影响目标设备上的后台任务") : "") + "。\n\n输入 yes 确认：";
         final EditText input = new EditText(this);
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         input.setHint("yes");
         AlertDialog dlg = new AlertDialog.Builder(this)
-                .setTitle("确认安装 · " + m.title)
+                .setTitle("确认安装 · " + jm.titleOf(m))
                 .setMessage(msg)
                 .setView(input)
                 .setNegativeButton("取消", null)

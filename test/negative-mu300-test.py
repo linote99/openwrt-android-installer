@@ -15,6 +15,24 @@ def man_patch(fn):
     def p(d):
         m = json.loads(d); fn(m); return json.dumps(m, indent=2).encode()
     return {'desktop/manifest.json': p}
+import hashlib
+def desktop_change(name):
+    # Changes a pinned desktop/ file and updates the manifest consistently: package stays valid (TF),
+    # but the internal-storage methods must be disabled because the file is no longer the adapted version.
+    new = {}
+    def data(d):
+        nd = d + b'\n# changed\n'; new['h'] = hashlib.sha256(nd).hexdigest(); return nd
+    def man(d):
+        m = json.loads(d); m['desktop'][name] = new['h']; return json.dumps(m, indent=2).encode()
+    return {name: data, 'desktop/manifest.json': man}
+def ordered_copy(patch):
+    def fn(zi, zo):
+        order = sorted(zi.infolist(), key=lambda i: i.filename == 'desktop/manifest.json')
+        for info in order:
+            d = zi.read(info)
+            if info.filename in patch: d = patch[info.filename](d)
+            zo.writestr(info.filename, d)
+    return fn
 def first_hash_change(m):
     sec = m['magisk']
     files = sec.get('files', sec) if isinstance(sec, dict) else sec
@@ -28,15 +46,23 @@ cases = [
     ('missing payload file', lambda zi, zo: copy(zi, zo, skip={'payload/switch.sh'}), False),
     ('unlisted extra payload file', lambda zi, zo: (copy(zi, zo), zo.writestr('payload/evil.sh', b'echo hi\n')), False),
     ('path traversal entry', lambda zi, zo: (copy(zi, zo), zo.writestr('../evil.sh', b'x')), False),
+    ('changed desktop/android-write-free.sh (manifest updated)', ordered_copy(desktop_change('desktop/android-write-free.sh')), True, 'android-write-free.sh'),
+    ('changed desktop/files/boot/install-part.sh (manifest updated)', ordered_copy(desktop_change('desktop/files/boot/install-part.sh')), True, 'install-part.sh'),
+    ('missing desktop/android-image.sh', lambda zi, zo: copy(zi, zo, skip={'desktop/android-image.sh'}), False),
+    ('unlisted extra repair file', lambda zi, zo: (copy(zi, zo), zo.writestr('desktop/files/boot/repair/evil', b'x')), True, 'available'),
 ]
 bad = 0
-for name, fn, want_ok in cases:
+for case in cases:
+    name, fn, want_ok = case[:3]
+    want_internal = case[3] if len(case) > 3 else ('available' if want_ok else None)
     with zipfile.ZipFile(src) as zi, zipfile.ZipFile(tmp, 'w', zipfile.ZIP_STORED) as zo:
         fn(zi, zo)
     out = subprocess.run(['java', '-cp', cls, 'DesktopInspect', tmp, os.path.join(work, 'out')],
                          capture_output=True, text=True).stdout
     verdict = next((l for l in out.splitlines() if l.startswith(('OK', 'REFUSED'))), 'NONE')
-    good = verdict.startswith('OK') == want_ok
+    internal = next((l[9:] for l in out.splitlines() if l.startswith('internal=')), '')
+    good = verdict.startswith('OK') == want_ok and (want_internal is None or want_internal in internal)
+    if want_ok: verdict += ' | internal=' + internal
     bad += not good
     print(('PASS' if good else 'FAIL'), name, '->', verdict[:150])
 os.remove(tmp)

@@ -74,6 +74,9 @@ public final class PackageInspector {
         public String layout = "e5";         // "e5" (files/SHA256SUMS) or "mu300" (payload/ + desktop/manifest.json)
         public boolean tfOnly;               // MU300: only the package's own on-device TF worker is ported
         public String kernelFamily = "";     // MU300 manifest "kernel" (6.18 / 7.2)
+        public String internalProblem;       // MU300: why the internal-storage methods are unavailable (null = available)
+        public File internalSrc;             // MU300: extracted desktop/ files for the internal methods
+        public Map<String, String> listedMap = new LinkedHashMap<>();   // MU300: every manifest entry and its hash
         public long requiredKib;             // MU300 rootfs.requirements (TF capacity needed)
         public String adminUrl = "http://192.168.9.1";
         public String logDir = "/data/adb/e5-tf-install";
@@ -495,11 +498,11 @@ public final class PackageInspector {
     }
 
     private static boolean isCandidate(String name) {
-        if (SUBSET.matcher(name).matches() || MU_SUBSET.matcher(name).matches()) return true;
+        if (SUBSET.matcher(name).matches() || MU_SUBSET.matcher(name).matches() || Mu300Internal.wanted(name)) return true;
         int slash = name.indexOf('/');
         if (slash <= 0) return false;
         String rest = name.substring(slash + 1);
-        return SUBSET.matcher(rest).matches() || MU_SUBSET.matcher(rest).matches();
+        return SUBSET.matcher(rest).matches() || MU_SUBSET.matcher(rest).matches() || Mu300Internal.wanted(rest);
     }
 
     // ------------------------------------------------------------------ MU300 layout
@@ -604,6 +607,24 @@ public final class PackageInspector {
             if (!rel.equals("desktop/manifest.json")) sums.append(listed.get(rel)).append("  ").append(rel).append('\n');
             res.extractedFiles++;
             res.extractedBytes += sizes.get(name);
+        }
+        // Internal-storage methods: the computer-side desktop/ files they run, exactly as pinned by this app.
+        res.listedMap = listed;
+        res.internalProblem = Mu300Internal.pinnedProblem(listed);
+        if (res.internalProblem == null) {
+            File src = new File(pkg.getParentFile(), "mu300src");
+            deleteTree(src);
+            for (String name : extracted) {
+                if (!name.startsWith(px)) continue;
+                String rel = name.substring(px.length());
+                if (!Mu300Internal.wanted(rel) || !listed.containsKey(rel)) continue;   // only manifest-listed files
+                File from = new File(raw, name);
+                File to = new File(src, rel);
+                File parent = to.getParentFile();
+                if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new IOException("mkdir " + parent);
+                if (!from.renameTo(to)) throw new IOException("cannot move " + rel);
+            }
+            res.internalSrc = src;
         }
         deleteTree(raw);
         for (String n : MU_REQUIRED)

@@ -10,7 +10,8 @@ sudo rm -rf "$B"; mkdir -p "$B/cls" "$B/adb" "$B/usb"
 summary=()
 note() { summary+=("$1"); echo "== $1"; }
 
-javac -encoding UTF-8 -nowarn -d "$B/cls" $J/MiniJson.java $J/PackageInspector.java test/DesktopInspect.java test/RuleTest.java 2>&1 | grep -v '^Note'
+MUJ="$J/Mu300Internal.java $J/Mu300Gpt.java $J/Mu300Boot.java $J/Lz4.java $J/RootfsFilter.java"
+javac -encoding UTF-8 -nowarn -d "$B/cls" $J/MiniJson.java $J/PackageInspector.java $MUJ test/DesktopInspect.java test/RuleTest.java test/Mu300FlowTest.java 2>&1 | grep -v '^Note'
 java -cp "$B/cls" top.linote.owrtinstaller.RuleTest > "$B/rule.txt" 2>&1; note "RuleTest rc=$? $(tail -1 "$B/rule.txt")"
 
 for z in "$Z"/*.zip; do
@@ -25,6 +26,13 @@ MU=$(ls "$Z"/mu300-openwrt-*.zip 2>/dev/null | head -1)
 K1=$(ls "$Z"/k1-openwrt-*.zip 2>/dev/null | head -1)
 [ -n "$K1" ] && { python3 test/negative-package-test.py "$K1" "$B/cls" "$B/neg-k1" > "$B/negk1.txt" 2>&1; note "negative-package(K1, model rules) rc=$? $(tail -1 "$B/negk1.txt")"; }
 [ -n "$E5" ] && { python3 test/negative-package-test.py "$E5" "$B/cls" "$B/neg" > "$B/neg.txt" 2>&1; note "negative-package rc=$? $(tail -1 "$B/neg.txt")"; }
+# MU300 internal-storage port against a simulated device (package scripts are simulated, never executed)
+for z in "$Z"/mu300-openwrt-*.zip; do
+  [ -f "$z" ] || continue
+  java -Xmx3g -cp "$B/cls" top.linote.owrtinstaller.Mu300FlowTest "$z" "$B/muflow" > "$B/muflow-$(basename "$z" .zip).txt" 2>&1
+  note "Mu300FlowTest rc=$? $(basename "$z") :: $(tail -1 "$B/muflow-$(basename "$z" .zip).txt")"
+done
+rm -rf "$B/muflow"
 [ -n "$MU" ] && { python3 test/negative-mu300-test.py "$MU" "$B/cls" "$B/neg-mu" > "$B/negmu.txt" 2>&1; note "negative-mu300 rc=$? $(tail -1 "$B/negmu.txt")"; }
 
 javac -encoding UTF-8 -nowarn -d "$B/adb" $J/AdbConnection.java $J/AdbKey.java test/AdbTest.java 2>&1 | grep -v '^Note'
