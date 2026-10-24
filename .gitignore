@@ -1,0 +1,10 @@
+signing/
+build/
+build-test/
+dist/
+*.keystore
+*.jks
+keystore.properties
+*.idsig
+notes-analysis.md
+*.zip
