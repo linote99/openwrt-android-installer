@@ -20,6 +20,9 @@ A_SYNC, A_CNXN, A_OPEN, A_OKAY, A_CLSE, A_WRTE, A_AUTH = (
     0x434e5953, 0x4e584e43, 0x4e45504f, 0x59414b4f, 0x45534c43, 0x45545257, 0x48545541)
 PORT, ROOT = int(sys.argv[1]), sys.argv[2]
 MAXDATA = int(sys.argv[3]) if len(sys.argv) > 3 else 256 * 1024
+# MOCK_MODE: stale-before (leftover CLSE + half packet queued before the handshake),
+# stale-after (leftover CLSE/OKAY right after our CNXN), hang-done (never answer sync DONE).
+MODE = os.environ.get("MOCK_MODE", "")
 log = open(os.path.join(ROOT, "..", "mock-adbd.log"), "a")
 
 
@@ -67,9 +70,14 @@ class Conn:
             self.s.sendall(struct.pack("<6I", cmd, a0, a1, len(d), sum(d) & 0xFFFFFFFF, cmd ^ 0xFFFFFFFF) + d)
 
     def run(self):
+        if MODE == "stale-before":
+            self.s.sendall(struct.pack("<6I", A_CLSE, 7, 8, 0, 0, A_CLSE ^ 0xFFFFFFFF) + b"\x57\x52\x54\x45" + b"\0" * 6)
         cmd, a0, a1, d = self.read()
         assert cmd == A_CNXN and d.startswith(b"host::"), "first packet must be CNXN host::"
         L("CNXN version=%x maxdata=%d" % (a0, a1))
+        if MODE == "stale-after":
+            self.send(A_CLSE, 7, 8)
+            self.send(A_OKAY, 9, 10)
         token = os.urandom(20)
         self.send(A_AUTH, 1, 0, token)
         cmd, a0, a1, d = self.read()
@@ -149,6 +157,30 @@ class Stream:
                 p = subprocess.run(["/bin/sh", "-c", cmd], cwd=ROOT, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, env={"PATH": "/usr/bin:/bin", "MOCKROOT": ROOT})
                 self.write(p.stdout)
+            elif self.svc.startswith("exec:"):
+                # Like adbd: stream the process's stdout while it runs, one WRTE per pipe read, and
+                # wait for the client's OKAY before the next one. The sizes cycle through values that
+                # are multiples of the USB packet size and below 16 KiB (no short packet ends them).
+                cmd = self.svc[5:]
+                L("exec: " + cmd)
+                p = subprocess.Popen(["/bin/sh", "-c", cmd], cwd=ROOT, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin", "MOCKROOT": ROOT})
+                sizes, i, sent = [4096, 8192, 512, 65536, 1000, 16384, 12288, MAXDATA], 0, 0
+                while True:
+                    want = min(sizes[i % len(sizes)], MAXDATA)
+                    i += 1
+                    chunk = p.stdout.read(want)
+                    if not chunk:
+                        break
+                    self.okay.clear()
+                    self.c.send(A_WRTE, self.lid, self.rid, chunk)
+                    sent += len(chunk)
+                    if not self.okay.wait(30):
+                        L("exec: no OKAY for a %d-byte WRTE after %d bytes (client stalled)" % (len(chunk), sent))
+                        p.kill()
+                        break
+                p.wait()
+                L("exec: sent %d bytes" % sent)
             elif self.svc == "sync:":
                 self.sync()
         except EOFError:
@@ -177,6 +209,9 @@ class Stream:
                         assert ln <= 64 * 1024, "sync DATA chunk too large"
                         b = self.take(ln); f.write(b); h.update(b); total += len(b)
                     elif ident == b"DONE":
+                        if MODE == "hang-done":
+                            L("hang-done: not answering DONE")
+                            import time; time.sleep(3600)
                         break
                     else:
                         raise AssertionError(ident)

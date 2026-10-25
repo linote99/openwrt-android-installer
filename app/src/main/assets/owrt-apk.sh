@@ -4,11 +4,13 @@
 # MU300 系列经 mu300-lib.sh 调用 payload/tf-install-worker.sh），以及记录/跟踪日志；
 # 分区写入全部由安装包脚本按原逻辑完成。
 #
+#   owrt-apk.sh helpers         只更新 APK 自带的助手脚本（暂存包完整、助手来自旧版时）
 #   owrt-apk.sh stage SRC_DIR   把 APK 已校验的安装文件移入 /data/adb/owrt-apk/pkg
 #                               （本机：APK 私有目录；局域网设备：无线 ADB 推送到 /data/local/tmp/owrt-apk-stage）
 #   owrt-apk.sh check           只运行安装包的 preflight()（只读预检，TF 卡）
 #   owrt-apk.sh check-data part|image   userdata 两种方式的只读预检（userdata-lib.sh check）
 #   owrt-apk.sh start [tf | part MIB GROW | image MIB]   后台启动安装，并跟踪日志
+#   owrt-apk.sh e5-tool SUB ...  两阶段安装 / 重装已有 e5root 的单步（userdata-lib.sh tool）
 #   owrt-apk.sh follow          重新跟踪正在进行/上次的安装日志
 #   owrt-apk.sh status          显示暂存与任务状态
 #   owrt-apk.sh clean           删除暂存的安装文件（不动安装器日志与启动链备份）
@@ -45,8 +47,10 @@ layout_of() {
 }
 has_pkg() {
     case $(layout_of "$P") in
-        mu300) [ -f "$P/payload/tf-install-worker.sh" ] && [ -f "$BASE/mu300-lib.sh" ] ;;
-        *) [ -f "$P/files/magisk-tf-install.sh" ] ;;
+        # 安装成功后会删除大文件（与安装包 customize.sh 相同），这时不再算“已暂存”，APK 会重新暂存。
+        mu300) [ -f "$P/payload/tf-install-worker.sh" ] && [ -f "$BASE/mu300-lib.sh" ] && \
+               [ -f "$P/payload/mu300-openwrt.tar.gz" ] && [ -f "$P/payload/boot-linux.img" ] ;;
+        *) [ -f "$P/files/magisk-tf-install.sh" ] && [ -f "$P/files/openwrt.ext4.gz" ] && [ -f "$P/files/boot.img" ] ;;
     esac
 }
 fingerprint() {
@@ -121,11 +125,7 @@ cmd_stage() {
     if [ -e "$P" ]; then mv "$P" "$BASE/pkg.old" || die 'cannot replace old package'; fi
     mv "$BASE/pkg.new" "$P" || die 'cannot activate package'
     rm -rf "$BASE/pkg.old"
-    here=${0%/*}
-    for f in $HELPERS; do
-        cp "$here/$f" "$BASE/$f.new" && chown 0:0 "$BASE/$f.new" && chmod 700 "$BASE/$f.new" && \
-            mv -f "$BASE/$f.new" "$BASE/$f" || die "cannot install helper $f"
-    done
+    install_helpers
     # Every subset line must appear in the package's own manifest (whose fingerprint the
     # APK compares), so the subset list cannot be altered on its own.
     if [ "$lay" = mu300 ]; then
@@ -148,6 +148,25 @@ cmd_stage() {
     restorecon -R "$BASE" >/dev/null 2>&1 || true
     say "staged to $P"
     echo "OWRT-APK-STAGED=$(fingerprint)"
+}
+
+install_helpers() {
+    here=${0%/*}
+    [ "$here" != "$BASE" ] || return 0
+    for f in $HELPERS; do
+        cp "$here/$f" "$BASE/$f.new" && chown 0:0 "$BASE/$f.new" && chmod 700 "$BASE/$f.new" && \
+            mv -f "$BASE/$f.new" "$BASE/$f" || die "cannot install helper $f"
+    done
+}
+# 只更新 APK 自带的助手脚本（暂存包完整、但目标设备上的助手来自旧版 APK 时）。
+cmd_helpers() {
+    safe_base
+    ! job_running || die '有安装任务正在进行 / an install job is running'
+    [ "${0%/*}" != "$BASE" ] || die 'run helpers from the uploaded copy'
+    mkdir -p "$BASE" && chmod 700 "$BASE"
+    install_helpers
+    restorecon -R "$BASE" >/dev/null 2>&1 || true
+    echo 'OWRT-APK-HELPERS-OK'
 }
 
 cmd_check() {
@@ -180,6 +199,20 @@ cmd_check_data() {
         "$BB" sh "$BASE/userdata-lib.sh" check "$1"
     rc=$?
     echo "OWRT-APK-CHECK-RC=$rc"
+    return 0
+}
+# 两阶段 / 重装用的单步（userdata-lib.sh tool），在全局挂载命名空间、随包 BusyBox 下运行。
+cmd_e5_tool() {
+    case ${1:-} in preflight|firmware|bootchain-sync|arm|part-write) ;; *) die 'e5-tool preflight|firmware|bootchain-sync|arm|part-write' ;; esac
+    [ "$(layout_of "$P")" != mu300 ] || die 'not an E5-family package'
+    [ -f "$P/files/magisk-tf-install.sh" ] && [ -f "$BASE/userdata-lib.sh" ] || die '没有暂存的安装包 / no staged package'
+    ! job_running || die '有安装任务正在进行 / an install job is running'
+    validate_bb
+    chmod 755 "$P/files/"*.sh "$P/files/e5-bootctl"
+    "$BB" timeout -k 10 2400 "$BB" nsenter -t 1 -m "$BB" env E5_PACKAGE="$P" ASH_STANDALONE=1 \
+        "$BB" sh "$BASE/userdata-lib.sh" tool "$@"
+    rc=$?
+    echo "OWRT-APK-TOOL-RC=$rc"
     return 0
 }
 valid_method() {
@@ -310,11 +343,13 @@ cmd_clean() {
 case ${1:-} in
     stage) cmd_stage "${2:-}" ;;
     check) cmd_check ;;
+    helpers) cmd_helpers ;;
     check-data) cmd_check_data "${2:-}" ;;
+    e5-tool) shift; cmd_e5_tool "$@" ;;
     start) shift; cmd_start "$@" ;;
     run-install) shift; cmd_run_install "$@" ;;
     follow) cmd_follow ;;
     status) cmd_status ;;
     clean) cmd_clean ;;
-    *) die 'usage: owrt-apk.sh stage|check|check-data|start|follow|status|clean' ;;
+    *) die 'usage: owrt-apk.sh stage|helpers|check|check-data|start|follow|status|clean' ;;
 esac

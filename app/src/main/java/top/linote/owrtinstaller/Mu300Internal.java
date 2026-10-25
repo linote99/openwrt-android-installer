@@ -40,8 +40,24 @@ final class Mu300Internal {
     interface Io {
         /** Runs a short command and returns its output; throws IOException on a non-zero status. */
         String sh(String script, boolean root) throws IOException;
+        /** Like sh(), giving up (with an error naming the command) after silenceSec without any output; 0 = never. */
+        default String sh(String script, boolean root, int silenceSec) throws IOException { return sh(script, root); }
+        /** Like sh(silenceSec), also handing each output line to live as it arrives. */
+        default String sh(String script, boolean root, int silenceSec, java.util.function.Consumer<String> live) throws IOException {
+            String out = sh(script, root, silenceSec);
+            if (live != null) for (String l : out.split("\n", -1)) if (!l.isEmpty()) live.accept(l);
+            return out;
+        }
+        /** The step now running on the target and whether it writes to the device (shown while waiting). */
+        default void step(String what, boolean writes) { }
+        /** A transient progress line (not logged); counts as activity. */
+        default void status(String line) { }
+        /** The user asked to stop waiting. */
+        default boolean cancelled() { return false; }
         /** Copies a remote file that the shell user can read into dest, byte for byte. */
         void pull(String remote, File dest) throws IOException;
+        /** pull() reporting the bytes received so far. */
+        default void pull(String remote, File dest, java.util.function.LongConsumer received) throws IOException { pull(remote, dest); }
         /** Copies local into remote (as the ADB shell user when possible; root locally). */
         void push(File local, String remote) throws IOException;
         void reboot() throws IOException;
@@ -134,6 +150,9 @@ final class Mu300Internal {
             });
         }
         sums.append(hex(md.digest())).append("  ").append(ROOTFS).append('\n');
+        File mf = new File(pkg, MANIFEST);
+        if (!mf.isFile()) mf = new File(desktop, MANIFEST);
+        if (mf.isFile()) sums.append(copy(mf, new File(out, MANIFEST))).append("  ").append(MANIFEST).append('\n');
         writeAll(new File(out, LOCAL_SUMS), sums.toString().getBytes(StandardCharsets.UTF_8));
         if (pr != null) pr.step("检查启动镜像生成", 92);
         checkBoot(out);
@@ -183,8 +202,11 @@ final class Mu300Internal {
         Storage s;
         Mu300Gpt.Space space;          // PART only
         boolean encrypted;
+        boolean encUnknown;            // encrypted() raised: no shrink at all (keep or format), like the original
+        boolean aligned;               // userdata starts on a 1 MiB boundary (shrink possible at all)
         String encryptedNote;          // why preservation is impossible / unknown
-        long freeMax, shrinkMax, shrinkCap, maximum, rootMib;
+        long freeMax, shrinkMax, shrinkCap, formatMax, maximum, rootMib;
+        long rootStart, rootSize;      // RESUME: geometry of the prepared mu300root
         long min = 2048, def = 4096;
         String summary;
     }
@@ -260,6 +282,22 @@ final class Mu300Internal {
     }
 
     static long download(Io io, String command, File dest, long expected) throws IOException {
+        return download(io, command, dest, expected, dest.getName());
+    }
+    /** Reads larger than this report progress while the target copies them. */
+    static final long BIG_READ = 4L << 20;
+    static String human(long b) {
+        if (b >= 1L << 20) return String.format(java.util.Locale.US, "%.1f MiB", b / 1048576.0);
+        if (b >= 1024) return String.format(java.util.Locale.US, "%.1f KiB", b / 1024.0);
+        return b + " B";
+    }
+    /**
+     * binary_io.pull_binary: the target copies the source to a private staging file, hashes it and
+     * re-reads the source to compare, then the file is pulled and hashed here. Large reads report
+     * the bytes copied on the target (once a second), each hashing phase, and the download's bytes
+     * and speed, so the progress card never sits silent while the work is going on.
+     */
+    static long download(Io io, String command, File dest, long expected, String label) throws IOException {
         long limit = 16L << 20;
         String dir = "/data/local/tmp/openwrt-read-" + token(12);
         String remote = dir + "/data.bin";
@@ -271,8 +309,27 @@ final class Mu300Internal {
         io.sh("umask 077; mkdir " + q(dir), false);
         File partial = new File(dest.getPath() + ".partial");
         try {
-            String[] meta = io.sh("set -e; set -o pipefail; (" + command + ") > " + remote + "; chmod 644 " + remote
-                    + "; wc -c < " + remote + "; sha256sum " + remote + "; (" + command + ") | sha256sum", true).trim().split("\n");
+            final boolean big = expected < 0 || expected > BIG_READ;
+            final String total = expected > 0 ? human(expected) : "大小未知";
+            long t0 = System.currentTimeMillis();
+            String copy = big
+                    ? "(" + command + ") > " + remote + " & p=$!; while kill -0 $p 2>/dev/null; do echo \"OWRT-PROG $(wc -c < "
+                            + remote + ")\"; sleep 1; done; wait $p; "
+                    : "(" + command + ") > " + remote + "; ";
+            if (big) io.status("目标设备读取 " + label + "（" + total + "）……");
+            String out = io.sh("set -e; set -o pipefail; " + copy + "chmod 644 " + remote + "; echo OWRT-PHASE hash; wc -c < " + remote
+                    + "; sha256sum " + remote + "; echo OWRT-PHASE verify; (" + command + ") | sha256sum", true, 600, l -> {
+                String t = l.trim();
+                if (!big) return;
+                if (t.startsWith("OWRT-PROG ")) {
+                    String n = t.substring(10).trim();
+                    if (NUM.matcher(n).matches()) io.status("目标设备读取 " + label + "：" + human(Long.parseLong(n)) + " / " + total);
+                } else if (t.equals("OWRT-PHASE hash")) io.status("目标设备计算 " + label + " 的校验值……");
+                else if (t.equals("OWRT-PHASE verify")) io.status("目标设备重读 " + label + " 源数据，核对校验值……");
+            });
+            java.util.List<String> kept = new java.util.ArrayList<>();
+            for (String l : out.trim().split("\n")) if (!l.trim().startsWith("OWRT-")) kept.add(l);
+            String[] meta = kept.toArray(new String[0]);
             if (meta.length > 3) meta = java.util.Arrays.copyOfRange(meta, meta.length - 3, meta.length);   // local su merges stderr
             if (meta.length != 3 || !NUM.matcher(meta[0].trim()).matches()) throw new IOException("二进制读取校验信息无效");
             long size = Long.parseLong(meta[0].trim());
@@ -280,9 +337,27 @@ final class Mu300Internal {
             if (size <= 0 || (expected > 0 && size != expected) || (expected < 0 && size > limit))
                 throw new IOException("二进制读取大小不符");
             if (!staged.matches("[a-f0-9]{64}") || !source.equals(staged)) throw new IOException("二进制源数据校验不一致");
-            io.pull(remote, partial);
+            final long t1 = System.currentTimeMillis();
+            final long[] shown = {0};
+            final String sizeText = human(size);
+            if (big) io.status("下载 " + label + "：0 / " + sizeText);
+            io.pull(remote, partial, n -> {
+                if (!big) return;
+                long now = System.currentTimeMillis();
+                if (now - shown[0] < 300 && n < size) return;
+                shown[0] = now;
+                double sec = (now - t1) / 1000.0;
+                io.status(String.format(java.util.Locale.US, "下载 %s：%s / %s · %.1f MiB/s", label, human(n), sizeText,
+                        sec > 0.05 ? n / 1048576.0 / sec : 0.0));
+            });
             if (partial.length() != size) throw new IOException("二进制文件下载不完整");
+            if (big) io.status("本机校验 " + label + "……");
             if (!hashFile(partial).equals(staged)) throw new IOException("二进制文件下载校验失败");
+            if (big) {
+                double read = (t1 - t0) / 1000.0, pull = Math.max(0.001, (System.currentTimeMillis() - t1) / 1000.0);
+                io.log(String.format(java.util.Locale.US, "  ✓ %s %s：目标设备读取与校验 %.1f 秒，传输 %.1f 秒（%.1f MiB/s），校验一致",
+                        label, sizeText, read, pull, size / 1048576.0 / pull));
+            }
             if (dest.exists() && !dest.delete()) throw new IOException("cannot replace " + dest);
             if (!partial.renameTo(dest)) throw new IOException("cannot save " + dest);
             return size;
@@ -323,12 +398,14 @@ final class Mu300Internal {
             String remote = p + "/" + name;
             String parent = remote.substring(0, remote.lastIndexOf('/'));
             io.sh("mkdir -p " + q(parent) + "; chown 2000:2000 " + q(parent) + "; chmod 700 " + q(parent), true);
+            io.step("上传 " + name, false);
             io.push(src, remote);
-            String got = first(io.sh("sha256sum " + q(remote), true));
+            io.step("校验 " + name + " 的 SHA-256", false);
+            String got = first(io.sh("sha256sum " + q(remote), true, 600));
             if (!got.equals(want)) throw new IOException("上传校验失败：" + name);
+            io.log("  ✓ " + name + "（" + size(src.length()) + "）");
             return remote;
         }
-
         String pushLocal(String rel, String name) throws IOException {
             String want = sums.get(rel);
             if (want == null) throw new IOException("内置安装文件缺少 " + rel);
@@ -350,30 +427,83 @@ final class Mu300Internal {
 
         String put(String text, String name) throws IOException { return put(text.getBytes(StandardCharsets.UTF_8), name); }
 
-        /** run(): the original wrapper script, executed detached so a dropped link never interrupts a write. */
-        String run(String body) throws IOException {
+        /**
+         * run(): the original wrapper script. A step that only reads runs in the foreground like the original
+         * installer (bounded by a silence timeout). A step that writes runs detached so a dropped link never
+         * interrupts it: it records its PID before doing anything, launch errors go to its log, and every poll
+         * checks that the process is still alive, so it can never be waited on forever without a word.
+         */
+        String run(String body, String what, boolean writes) throws IOException {
             String script = "#!/system/bin/sh\nset -eu\nP=" + p + "\nT=" + t + "\nBB=" + bb
                     + "\nexport MU300_PAYLOAD_DIR=$P MU300_INSTALL_TMP=$T MU300_BUSYBOX=$BB MU300_KEEP_PAYLOAD=1\nmkdir -p \"$T/bin\"\n\"$BB\" --install -s \"$T/bin\"\nexport PATH=\"$T/bin:$PATH\"\n"
                     + body + "\n";
             String rs = put(script, "run.sh");
-            String logf = p + "/run.log", rcf = p + "/run.rc";
-            io.sh("rm -f " + logf + " " + rcf + "; : > " + logf + "; cd /; " + bb + " setsid " + bb + " sh -c "
-                    + q(bb + " nsenter -t 1 -m " + bb + " sh " + rs + " >> " + logf + " 2>&1; echo $? > " + rcf)
-                    + " </dev/null >/dev/null 2>&1 &", true);
+            io.log("▸ " + what + (writes ? "（写入目标设备）" : "（只读）"));
+            io.step(what, writes);
+            if (!writes) return foreground(rs, what);
+            String logf = p + "/run.log", rcf = p + "/run.rc", pidf = p + "/run.pid", gof = p + "/run.go";
+            // Two-phase start. The detached process records its PID and then only waits for the go file;
+            // without it, it exits after GO_WAIT_S seconds having run nothing. The go file is created by a
+            // new session that still sees the process alive after the launching session has ended: some
+            // root setups (su implementations, adbd) end every process of a session when it closes, and
+            // then the step falls back to the foreground, like the original installer runs it.
+            String inner = "echo $$ > " + pidf + "; i=0; while [ ! -f " + gof + " ]; do i=$((i+1)); if [ $i -gt " + GO_WAIT_S
+                    + " ]; then exit 0; fi; " + bb + " sleep 1; done; " + bb + " nsenter -t 1 -m " + bb + " sh " + rs + " >> " + logf
+                    + " 2>&1; echo $? > " + rcf;
+            String launch = "";
+            try {
+                launch = io.sh("rm -f " + logf + " " + rcf + " " + pidf + " " + gof + "; : > " + logf + "; cd /; trap '' HUP; "
+                        + bb + " setsid " + bb + " sh -c " + q(inner) + " </dev/null >> " + logf + " 2>&1 & "
+                        + "i=0; while [ ! -s " + pidf + " ] && [ $i -lt 10 ]; do i=$((i+1)); sleep 1; done; "
+                        + "echo OWRT-LAUNCH-PID=$(cat " + pidf + " 2>/dev/null)", true, 120);
+            } catch (IOException e) {
+                launch = e.getMessage();
+            }
+            String pid = null;
+            long t0 = System.currentTimeMillis();
+            while (System.currentTimeMillis() - t0 < LAUNCH_MS) {
+                String o = io.sh("cat " + pidf + " 2>/dev/null; true", true, 120).trim();
+                if (o.matches("\\d{1,9}")) { pid = o; break; }
+                sleep(500);
+            }
+            boolean go = false;
+            if (pid != null) {
+                sleep(1000);
+                go = io.sh("if kill -0 " + pid + " 2>/dev/null; then : > " + gof + " && echo OWRT-GO; fi; true", true, 120).contains("OWRT-GO");
+            }
+            if (!go) {
+                String tail = "";
+                try {
+                    tail = io.sh("rm -f " + gof + "; " + (pid != null ? "kill " + pid + " 2>/dev/null; " : "")
+                            + "tail -c 2000 " + logf + " 2>/dev/null; true", true, 120).trim();
+                } catch (IOException ignored) { }
+                String detail = !tail.isEmpty() ? lastLine(tail) : lastLine(new StringBuilder(launch.replaceAll("(?m)^OWRT-LAUNCH-PID=\\s*$", "")));
+                io.log("  目标设备上的后台进程" + (pid == null ? "没有启动（" + LAUNCH_MS / 1000 + " 秒内未记录 PID）"
+                        : "（PID " + pid + "）在启动会话结束时被系统结束") + (detail.isEmpty() ? "" : "：" + detail)
+                        + "。后台进程尚未执行这一步的任何命令，现改为前台执行（与电脑端原程序相同），执行期间请保持连接、不要锁屏或断开");
+                io.step(what + "（前台执行）", true);
+                return foregroundWrite(rs, what);
+            }
+            io.log("  目标设备后台进程 PID " + pid);
             StringBuilder all = new StringBuilder();
             ByteArrayOutputStream pending = new ByteArrayOutputStream();
             long off = 0;
-            int failures = 0;
-            long started = System.currentTimeMillis();
+            int failures = 0, dead = 0;
+            long started = System.currentTimeMillis(), lastOut = started, shownSilence = 0;
             while (true) {
+                if (io.cancelled()) throw new IOException("已停止等待「" + what + "」。目标设备上的后台进程（PID " + pid
+                        + "）可能仍在写入：请保持目标设备通电、不要重启，几分钟后重新连接查看状态，不要直接重试写入");
                 String out;
                 try {
-                    out = io.sh("s=$(stat -c %s " + logf + " 2>/dev/null || echo 0); echo SIZE=$s; "
+                    out = io.sh("if kill -0 " + pid + " 2>/dev/null; then echo ALIVE=1; else echo ALIVE=0; fi; "
+                            + "s=$(stat -c %s " + logf + " 2>/dev/null || echo 0); echo SIZE=$s; "
                             + "if [ -f " + rcf + " ]; then echo RC=$(cat " + rcf + "); fi; echo DATA; "
-                            + "tail -c +" + (off + 1) + " " + logf + " 2>/dev/null | head -c 49152 | base64", true);
+                            + "tail -c +" + (off + 1) + " " + logf + " 2>/dev/null | head -c 49152 | base64", true, 120);
                     failures = 0;
                 } catch (IOException e) {
+                    if (io.cancelled()) continue;
                     if (++failures > 60) throw new IOException("与目标设备的连接中断，目标设备上的步骤可能仍在进行；请勿重复写入，稍后检查设备状态（" + e.getMessage() + "）");
+                    io.step(what + "（连接中断，正在重试 " + failures + "/60：" + e.getMessage() + "）", true);
                     sleep(5000);
                     continue;
                 }
@@ -382,6 +512,8 @@ final class Mu300Internal {
                 byte[] chunk = d < 0 ? new byte[0] : java.util.Base64.getMimeDecoder().decode(out.substring(d + 5).trim());
                 pending.write(chunk, 0, chunk.length);
                 off += chunk.length;
+                long now = System.currentTimeMillis();
+                if (chunk.length > 0) { lastOut = now; if (shownSilence > 0) { shownSilence = 0; io.step(what, true); } }
                 byte[] buf = pending.toByteArray();
                 int last = -1;
                 for (int i = buf.length - 1; i >= 0; i--) if (buf[i] == '\n') { last = i; break; }
@@ -399,17 +531,64 @@ final class Mu300Internal {
                 }
                 if (done) {
                     String rc = rcText.trim();
-                    if (!"0".equals(rc)) throw new IOException("目标设备上的步骤失败（退出码 " + rc + "）：" + lastLine(all));
+                    if (!"0".equals(rc)) throw new IOException("目标设备上的「" + what + "」失败（退出码 " + rc + "）：" + lastLine(all));
                     return all.toString();
                 }
-                if (System.currentTimeMillis() - started > 6L * 3600 * 1000) throw new IOException("目标设备上的步骤超过 6 小时未结束");
+                // ALIVE is sampled before RC: a process that is gone without an exit code died (killed, out of memory).
+                if ("0".equals(head.get("ALIVE")) && rcText == null && chunk.length == 0) {
+                    if (++dead >= 2) throw new IOException("目标设备上的「" + what + "」进程（PID " + pid + "）意外结束，没有返回退出码"
+                            + (all.length() > 0 ? "；最后输出：" + lastLine(all) : "") + "。该步骤可能只完成了一部分：请勿直接重试，先查看日志并检查设备状态");
+                } else dead = 0;
+                long silent = (now - lastOut) / 60000;
+                if (silent >= 1 && silent != shownSilence) {
+                    shownSilence = silent;
+                    io.step(what + "（已 " + silent + " 分钟无新输出，目标设备进程 " + pid + " 仍在运行）", true);
+                }
+                if (now - started > 6L * 3600 * 1000) throw new IOException("目标设备上的「" + what + "」超过 6 小时未结束");
                 if (chunk.length < 49152) sleep(1500);
             }
         }
-
+        /**
+         * A writing step in the foreground (installer.py run(): adb shell su -c "$BB nsenter -t 1 -m $BB sh run.sh"),
+         * used when the target does not keep detached processes alive. Output is logged as it arrives.
+         */
+        private String foregroundWrite(String rs, String what) throws IOException {
+            StringBuilder all = new StringBuilder();
+            String[] rc = {null};
+            try {
+                io.sh(bb + " nsenter -t 1 -m " + bb + " sh " + rs + " 2>&1; echo OWRT-RUN-RC=$?", true, WRITE_SILENCE_S, l -> {
+                    if (l.startsWith("OWRT-RUN-RC=")) { rc[0] = l.substring(12).trim(); return; }
+                    if (l.isEmpty()) return;
+                    all.append(l).append('\n');
+                    io.log(l);
+                });
+            } catch (IOException e) {
+                throw new IOException("前台执行「" + what + "」时与目标设备的连接中断或超时（" + e.getMessage() + "）"
+                        + (all.length() > 0 ? "；最后输出：" + lastLine(all) : "") + "。该步骤可能只完成了一部分：请勿直接重试，先查看日志并检查设备状态");
+            }
+            if (rc[0] == null) throw new IOException("目标设备上的「" + what + "」没有返回退出码：" + lastLine(all));
+            if (!"0".equals(rc[0])) throw new IOException("目标设备上的「" + what + "」失败（退出码 " + rc[0] + "）：" + lastLine(all));
+            return all.toString();
+        }
+        /** A read-only step in the foreground, like the original installer's adb shell call. */
+        private String foreground(String rs, String what) throws IOException {
+            String out = io.sh(bb + " nsenter -t 1 -m " + bb + " sh " + rs + " 2>&1; echo OWRT-RUN-RC=$?", true, READ_ONLY_SILENCE_S);
+            StringBuilder all = new StringBuilder();
+            String rc = null;
+            for (String l : out.split("\n")) {
+                if (l.startsWith("OWRT-RUN-RC=")) { rc = l.substring(12).trim(); continue; }
+                if (l.isEmpty()) continue;
+                all.append(l).append('\n');
+                io.log(l);
+            }
+            if (rc == null) throw new IOException("目标设备上的「" + what + "」没有返回退出码：" + lastLine(all));
+            if (!"0".equals(rc)) throw new IOException("目标设备上的「" + what + "」失败（退出码 " + rc + "）：" + lastLine(all));
+            return all.toString();
+        }
         /** prepare_payload(root, tf=False, with_rootfs=True). */
-        void preparePayload() throws IOException {
-            io.log("上传安装文件（已剔除构建机基带运行时与非公开固件）");
+        void preparePayload() throws IOException { preparePayload(true); }
+        void preparePayload(boolean withRootfs) throws IOException {
+            io.log(withRootfs ? "上传安装文件（已剔除构建机基带运行时与非公开固件）" : "上传准备阶段文件（此阶段不需要 OpenWrt 系统包）");
             String[] names = {"busybox", "android-bootchain.sh", "bootchain.sh", "switch.sh", "mu300-vendor-from-device.sh",
                     "rootfs-critical.sha256", "rootfs.requirements"};
             int i = 0;
@@ -418,15 +597,20 @@ final class Mu300Internal {
                 pushLocal(rel, n);
                 io.progress(5 + 5 * (++i) / names.length);
             }
-            pushLocal(ROOTFS, "mu300-openwrt.tar.gz");
+            if (withRootfs) pushLocal(ROOTFS, "mu300-openwrt.tar.gz");
             io.progress(40);
             io.sh("chmod 755 " + bb + " " + p + "/*.sh", true);
+            io.step("确认目标设备能运行安装包里的 busybox", false);
+            String bbOk = io.sh(bb + " echo OWRT-BB-OK 2>&1; true", true, 60);
+            if (!bbOk.contains("OWRT-BB-OK"))
+                throw new IOException("目标设备无法运行安装包里的 busybox：" + lastLine(bbOk.trim()) + "。没有改动目标设备");
             for (String n : DESKTOP_SH) pushLocal("desktop/" + n, n);
             pushLocal("desktop/files/boot/ext4-geometry.sh", "ext4-geometry.sh");
             for (String rel : sums.keySet()) if (rel.startsWith(REPAIR)) pushLocal(rel, rel);
             io.sh("chmod -R u+rx " + p + "/desktop/files/boot/repair", true);
+            io.log("安装文件已全部上传并校验");
             io.progress(50);
-            run("\"$BB\" sh \"$P/android-bootchain.sh\" check");
+            run("\"$BB\" sh \"$P/android-bootchain.sh\" check", "检查启动链（android-bootchain.sh check）", false);
         }
 
         byte[] live() throws IOException {
@@ -467,14 +651,15 @@ final class Mu300Internal {
                     + "    dd if=\"$T/misc-before.bin\" of=/dev/block/by-name/misc bs=1 seek=2048 conv=notrunc,fsync\n"
                     + "    exit 1\n"
                     + "fi\n"
-                    + "echo 'BOOT-VERIFIED; OpenWrt selected'");
+                    + "echo 'BOOT-VERIFIED; OpenWrt selected'", "同步启动链、写入启动镜像并选择 Linux 槽", true);
             if (!out.contains("BOOT-VERIFIED")) throw new IOException("启动镜像写入未确认");
         }
 
         String settings(long imageMib, String mode) { return Mu300Gpt.settings(imageMib, mode, kernel, true); }
 
         String imageChecksum() throws IOException {
-            String c = first(io.sh("sha256sum " + t + "/openwrt.ext4.new", true));
+            io.step("计算 OpenWrt 镜像的 SHA-256", false);
+            String c = first(io.sh("sha256sum " + t + "/openwrt.ext4.new", true, 3600));
             if (!c.matches("[a-f0-9]{64}")) throw new IOException("Invalid image checksum");
             return c;
         }
@@ -533,7 +718,7 @@ final class Mu300Internal {
 
     // ------------------------------------------------------------------ read-only check
 
-    enum Kind { PART, REPART, IMAGE }
+    enum Kind { PART, REPART, IMAGE, RESUME }
 
     static Plan check(Io io, Kind kind) throws IOException {
         io.log("  读取设备型号、平台与启动槽…");
@@ -550,9 +735,20 @@ final class Mu300Internal {
             if (p.encrypted) p.encryptedNote = "userdata 已加密";
         } catch (IllegalStateException e) {
             p.encrypted = true;
+            p.encUnknown = true;
             p.encryptedNote = "无法确认 userdata 的加密状态";
         }
         io.log("  加密判断：" + (p.encrypted ? p.encryptedNote + ("file".equals(s.type) ? "（文件级加密 FBE）" : "block".equals(s.type) ? "（全盘加密 FDE）" : "") : "未加密"));
+        if (kind == Kind.RESUME) {
+            if (s.root == null) throw new IOException("没有找到已准备的 mu300root 分区（格式化 userdata 的准备阶段可能还没完成，或 Android 尚未刷新分区节点）");
+            String[] g = io.sh("cat /sys/class/block/" + s.root + "/start /sys/class/block/" + s.root + "/size", true).trim().split("\\s+");
+            if (g.length != 2 || !NUM.matcher(g[0]).matches() || !NUM.matcher(g[1]).matches()) throw new IOException("无法读取 mu300root 位置");
+            p.rootStart = Long.parseLong(g[0]);
+            p.rootSize = Long.parseLong(g[1]);
+            p.rootMib = p.rootSize / 2048;
+            p.summary = "续装到已准备的 /dev/block/" + s.root + "（" + p.rootMib + " MiB）";
+            return p;
+        }
         if (kind == Kind.REPART) {
             if (s.root == null) throw new IOException("没有已有的 mu300root 分区可重装");
             String cap = io.sh("cat /sys/class/block/" + s.root + "/size", true).trim();
@@ -579,22 +775,76 @@ final class Mu300Internal {
         if (space.empty.isEmpty()) throw new IOException("GPT 没有空闲的分区表项；未做任何修改");
         p.freeMax = space.largest / 2048 / 4 * 4;
         p.shrinkMax = (s.size / 2048 - 2048) / 4 * 4;
-        boolean shrinkOk = !p.encrypted && s.start % 2048 == 0;
-        // Preserving shrink (as install() checks it): target/2 >= used KiB + 1 GiB reserve.
+        p.aligned = s.start % 2048 == 0;
+        boolean anyShrink = p.aligned && !p.encUnknown;
+        // Preserving shrink (as install() checks it): target/2 >= used KiB + 1 GiB reserve. Formatting has no reserve.
         long reserve = 2 * (s.size / 2 - s.free + 1048576);
-        long shrinkCap = shrinkOk ? Math.max(0, Math.min(p.shrinkMax, (s.size - reserve) / 2048 / 4 * 4)) : 0;
-        p.shrinkCap = shrinkCap;
-        p.maximum = Math.max(p.freeMax, shrinkCap);
+        p.shrinkCap = anyShrink && !p.encrypted ? Math.max(0, Math.min(p.shrinkMax, (s.size - reserve) / 2048 / 4 * 4)) : 0;
+        p.formatMax = anyShrink ? Math.max(0, p.shrinkMax) : 0;
+        p.maximum = Math.max(p.freeMax, Math.max(p.shrinkCap, p.formatMax));
+        io.log("  路径一 未分配空间（不碰 userdata）：" + (p.freeMax >= p.min ? "最大 " + p.freeMax + " MiB" : "不可用，最大连续未分配只有 " + p.freeMax + " MiB"));
+        io.log("  路径二 保留数据缩容：" + (p.shrinkCap >= p.min ? "最大 " + p.shrinkCap + " MiB" : "不可用，" + keepWhyNot(p)));
+        io.log("  路径三 格式化 userdata（Android 数据全部清空）：" + (p.formatMax >= p.min ? "最大 " + p.formatMax + " MiB" : "不可用，" + formatWhyNot(p)));
         if (p.maximum < p.min) {
-            if (!shrinkOk && p.freeMax < p.min)
-                throw new IOException("eMMC 没有足够的未分配空间（" + p.freeMax + " MiB），且" + (p.encryptedNote != null ? p.encryptedNote : "userdata 起点未对齐")
-                        + "，无法保留数据缩容；请改用 TF 卡安装");
-            throw new IOException("可用空间不足 2 GiB（未分配 " + p.freeMax + " MiB，可缩容 " + shrinkCap + " MiB）");
+            throw new IOException("三条路径都放不下 2 GiB 的 OpenWrt 分区：未分配 " + p.freeMax + " MiB；保留数据缩容" + (p.shrinkCap >= p.min ? "" : "不可用（" + keepWhyNot(p) + "）")
+                    + "；格式化 userdata" + (p.formatMax >= p.min ? "" : "不可用（" + formatWhyNot(p) + "）") + "。请改用 TF 卡安装");
         }
-        p.def = Math.min(4096, p.maximum) / 4 * 4;
-        p.summary = "eMMC " + s.diskSize / 2048 + " MiB；未分配可用 " + p.freeMax + " MiB" + (shrinkOk ? "；可保留数据缩容至多 " + shrinkCap + " MiB"
-                : "；" + (p.encryptedNote != null ? p.encryptedNote : "userdata 未对齐") + "，不能缩容");
+        // Default never lands on a destructive path: unallocated space first, then a preserving shrink.
+        long base = p.freeMax >= p.min ? p.freeMax : p.shrinkCap >= p.min ? p.shrinkCap : p.formatMax;
+        p.def = Math.max(p.min, Math.min(4096, base) / 4 * 4);
+        p.summary = "eMMC " + s.diskSize / 2048 + " MiB；未分配可用 " + p.freeMax + " MiB"
+                + (p.shrinkCap >= p.min ? "；可保留数据缩容至多 " + p.shrinkCap + " MiB" : "；不能保留数据缩容（" + keepWhyNot(p) + "）")
+                + (p.formatMax >= p.min ? "；格式化 userdata 后至多 " + p.formatMax + " MiB" : "");
         return p;
+    }
+
+    private static String keepWhyNot(Plan p) {
+        if (!p.aligned) return "userdata 起点未按 1 MiB 对齐";
+        if (p.encUnknown) return "无法确认 userdata 的加密状态";
+        if (p.encrypted) return "userdata 已加密，加密数据无法离线保留";
+        return "已用数据加 1 GiB 余量后剩余不足 2 GiB";
+    }
+
+    private static String formatWhyNot(Plan p) {
+        if (!p.aligned) return "userdata 起点未按 1 MiB 对齐";
+        if (p.encUnknown) return "无法确认 userdata 的加密状态，原程序同样拒绝缩容";
+        return "userdata 太小";
+    }
+
+    /** The three PART routes of the original install(): GPT gap, preserving shrink, formatting userdata. */
+    enum Route { FREE, KEEP, FORMAT }
+
+    /**
+     * The route the original takes for this size: a GPT gap always wins (it never touches userdata); otherwise
+     * a shrink, which formats userdata when it is encrypted or the user asked for it (--format-userdata).
+     * Returns null when the size fits no route; why() explains it.
+     */
+    static Route route(Plan p, long mib, boolean format) {
+        if (p == null || p.space == null || mib < p.min) return null;
+        if (Mu300Gpt.freeRootRange(p.space, mib * 2048) >= 0) return Route.FREE;
+        if (!p.aligned || p.encUnknown || mib > p.shrinkMax) return null;
+        if (p.encrypted || format) return Route.FORMAT;
+        return mib <= p.shrinkCap ? Route.KEEP : null;
+    }
+
+    /** True when this size can only be installed by formatting userdata (encrypted, or data does not fit). */
+    static boolean formatRequired(Plan p, long mib) {
+        Route plain = route(p, mib, false);
+        return (plain == null || plain == Route.FORMAT) && route(p, mib, true) == Route.FORMAT;
+    }
+
+    static String why(Plan p, long mib, boolean format) {
+        if (p == null || p.space == null) return "请先完成只读检查";
+        Route r = route(p, mib, format);
+        if (r == Route.FREE) return "所选 " + mib + " MiB 放得进 eMMC 未分配空间（最大 " + p.freeMax + " MiB），不缩小也不格式化 userdata";
+        if (r == Route.KEEP) return "未分配空间只有 " + p.freeMax + " MiB，放不下 " + mib + " MiB；userdata 未加密且数据放得下，离线缩小 userdata 并保留 Android 数据";
+        if (r == Route.FORMAT) return "未分配空间只有 " + p.freeMax + " MiB，放不下 " + mib + " MiB；"
+                + (p.encrypted ? "userdata 已加密（" + orDash(p.s.type) + "），加密数据无法离线保留，" : format && mib <= p.shrinkCap ? "按你的选择不保留数据，" : "已用数据放不进缩小后的 userdata，")
+                + "必须格式化 userdata（Android 数据全部清空）";
+        if (mib > p.maximum) return "超出最大 " + p.maximum + " MiB";
+        if (!p.aligned || p.encUnknown) return "放不进未分配空间（" + p.freeMax + " MiB），且" + keepWhyNot(p) + "，无法缩容";
+        if (mib > p.shrinkMax) return "超出缩容上限 " + p.shrinkMax + " MiB";
+        return "保留数据缩容最多 " + p.shrinkCap + " MiB；更大需要勾选“格式化 userdata”";
     }
 
     private static String fsName(Storage s) {
@@ -651,9 +901,9 @@ final class Mu300Internal {
         for (String n : new String[]{"boot", "uboot", "sml", "teecfg", "trustos", "vbmeta"})
             for (String sl : new String[]{"a", "b"}) items.put(n + "_" + sl + ".img", "cat /dev/block/by-name/" + n + "_" + sl);
         StringBuilder sums = new StringBuilder();
-        for (Map.Entry<String, String> it : items.entrySet()) {
-            String n = it.getKey();
-            io.log("备份：" + n);
+        LinkedHashMap<String, Long> sizes = new LinkedHashMap<>();
+        long all = 0;
+        for (String n : items.keySet()) {
             long size;
             if (n.equals("misc-head.bin")) size = 4096;
             else if (n.equals("gpt-first.bin")) size = front * 512;
@@ -663,8 +913,19 @@ final class Mu300Internal {
                 if (!NUM.matcher(v).matches()) throw new IOException("无法读取分区大小：" + n);
                 size = Long.parseLong(v);
             }
+            sizes.put(n, size);
+            all += size;
+        }
+        io.log("备份 " + items.size() + " 项到本机，合计 " + human(all) + "：" + path);
+        int i = 0;
+        for (Map.Entry<String, String> it : items.entrySet()) {
+            String n = it.getKey();
+            long size = sizes.get(n);
+            i++;
+            io.step("备份 " + n + "（第 " + i + "/" + items.size() + " 个）", false);
+            io.log("正在备份 第 " + i + "/" + items.size() + " 个：" + n + "（" + human(size) + "）");
             File f = new File(path, n);
-            download(io, it.getValue() + " 2>/dev/null", f, size);
+            download(io, it.getValue() + " 2>/dev/null", f, size, n);
             sums.append(hashFile(f)).append("  ").append(n).append('\n');
         }
         byte[] first = readAll(new File(path, "gpt-first.bin")), last = readAll(new File(path, "gpt-last.bin"));
@@ -684,9 +945,26 @@ final class Mu300Internal {
 
     static Outcome install(Io io, File local, String kernel, Kind kind, long sizeMib, File backupRoot, String serial,
                            Boolean expectFree, PathSink backupSink) throws IOException {
+        Route r = expectFree == null ? null : expectFree ? Route.FREE : Route.KEEP;
+        return install(io, local, kernel, kind, sizeMib, backupRoot, serial, r, false, backupSink);
+    }
+
+    static Outcome install(Io io, File local, String kernel, Kind kind, long sizeMib, File backupRoot, String serial,
+                           Route expect, boolean formatData, PathSink backupSink) throws IOException {
         Plan p = check(io, kind);
         Storage s = p.s;
         io.log("设备：" + p.model + "（" + p.profile + "），Android 槽 " + p.slot + "，Linux 槽 " + p.linux);
+        if (kind == Kind.RESUME) {
+            Resume rec = loadResume(io, p, local, backupRoot, serial);
+            io.log("续装记录：" + rec.file.getAbsolutePath());
+            io.log("继续安装到已准备的 OpenWrt 分区 /dev/block/" + s.root + "（" + p.rootMib + " MiB）");
+            bindPackage(local, rec.r, rec.file);
+            Session x = new Session(io, local, p, kernel);
+            x.preparePayload();
+            Outcome o = directWrite(x, s, p.rootSize, rec);
+            x.cleanup();
+            return o;
+        }
         if (kind == Kind.REPART) {
             Session x = new Session(io, local, p, kernel);
             x.preparePayload();
@@ -703,7 +981,7 @@ final class Mu300Internal {
             x.preparePayload();
             x.put(x.settings(size, "data-image"), "desktop-settings.env");
             io.progress(60);
-            x.run("\"$BB\" sh \"$P/android-image.sh\"");
+            x.run("\"$BB\" sh \"$P/android-image.sh\"", "生成 OpenWrt 系统镜像（只写临时文件，不改分区）", true);
             io.progress(85);
             byte[] live = x.live();
             x.flash(x.boot("data-image", live, null, null), Mu300Boot.bootControl(live, p.slot));
@@ -711,10 +989,19 @@ final class Mu300Internal {
             return new Outcome(false, "userdata 镜像和启动镜像已安装并校验", "请手动重启设备进入 OpenWrt");
         }
         long offset = Mu300Gpt.freeRootRange(p.space, size * 2048);
-        // The user confirmed one of the two paths (unallocated space vs. shrinking userdata); never switch silently.
-        if (expectFree != null && expectFree != (offset >= 0))
-            throw new IOException("设备分区状态与检查时不同（" + (offset >= 0 ? "现在可以使用未分配空间" : "未分配空间已不够，需要缩小 userdata")
+        Route now = route(p, size, formatData);
+        io.log("安装路径：" + (now == Route.FREE ? "未分配空间" : now == Route.KEEP ? "保留数据缩容" : now == Route.FORMAT ? "格式化 userdata" : "无")
+                + "。原因：" + why(p, size, formatData));
+        if (offset >= 0 && formatData)
+            throw new IOException("所选大小放得进未分配空间，这条路径会保留 userdata，不需要也不会格式化；请取消“格式化 userdata”后重试。未做任何修改");
+        // The user confirmed exactly one path (unallocated / keep data / format userdata); never switch silently.
+        if (expect != null && expect != now)
+            throw new IOException("设备分区状态与检查时不同（检查时为" + routeName(expect) + "，现在为" + (now == null ? "无可用路径" : routeName(now))
                     + "）；未安装任何内容，请重新做只读检查");
+        if (now == null) throw new IOException(why(p, size, formatData) + "；未做任何修改");
+        // Formatting is never implied (not even by encryption): the user must have opted in for this run.
+        if (now == Route.FORMAT && !formatData)
+            throw new IOException(why(p, size, false) + "；需要勾选“格式化 userdata”并确认清空 Android 数据，未做任何修改");
         if (offset >= 0) {
             io.log("使用 eMMC 未分配空间 " + size + " MiB（起始扇区 " + offset + "），不缩容、不格式化 Android");
             File b = backupDir(backupRoot, s);
@@ -730,27 +1017,52 @@ final class Mu300Internal {
             x.cleanup();
             return o;
         }
-        // Offline shrink that preserves Android data.
-        if (p.encrypted) throw new IOException((p.encryptedNote != null ? p.encryptedNote : "userdata 已加密") + "，无法保留数据缩容；请减小大小以使用未分配空间，或改用 TF 卡");
+        if (p.encUnknown) throw new IOException("无法确认 userdata 的加密状态，拒绝缩容（原程序同样拒绝）；未做任何修改");
         if (s.start % 2048 != 0) throw new IOException("userdata 起点未按 1 MiB 对齐，不支持缩容");
         long[] tn;
         try { tn = Mu300Gpt.allocation(s.size, size); }
         catch (IllegalArgumentException e) { throw new IOException("每个系统至少需要 2 GiB"); }
-        long target = tn[0];
-        if (target / 2 < (s.size / 2 - s.free + 1048576))
-            throw new IOException("缩小后的 userdata 放不下现有 Android 数据和 1 GiB 余量；请减小 OpenWrt 分区");
-        io.log("离线缩小 userdata 并保留 Android 数据：userdata " + s.size / 2048 + " → " + target / 2048 + " MiB，OpenWrt " + size + " MiB");
+        long target = tn[0], need = tn[1];
+        boolean destructive = now == Route.FORMAT;
+        if (!destructive && target / 2 < (s.size / 2 - s.free + 1048576))
+            throw new IOException("缩小后的 userdata 放不下现有 Android 数据和 1 GiB 余量；请减小 OpenWrt 分区，或勾选“格式化 userdata”");
+        if (destructive)
+            io.log("格式化 userdata 后安装（Android 数据全部清空）：userdata " + s.size / 2048 + " → " + target / 2048 + " MiB，OpenWrt " + size + " MiB"
+                    + (p.encrypted ? "；原因：userdata 已加密，加密数据无法离线保留" : "；原因：你选择了格式化 userdata"));
+        else
+            io.log("离线缩小 userdata 并保留 Android 数据：userdata " + s.size / 2048 + " → " + target / 2048 + " MiB，OpenWrt " + size + " MiB");
         File b = backupDir(backupRoot, s);
         backup(io, b, s, p.slot, serial);
         if (backupSink != null) backupSink.path(b.getAbsolutePath());
         io.log("备份已保存：" + b.getAbsolutePath());
         Session x = new Session(io, local, p, kernel);
         byte[] live = x.live();
+        if (destructive) {
+            String token = token(16);
+            byte[] aa = androidBlock(live, p.slot);
+            String request = token + ":" + s.cid + ":" + s.node + ":" + s.start + ":" + s.size + ":" + target + ":" + need + ":" + hex(aa);
+            LinkedHashMap<String, Object> r = new LinkedHashMap<>();
+            r.put("format", 1L); r.put("state", "prepared-request"); r.put("serial", serial); r.put("android_slot", p.slot);
+            r.put("storage", storageMap(s)); r.put("target", target); r.put("need", need); r.put("token", token);
+            r.put("package", hashFile(new File(local, MANIFEST)));
+            File rec = new File(b, "transaction.json");
+            bindPackage(local, r, rec);
+            io.log("续装记录已保存：" + rec.getAbsolutePath());
+            x.preparePayload(false);
+            io.progress(80);
+            x.flash(x.boot("prepare", live, request, null), Mu300Boot.bootControl(live, p.slot));
+            io.log("重启后离线缩小 userdata 并格式化，Android 会恢复出厂设置（开发者选项、USB 调试、Magisk 和 Shell 的 root 授权都会没有）");
+            for (String l : resumePrep().split("\n")) io.log("  " + l);
+            io.log("首次开机离线缩容通常需数分钟，请勿断电；缩容完成后自动重启，原厂恢复出厂可能另有重启");
+            io.reboot();
+            return new Outcome(true, "准备阶段已写入，设备将离线缩容并重置 Android（Android 数据全部清空）",
+                    "等待数分钟离线缩容及自动重启；" + RESUME_PREP_SHORT);
+        }
         x.preparePayload();
         x.put(x.settings(2048, "part-stage"), "desktop-settings.env");
         io.progress(60);
-        x.run("\"$BB\" sh \"$P/android-image.sh\"");
-        x.run("printf \"PART_MIB=" + size + "\\nDATA_MIB=" + target / 2048 + "\\nGROW_FS=1\\nFORMAT_DATA=0\\n\" > /data/mu300linux/part-install.conf\nsync");
+        x.run("\"$BB\" sh \"$P/android-image.sh\"", "生成 OpenWrt 系统镜像（只写临时文件，不改分区）", true);
+        x.run("printf \"PART_MIB=" + size + "\\nDATA_MIB=" + target / 2048 + "\\nGROW_FS=1\\nFORMAT_DATA=0\\n\" > /data/mu300linux/part-install.conf\nsync", "写入离线安装参数", true);
         io.progress(85);
         String identity = s.cid + ":" + s.node + ":" + s.start + ":" + s.size + ":" + target;
         x.flash(x.boot("install-part", live, null, identity), Mu300Boot.bootControl(live, p.slot));
@@ -767,16 +1079,19 @@ final class Mu300Internal {
     }
 
     /** direct_write(): image built on the device, written into mu300root with the package's own script. */
-    static Outcome directWrite(Session x, Storage s, long sectors) throws IOException {
+    static Outcome directWrite(Session x, Storage s, long sectors) throws IOException { return directWrite(x, s, sectors, null); }
+    static Outcome directWrite(Session x, Storage s, long sectors, Resume rec) throws IOException {
         x.put(x.settings(2048, "part"), "desktop-settings.env");
         x.io.progress(60);
-        x.run("\"$BB\" sh \"$P/android-image.sh\"");
+        x.run("\"$BB\" sh \"$P/android-image.sh\"", "生成 OpenWrt 系统镜像（只写临时文件，不改分区）", true);
         String checksum = x.imageChecksum();
         x.io.progress(75);
-        x.run("\"$BB\" sh \"$P/android-write-part.sh\" /dev/block/" + s.root + " " + s.cid + " " + sectors + " " + checksum);
+        x.run("\"$BB\" sh \"$P/android-write-part.sh\" /dev/block/" + s.root + " " + s.cid + " " + sectors + " " + checksum,
+                "写入 OpenWrt 分区 /dev/block/" + s.root, true);
         x.io.progress(88);
         byte[] live = x.live();
         x.flash(x.boot("part", live, null, null), Mu300Boot.bootControl(live, x.plan.slot));
+        if (rec != null) { rec.r.put("state", "installed"); writeJson(rec.file, rec.r); }
         return new Outcome(false, "独立分区已安装、扩容并校验：" + String.format(Locale.US, "%.2f GiB", sectors / 2097152.0), "请手动重启设备");
     }
 
@@ -791,11 +1106,12 @@ final class Mu300Internal {
         x.put(copies[1], "gpt-new-last.bin");
         x.put(x.settings(2048, "part"), "desktop-settings.env");
         x.io.progress(60);
-        x.run("\"$BB\" sh \"$P/android-image.sh\"");
+        x.run("\"$BB\" sh \"$P/android-image.sh\"", "生成 OpenWrt 系统镜像（只写临时文件，不改分区）", true);
         String checksum = x.imageChecksum();
         x.io.progress(75);
         String disk = s.disk();
-        x.run("\"$BB\" sh \"$P/android-write-free.sh\" " + Mu300Gpt.envArgs(disk, s.cid, s.diskSize, offset, sectors, checksum, space.front, space.tail));
+        x.run("\"$BB\" sh \"$P/android-write-free.sh\" " + Mu300Gpt.envArgs(disk, s.cid, s.diskSize, offset, sectors, checksum, space.front, space.tail),
+                "在未分配空间创建 OpenWrt 分区并写入", true);
         byte[] f = read(x.io, "dd if=" + disk + " bs=512 count=" + space.front + " 2>/dev/null", space.front * 512);
         byte[] l = read(x.io, "dd if=" + disk + " bs=512 skip=" + space.tail + " count=" + (s.diskSize - space.tail) + " 2>/dev/null",
                 (s.diskSize - space.tail) * 512);
@@ -813,6 +1129,157 @@ final class Mu300Internal {
     static String q(String s) { return Mu300Gpt.quote(s); }   // shlex.quote, as the original
 
     private static final SecureRandom RNG = new SecureRandom();
+
+    static final String MANIFEST = "desktop/manifest.json";
+
+    static String routeName(Route r) {
+        return r == Route.FREE ? "使用未分配空间" : r == Route.KEEP ? "保留数据缩容" : "格式化 userdata";
+    }
+
+    /** The A/B block the prepare stage restores: Android slot selected again (the original "aa"). */
+    static byte[] androidBlock(byte[] live, String slot) {
+        byte[] aa = live.clone();
+        aa[0] = '_'; aa[1] = (byte) slot.charAt(0); aa[2] = 0; aa[3] = 0;
+        if ("a".equals(slot)) { aa[12] = (byte) 0x9f; aa[14] = (byte) 0x1e; } else { aa[12] = (byte) 0x1e; aa[14] = (byte) 0x9f; }
+        java.util.zip.CRC32 c = new java.util.zip.CRC32();
+        c.update(aa, 0, 28);
+        long v = c.getValue();
+        for (int i = 0; i < 4; i++) aa[28 + i] = (byte) (v >>> (8 * i));
+        return aa;
+    }
+
+    static LinkedHashMap<String, Object> storageMap(Storage s) {
+        LinkedHashMap<String, Object> m = new LinkedHashMap<>();
+        m.put("NODE", s.node); m.put("CID", s.cid); m.put("START", s.start); m.put("SIZE", s.size); m.put("DISK_SIZE", s.diskSize);
+        m.put("FREE", s.free); m.put("STATE", s.state); m.put("TYPE", s.type); m.put("SOURCE", s.source); m.put("MAGIC", s.magic);
+        m.put("EXT", s.ext); if (s.root != null) m.put("ROOT", s.root);
+        return m;
+    }
+
+    /** resume_payload_id(): binds a transaction to the boot/rootfs/filesystem-tool content, not paths or prompts. */
+    @SuppressWarnings("unchecked")
+    static String payloadId(byte[] manifestJson) throws IOException {
+        Map<String, Object> m;
+        try { m = (Map<String, Object>) MiniJson.parse(new String(manifestJson, StandardCharsets.UTF_8)); }
+        catch (RuntimeException e) { throw new IOException("desktop/manifest.json 无法解析"); }
+        Object lo = m.get("magisk_layout"), mo = m.get("magisk"), dobj = m.get("desktop");
+        Map<String, Object> layout = lo instanceof Map ? (Map<String, Object>) lo : new LinkedHashMap<>();
+        if (!(mo instanceof Map) || !(dobj instanceof Map) || !(m.get("kernel") instanceof String)) throw new IOException("续装载荷信息不完整");
+        java.util.TreeMap<String, Object> files = new java.util.TreeMap<>();
+        for (String n : new String[]{"boot-linux.img", "mu300-openwrt.tar.gz", "rootfs-critical.sha256", "rootfs.requirements", "busybox"}) {
+            Object key = layout.containsKey(n) ? layout.get(n) : n;
+            Object h = ((Map<String, Object>) mo).get(String.valueOf(key));
+            if (!(h instanceof String) || !((String) h).matches("[a-f0-9]{64}")) throw new IOException("续装载荷信息不完整：" + n);
+            files.put(n, h);
+        }
+        boolean repair = false;
+        for (Map.Entry<String, Object> e : ((Map<String, Object>) dobj).entrySet())
+            if (e.getKey().startsWith("desktop/files/boot/repair/")) { files.put(e.getKey(), e.getValue()); repair = true; }
+        if (!repair) throw new IOException("安装包缺少续装所需的文件系统工具校验值");
+        java.util.TreeMap<String, Object> canon = new java.util.TreeMap<>();
+        canon.put("files", files); canon.put("format", 1L); canon.put("kernel", m.get("kernel")); canon.put("layout", "mu300root-container");
+        return hex(sha().digest(json(canon, false).getBytes(StandardCharsets.UTF_8)));
+    }
+
+    /** bind_resume_package(): payload identity, package digest/dir, manifest snapshot beside the transaction. */
+    static void bindPackage(File local, Map<String, Object> r, File record) throws IOException {
+        byte[] mb = readAll(new File(local, MANIFEST));
+        r.put("payload_identity", payloadId(mb));
+        r.put("package", hex(sha().digest(mb)));
+        r.put("package_dir", local.getAbsolutePath());
+        File tmp = new File(record.getParentFile(), "package-manifest.tmp");
+        writeAll(tmp, mb);
+        if (!tmp.renameTo(new File(record.getParentFile(), "package-manifest.json"))) throw new IOException("无法保存 package-manifest.json");
+        writeJson(record, r);
+    }
+
+    static void writeJson(File f, Map<String, Object> r) throws IOException {
+        File tmp = new File(f.getParentFile(), f.getName() + ".tmp");
+        writeAll(tmp, (json(r, true) + "\n").getBytes(StandardCharsets.UTF_8));
+        if (!tmp.renameTo(f)) throw new IOException("无法保存 " + f);
+    }
+
+    /** Minimal JSON writer; compact output matches json.dumps(..., separators=(',',':')) for ASCII data. */
+    @SuppressWarnings("unchecked")
+    static String json(Object v, boolean pretty) {
+        if (v == null) return "null";
+        if (v instanceof Boolean || v instanceof Long || v instanceof Integer) return v.toString();
+        if (v instanceof Map) {
+            StringBuilder b = new StringBuilder("{");
+            int i = 0;
+            for (Map.Entry<String, Object> e : ((Map<String, Object>) v).entrySet()) {
+                if (i++ > 0) b.append(pretty ? ", " : ",");
+                b.append(json(e.getKey(), pretty)).append(pretty ? ": " : ":").append(json(e.getValue(), pretty));
+            }
+            return b.append('}').toString();
+        }
+        String t = String.valueOf(v);
+        StringBuilder b = new StringBuilder("\"");
+        for (char c : t.toCharArray()) {
+            if (c == '"' || c == '\\') b.append('\\').append(c);
+            else if (c < 0x20 || c > 0x7e) b.append(String.format("\\u%04x", (int) c));
+            else b.append(c);
+        }
+        return b.append('"').toString();
+    }
+
+    static final class Resume {
+        final File file; final Map<String, Object> r;
+        Resume(File file, Map<String, Object> r) { this.file = file; this.r = r; }
+    }
+
+    private static long num(Object o) throws IOException {
+        if (o instanceof Long) return (Long) o;
+        if (o instanceof Integer) return (Integer) o;
+        throw new IOException("续装记录格式异常");
+    }
+
+    /** load_resume() + validate_resume() + validate_resume_package(): read-only, refuses any mismatch. */
+    @SuppressWarnings("unchecked")
+    static Resume loadResume(Io io, Plan p, File local, File backupRoot, String serial) throws IOException {
+        File rec = null;
+        File[] dirs = backupRoot == null ? null : backupRoot.listFiles();
+        if (dirs != null)
+            for (File d : dirs) {
+                File f = new File(d, "transaction.json");
+                if (f.isFile() && (rec == null || f.lastModified() > rec.lastModified())) rec = f;
+            }
+        if (rec == null) throw new IOException("没有找到续装记录（transaction.json）；续装只能在做过“格式化 userdata 后安装”的这台手机上进行");
+        io.log("  续装记录：" + rec.getAbsolutePath());
+        Map<String, Object> r;
+        try { r = (Map<String, Object>) MiniJson.parse(new String(readAll(rec), StandardCharsets.UTF_8)); }
+        catch (RuntimeException e) { throw new IOException("续装记录无法解析：" + rec); }
+        Storage s = p.s;
+        if (s.root == null) throw new IOException("没有找到已准备的 mu300root");
+        Map<String, Object> st = (Map<String, Object>) r.get("storage");
+        if (st == null || !s.cid.equals(st.get("CID")) || !s.node.equals(st.get("NODE")) || s.start != num(st.get("START"))
+                || !p.slot.equals(r.get("android_slot")) || !String.valueOf(serial).equals(r.get("serial")))
+            throw new IOException("续装的设备或启动槽与记录不同（eMMC、userdata 位置、Android 槽或序列号不一致）；未做任何修改");
+        long target = num(r.get("target")), need = num(r.get("need"));
+        if (s.size != target || p.rootStart != s.start + target || p.rootSize != need)
+            throw new IOException("已准备分区的位置/大小与记录不同；未做任何修改");
+        boolean verified = "installed".equals(r.get("state"));
+        if (!verified) {
+            byte[] head = read(io, "dd if=/dev/block/" + s.root + " bs=512 count=1 2>/dev/null", 512);
+            int z = 0;
+            while (z < head.length && head[z] != 0) z++;
+            String marker = new String(head, 0, z, StandardCharsets.ISO_8859_1).trim();
+            if (!marker.equals("MU300-PART-PREPARED-V2 " + r.get("token")))
+                throw new IOException("准备阶段令牌不一致，拒绝覆盖这个分区；未做任何修改");
+            io.log("  ✓ 准备阶段令牌一致");
+        } else io.log("  记录显示已安装过，将重写同一分区");
+        String current = payloadId(readAll(new File(local, MANIFEST)));
+        if (r.get("payload_identity") != null) {
+            if (!current.equals(r.get("payload_identity")))
+                throw new IOException("当前安装包的启动镜像/系统包/文件系统工具与准备时不同；请选择准备时用的同一安装包");
+        } else {
+            File snap = new File(rec.getParentFile(), "package-manifest.json");
+            if (!snap.isFile() || !hashFile(snap).equals(r.get("package")) || !payloadId(readAll(snap)).equals(current))
+                throw new IOException("准备时的安装包信息缺失或不同；请选择准备时用的同一安装包");
+        }
+        io.log("  ✓ 安装包载荷与准备时一致");
+        return new Resume(rec, r);
+    }
 
     static String token(int bytes) {
         byte[] b = new byte[bytes];
@@ -881,6 +1348,44 @@ final class Mu300Internal {
         //noinspection ResultOfMethodCallIgnored
         f.delete();
     }
+
+    /** How long a background step may take to record its PID after being launched. */
+    static long LAUNCH_MS = 20_000;
+    /**
+     * What the user must redo on the target after the formatting first stage (Android data, developer
+     * options, the Magisk app and the Shell root grant are all gone) before "继续格式化后的安装".
+     */
+    static final String[] RESUME_PREP = {
+            "完成 Android 首次设置（格式化后原来的设置全部清空）。",
+            "重新打开 ADB：在开发者选项里打开“USB 调试”（开发者选项一般在“关于手机”里连点版本号打开；没有设置界面的设备用原来开启 ADB 的方法）。",
+            "重新安装 Magisk（面具）App，确认显示已安装、已 root；如果显示未安装，按原来的方法重新 root。",
+            "用局域网（无线 ADB）连接的，还要重新开启 5555 端口的网络 ADB（例如用 USB 执行 adb tcpip 5555，或 root 后执行 setprop service.adb.tcp.port 5555 再重启 adbd）。",
+            "用本应用重新连接目标设备：先在目标设备上允许 USB 调试，再在弹出的超级用户请求里允许“Shell”（或在 Magisk「超级用户」列表里打开 Shell）。",
+    };
+    static final String RESUME_ENTRY = "完成后在「安装方式」页选“继续格式化后的安装”";
+    /** RESUME_PREP as a numbered block. */
+    static String resumePrep() {
+        StringBuilder b = new StringBuilder("继续之前，请先在目标设备上：");
+        for (int i = 0; i < RESUME_PREP.length; i++) b.append('\n').append(i + 1).append(". ").append(RESUME_PREP[i]);
+        return b.append('\n').append(RESUME_ENTRY).append('。').toString();
+    }
+    /** RESUME_PREP in one sentence, for outcome lines. */
+    static final String RESUME_PREP_SHORT = "回到 Android 后先完成首次设置，再在目标设备上重新打开 ADB（USB 调试；用局域网的还要重新开启 5555 网络 ADB）、"
+            + "重新安装 Magisk（面具），连接时在超级用户请求里给 Shell 授予 root；" + RESUME_ENTRY + "续装，不要重复运行第一阶段";
+    /** How long a parked detached step waits for its go file before exiting without running. */
+    static int GO_WAIT_S = 60;
+    /** Silence limit of a writing step run in the foreground. */
+    static int WRITE_SILENCE_S = 1800;
+    /** Longest silence of a read-only foreground step (the boot-chain check prints only at its end). */
+    static int READ_ONLY_SILENCE_S = 600;
+
+    static String size(long n) {
+        if (n < 1024) return n + " B";
+        if (n < 1L << 20) return String.format(java.util.Locale.ROOT, "%.1f KiB", n / 1024.0);
+        return String.format(java.util.Locale.ROOT, "%.1f MiB", n / 1048576.0);
+    }
+
+    private static String lastLine(String all) { return lastLine(new StringBuilder(all)); }
 
     private static String lastLine(StringBuilder all) {
         String[] ls = all.toString().trim().split("\n");

@@ -104,6 +104,23 @@ public class UsbAdbTest {
                 uc.framingErrors == 0 && uc.maxTransfer <= 16384);
         check("USB framing: zero-length packets were sent (" + uc.zlps + ")", uc.zlps > 0);
         check("USB: shell after push", c.shellText("echo after").trim().equals("after"));
+        // v1.5.1: binary reads through exec: (backups). adbd streams WRTEs whose sizes are often
+        // multiples of 512 below 16 KiB with no zero-length packet; each must be read exactly.
+        for (File f : new File[]{o1, o2}) {
+            java.io.ByteArrayOutputStream got = new java.io.ByteArrayOutputStream();
+            long t0 = System.currentTimeMillis();
+            String err2 = null;
+            try { c.execRaw("cat data/local/tmp/owrt-apk-stage/usb/" + f.getName(), got, 5000); }
+            catch (java.io.IOException e) { err2 = e.getMessage(); }
+            long dt = System.currentTimeMillis() - t0;
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            StringBuilder h = new StringBuilder();
+            for (byte x : md.digest(got.toByteArray())) h.append(String.format("%02x", x));
+            check("USB: exec read " + f.getName() + " (" + f.length() + " bytes) complete and identical in " + dt + " ms"
+                    + (err2 != null ? " (" + err2 + ")" : ""), err2 == null && got.size() == f.length() && h.toString().equals(sha(f)) && dt < 5000);
+        }
+        check("USB: no IN overflow, exact-size requests (inErrors=" + uc.inErrors + ", packets=" + uc.inPackets + ")", uc.inErrors == 0 && uc.inPackets > 0);
+        check("USB: shell after exec reads", c.shellText("echo again").trim().equals("again"));
 
         // Cable pulled: the next command fails with a clear error instead of hanging.
         uc.unplug();

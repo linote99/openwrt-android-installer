@@ -14,6 +14,7 @@ MUJ="$J/Mu300Internal.java $J/Mu300Gpt.java $J/Mu300Boot.java $J/Lz4.java $J/Roo
 javac -encoding UTF-8 -nowarn -d "$B/cls" $J/MiniJson.java $J/PackageInspector.java $MUJ test/DesktopInspect.java test/RuleTest.java test/Mu300FlowTest.java 2>&1 | grep -v '^Note'
 java -cp "$B/cls" top.linote.owrtinstaller.RuleTest > "$B/rule.txt" 2>&1; note "RuleTest rc=$? $(tail -1 "$B/rule.txt")"
 bash test/version-check.sh > "$B/version.txt" 2>&1; note "version-check rc=$? $(tail -1 "$B/version.txt")"
+bash test/ui-check.sh > "$B/ui.txt" 2>&1; note "ui-check rc=$? $(tail -1 "$B/ui.txt")"
 # Android compatibility of the APK's own classes (build.sh output): APIs must exist at minSdk 26 and
 # regex flags must be ones Android accepts (v1.4.0 crashed on Pattern.UNICODE_CHARACTER_CLASS).
 API_XML=${ANDROID_HOME:-$HOME/android-sdk}/platforms/android-34/data/api-versions.xml
@@ -42,6 +43,15 @@ for z in "$Z"/mu300-openwrt-*.zip; do
   note "Mu300FlowTest rc=$? $(basename "$z") :: $(tail -1 "$B/muflow-$(basename "$z" .zip).txt")"
 done
 rm -rf "$B/muflow"
+# v1.5.0: E5-series "format userdata" two-stage install, resume and rewrite of e5root (simulated device)
+AJ=$(ls -d "${ANDROID_HOME:-/workspace/.android-sdk}"/platforms/android-35/android.jar 2>/dev/null)
+if [ -f build/gen/top/linote/owrtinstaller/BuildInfo.java ] && [ -n "$AJ" ]; then
+  mkdir -p "$B/e5p"
+  javac -encoding UTF-8 -nowarn -cp "$AJ" -sourcepath app/src/main/java:build/gen -d "$B/e5p" test/E5PartTest.java 2>&1 | grep -v '^Note'
+  java -cp "$B/e5p:$AJ" top.linote.owrtinstaller.E5PartTest "$B/e5part-work" > "$B/e5part.txt" 2>&1; note "E5PartTest rc=$? $(tail -1 "$B/e5part.txt")"
+else
+  note "E5PartTest rc=1 FAIL: run ./build.sh first (needs build/gen and android.jar)"
+fi
 [ -n "$MU" ] && { python3 test/negative-mu300-test.py "$MU" "$B/cls" "$B/neg-mu" > "$B/negmu.txt" 2>&1; note "negative-mu300 rc=$? $(tail -1 "$B/negmu.txt")"; }
 
 javac -encoding UTF-8 -nowarn -d "$B/adb" $J/AdbConnection.java $J/AdbKey.java test/AdbTest.java 2>&1 | grep -v '^Note'
@@ -57,6 +67,29 @@ python3 test/mock-adbd.py 15556 "$B/usb-root" > "$B/adbd-usb.log" 2>&1 & UP=$!
 sleep 1.5
 timeout 120 java -cp "$B/usb" top.linote.owrtinstaller.UsbAdbTest 15556 "$B/usb-work" "$B/usb-root" > "$B/usbt.txt" 2>&1; note "UsbAdbTest rc=$? $(tail -1 "$B/usbt.txt")"
 kill $UP 2>/dev/null
+# v1.4.3: stale packets at the USB handshake, a device that never confirms sync DONE, shell silence limits
+javac -encoding UTF-8 -nowarn -d "$B/stall" $(find test/usbstub -name '*.java') $J/AdbConnection.java $J/AdbKey.java $J/UsbAdbTransport.java test/AdbStallTest.java 2>&1 | grep -v '^Note'
+mkdir -p "$B/stall-r1" "$B/stall-r2" "$B/stall-r3" "$B/stall-work"
+MOCK_MODE=stale-before python3 test/mock-adbd.py 15561 "$B/stall-r1" > "$B/adbd-stall1.log" 2>&1 & S1=$!
+MOCK_MODE=stale-after python3 test/mock-adbd.py 15562 "$B/stall-r2" > "$B/adbd-stall2.log" 2>&1 & S2=$!
+MOCK_MODE=hang-done python3 test/mock-adbd.py 15563 "$B/stall-r3" > "$B/adbd-stall3.log" 2>&1 & S3=$!
+sleep 1.5
+timeout 120 java -cp "$B/stall" top.linote.owrtinstaller.AdbStallTest 15561 15562 15563 "$B/stall-work" > "$B/stall.txt" 2>&1; note "AdbStallTest rc=$? $(tail -1 "$B/stall.txt")"
+kill $S1 $S2 $S3 2>/dev/null
+# v1.5.1: E5-family and MU300 backups/reads of large partitions over USB (real AdbConnection + UsbAdbTransport)
+if [ -n "$AJ" ] && [ -f build/gen/top/linote/owrtinstaller/BuildInfo.java ]; then
+  mkdir -p "$B/ub-stub" "$B/ub-main" "$B/ub-cls" "$B/ub-root" "$B/ub-work"
+  javac -encoding UTF-8 -nowarn -cp "$AJ" -sourcepath app/src/main/java:build/gen -d "$B/ub-main" $J/E5Part.java $J/Mu300Internal.java $J/RootShell.java 2>&1 | grep -v '^Note'
+  javac -encoding UTF-8 -nowarn -d "$B/ub-stub" $(find test/usbstub -name '*.java') 2>&1 | grep -v '^Note'
+  javac -encoding UTF-8 -nowarn -cp "$B/ub-stub:$B/ub-main:$AJ" -d "$B/ub-cls" $J/AdbConnection.java $J/AdbKey.java $J/UsbAdbTransport.java test/UsbBackupTest.java 2>&1 | grep -v '^Note'
+  python3 test/mock-adbd.py 15570 "$B/ub-root" > "$B/adbd-ub.log" 2>&1 & UB=$!
+  sleep 1.5
+  timeout 300 java -cp "$B/ub-cls:$B/ub-stub:$B/ub-main:$AJ" top.linote.owrtinstaller.UsbBackupTest 15570 "$B/ub-work" "$B/ub-root" > "$B/usbbackup.txt" 2>&1; note "UsbBackupTest rc=$? $(tail -1 "$B/usbbackup.txt")"
+  kill $UB 2>/dev/null
+  rm -rf "$B/ub-root"
+else
+  note "UsbBackupTest rc=1 FAIL: run ./build.sh first (needs build/gen and android.jar)"
+fi
 
 for t in mock-helper-test.sh mock-userdata-test.sh mock-mu300-test.sh; do
   sudo bash "test/$t" > "$B/$t.txt" 2>&1; note "$t rc=$? $(tail -1 "$B/$t.txt")"

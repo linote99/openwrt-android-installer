@@ -116,17 +116,26 @@ final class UsbAdbTransport implements AdbConnection.Transport {
 
         @Override public int read(byte[] b, int off, int len) throws IOException {
             if (len == 0) return 0;
-            while (pos >= lim) fill();
+            while (pos >= lim) fill(len);
             int n = Math.min(len, lim - pos);
             System.arraycopy(buf, pos, b, off, n);
             pos += n;
             return n;
         }
 
-        private void fill() throws IOException {
+        /**
+         * Receives at most want bytes. The request must not be larger than what the caller needs:
+         * a bulk IN request only completes when it is full or a short packet arrives, and adbd
+         * sends neither a zero-length packet after a payload that is a multiple of the packet size
+         * nor its next packet before our OKAY. A 16 KiB request for a 4096-byte payload therefore
+         * waited forever (seen as a backup stuck on boot_a.img). AdbConnection reads exactly the
+         * 24-byte header and then exactly the payload, like the desktop adb's USB backends.
+         */
+        private void fill(int want) throws IOException {
             if (closed) throw new IOException("USB 连接已断开");
             if (!queued) {
                 inBuf.clear();
+                inBuf.limit(Math.min(want, CHUNK));
                 if (!inReq.queue(inBuf)) { close(); throw new IOException("USB 读取失败（设备可能已拔出）"); }
                 queued = true;
             }

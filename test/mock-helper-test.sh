@@ -69,7 +69,7 @@ expect 'install marker' "$out" 'OWRT-APK-INSTALL-OK'
 [ ! -e "$T/base/pkg/files/openwrt.ext4.gz" ] && { echo 'PASS: payload removed after success'; pass=$((pass+1)); } || { echo 'FAIL: payload kept'; fail=$((fail+1)); }
 out=$($H status 2>&1);                                 expect 'status done 0'     "$out" 'OWRT-APK-JOB=done 0'
 out=$(timeout 30 $H follow 2>&1);                      expect 'follow replays log' "$out" 'E5-TF-INSTALL-OK'
-out=$($H start 2>&1);                                  expect 'restart refused w/o payload' "$out" 'payload missing'
+out=$($H start 2>&1);                                  expect 'restart refused w/o payload (re-stage required)' "$out" 'no staged package'
 
 # Failure + detach: the caller is killed mid-way, job must keep running and record rc.
 make_pkg 3

@@ -51,11 +51,24 @@ public class Mu300FlowTest {
         long udStart, udSize, freeKib;
         String state = "unencrypted", type = "", source = "/dev/block/by-name/userdata", magic = "1020f5f2", ext = "0000";
         String rootNode;            // existing mu300root node, e.g. mmcblk0p40
-        long rootSectors;
+        long rootSectors, rootStart;
+        byte[] rootHead = new byte[512];   // first sector of mu300root (prepare-stage marker)
         boolean rebooted;
         String logText = "";
         int lastRc = 0;
         String failStep;            // simulate a failing device step by script name
+        String dieStep;             // background step whose process vanishes without an exit code
+        String stallStep;           // background step that keeps running silently
+        boolean launchFails;        // the detached launcher never starts (no run.pid)
+        boolean killedOnClose;      // the detached process is ended when the launching session closes
+        String pendingLaunch;       // launcher parked until the go file is created
+        boolean bbBroken;           // the package busybox cannot run on this device
+        int cancelAfterPolls = -1;  // the user presses 停止 after this many polls
+        int polls;
+        boolean finished = true, alive;
+        String pid;
+        final List<String> modes = new ArrayList<>();   // "fg <step>" / "bg <step>"
+        final List<String> steps = new ArrayList<>();   // io.step() reports
 
         Dev(long diskSectors, File cache) { this.diskSectors = diskSectors; this.cache = cache; }
 
@@ -87,6 +100,7 @@ public class Mu300FlowTest {
                 byte[] misc = byName.get("misc");
                 return Arrays.copyOfRange(misc, (int) (skip * bs), (int) (skip * bs + (long) count * bs));
             }
+            if (rootNode != null && cmd.equals("dd if=/dev/block/" + rootNode + " bs=512 count=1 2>/dev/null")) return rootHead.clone();
             m = CAT.matcher(cmd);
             if (m.matches() && byName.containsKey(m.group(1))) return byName.get(m.group(1));
             throw new AssertionError("unexpected binary read: " + cmd);
@@ -100,7 +114,7 @@ public class Mu300FlowTest {
                 int a = "set -e; set -o pipefail; (".length();
                 int b = script.indexOf(") > ", a);
                 String inner = script.substring(a, b);
-                String remote = script.substring(b + 4, script.indexOf(';', b));
+                String remote = script.substring(b + 4).split("[;& ]")[0];
                 if (!root) throw new AssertionError("binary read must run as root");
                 byte[] data = eval(inner);
                 files.put(remote, data);
@@ -119,6 +133,8 @@ public class Mu300FlowTest {
                         + "\nMAGIC=" + magic + "\nEXT=" + ext + "\n" + (rootNode != null ? "ROOT=" + rootNode + "\n" : "");
             }
             if (rootNode != null && script.equals("cat /sys/class/block/" + rootNode + "/size")) return rootSectors + "\n";
+            if (rootNode != null && script.equals("cat /sys/class/block/" + rootNode + "/start /sys/class/block/" + rootNode + "/size"))
+                return rootStart + "\n" + rootSectors + "\n";
             Matcher m = Pattern.compile("^blockdev --getsize64 /dev/block/by-name/(\\w+)$").matcher(script);
             if (m.matches()) {
                 byte[] p = byName.get(m.group(1));
@@ -135,21 +151,60 @@ public class Mu300FlowTest {
             if (script.startsWith("mkdir -p ") && script.contains("; chown 2000:2000 ") && script.contains("; chmod 700 ")) return "";
             if (script.startsWith("chmod 755 ") || script.startsWith("chmod -R u+rx ")) return "";
             if (script.startsWith("rm -rf /data/local/tmp/mu300-desktop-")) { files.keySet().removeIf(k -> k.startsWith(script.substring(7))); return ""; }
-            if (script.startsWith("rm -f ") && script.contains("/run.log") && script.contains(" setsid ")) return launch(script);
-            if (script.startsWith("s=$(stat -c %s ")) {
+            if (script.startsWith("rm -f ") && script.contains("/run.log") && script.contains("/run.pid") && script.contains(" setsid ")) {
+                // two-phase start: PID first, then nothing until the go file exists; HUP ignored
+                Matcher g = Pattern.compile("sh -c 'echo \\$\\$ > (\\S+/run\\.pid); i=0; while \\[ ! -f (\\S+/run\\.go) \\]; do .*?done; \\S+/busybox nsenter ").matcher(script);
+                if (!g.find() || !script.contains("/run.go") || !script.contains("trap '' HUP; "))
+                    throw new AssertionError("launcher must record its PID and wait for the go file before running: " + script);
+                if (!script.contains("echo OWRT-LAUNCH-PID=")) throw new AssertionError("launcher must wait for the PID: " + script);
+                pid = null;
+                pendingLaunch = null;
+                if (launchFails) { logText = "setsid: applet not found\n"; return "OWRT-LAUNCH-PID=\n"; }
+                pendingLaunch = script;
+                pid = "4242";
+                logText = "";
+                return "OWRT-LAUNCH-PID=4242\n";
+            }
+            if (pid != null && script.matches("^if kill -0 " + pid + " 2>/dev/null; then : > \\S+/run\\.go && echo OWRT-GO; fi; true$")) {
+                if (killedOnClose || pendingLaunch == null) { pendingLaunch = null; return ""; }
+                launch(pendingLaunch);
+                pendingLaunch = null;
+                modes.add("bg " + runs.get(runs.size() - 1).split("\n")[0]);
+                String step = runs.get(runs.size() - 1);
+                finished = true; alive = false;
+                if (dieStep != null && step.contains(dieStep)) { logText = "writing...\n"; finished = false; alive = false; }
+                if (stallStep != null && step.contains(stallStep)) { logText = "working...\n"; finished = false; alive = true; }
+                return "OWRT-GO\n";
+            }
+            if (script.matches("^rm -f \\S+/run\\.go; (kill \\d+ 2>/dev/null; )?tail -c 2000 \\S+/run\\.log 2>/dev/null; true$")) {
+                pendingLaunch = null;
+                return logText;
+            }
+            if (script.matches("^cat /data/local/tmp/mu300-desktop-[0-9a-f]{12}/run\\.pid 2>/dev/null; true$")) return pid == null ? "" : pid + "\n";
+            if (script.matches("^tail -c 2000 /data/local/tmp/mu300-desktop-[0-9a-f]{12}/run\\.log 2>/dev/null; true$")) return logText;
+            if (script.matches("^/data/local/tmp/mu300-desktop-[0-9a-f]{12}/busybox echo OWRT-BB-OK 2>&1; true$"))
+                return bbBroken ? "/system/bin/sh: busybox: not executable: 64-bit ELF file\n" : "OWRT-BB-OK\n";
+            if (script.matches("^/data/local/tmp/mu300-desktop-[0-9a-f]{12}/busybox nsenter -t 1 -m \\S+/busybox sh \\S+/run\\.sh 2>&1; echo OWRT-RUN-RC=\\$\\?$")) {
+                launch(script);
+                modes.add("fg " + runs.get(runs.size() - 1).split("\n")[0]);
+                return logText + "OWRT-RUN-RC=" + lastRc + "\n";
+            }
+            if (script.startsWith("if kill -0 " + pid + " 2>/dev/null; then echo ALIVE=1; else echo ALIVE=0; fi; s=$(stat -c %s ")) {
+                polls++;
                 m = Pattern.compile("tail -c \\+(\\d+) ").matcher(script);
                 if (!m.find()) throw new AssertionError("bad poll");
                 long off = Long.parseLong(m.group(1)) - 1;
                 byte[] log = logText.getBytes(StandardCharsets.UTF_8);
                 byte[] chunk = off >= log.length ? new byte[0] : Arrays.copyOfRange(log, (int) off, Math.min(log.length, (int) off + 49152));
-                return "SIZE=" + log.length + "\nRC=" + lastRc + "\nDATA\n" + java.util.Base64.getMimeEncoder().encodeToString(chunk) + "\n";
+                return "ALIVE=" + (alive ? 1 : 0) + "\nSIZE=" + log.length + "\n" + (finished ? "RC=" + lastRc + "\n" : "") + "DATA\n"
+                        + java.util.Base64.getMimeEncoder().encodeToString(chunk) + "\n";
             }
             throw new AssertionError("unexpected command: " + script);
         }
 
         /** The detached run.sh launcher: simulate the package script's effect from the arguments; never execute it. */
         String launch(String script) throws IOException {
-            Matcher m = Pattern.compile(" sh (/data/local/tmp/mu300-desktop-[0-9a-f]{12})/run\\.sh ").matcher(script);
+            Matcher m = Pattern.compile(" sh (/data/local/tmp/mu300-desktop-[0-9a-f]{12})/run\\.sh[ ']").matcher(script);
             if (!m.find()) throw new AssertionError("launcher without run.sh: " + script);
             String p = m.group(1);
             String body = new String(files.get(p + "/run.sh"), StandardCharsets.UTF_8);
@@ -219,6 +274,8 @@ public class Mu300FlowTest {
         @Override public void log(String line) { logs.add(line); }
         @Override public void progress(int percent) { }
         @Override public File cacheDir() { return cache; }
+        @Override public void step(String what, boolean writes) { steps.add((writes ? "W " : "R ") + what); }
+        @Override public boolean cancelled() { return cancelAfterPolls >= 0 && polls >= cancelAfterPolls; }
     }
 
     // ------------------------------------------------------------------ synthetic GPT
@@ -397,11 +454,83 @@ public class Mu300FlowTest {
         p = Mu300Internal.check(d, Mu300Internal.Kind.PART);
         ok(p.freeMax == 0 && p.shrinkCap >= 2048 && !Mu300Internal.usesFreeSpace(p, 2048), "B2 leftover ext4 signature blocks the gap; falls back to shrink");
 
-        // C: encrypted userdata and no gap → refused
+        // C: encrypted userdata and no gap → only the "format userdata" route (as the original: destructive = is_encrypted)
         d = device(cache, false, boot);
         d.state = "encrypted"; d.type = "file";
-        String why = expectFail(d, Mu300Internal.Kind.PART);
-        ok(why != null && why.contains("加密"), "C encrypted + no gap refused: " + why);
+        p = Mu300Internal.check(d, Mu300Internal.Kind.PART);
+        ok(p.shrinkCap == 0 && p.formatMax >= 2048 && Mu300Internal.route(p, 2048, false) == Mu300Internal.Route.FORMAT
+                && Mu300Internal.formatRequired(p, 2048), "C encrypted + no gap: check passes, format route required (formatMax=" + p.formatMax + ")");
+        ok(p.def <= p.formatMax && String.join("\n", d.logs).contains("路径三 格式化 userdata"), "C check logs all three routes");
+        byte[] bootC = d.byName.get("boot_b").clone();
+        int backupsBefore = backups.exists() ? backups.list().length : 0;
+        String why = null;
+        try { Mu300Internal.install(d, local, r.kernelFamily, Mu300Internal.Kind.PART, 2048, backups, "SERIAL1", Mu300Internal.Route.FORMAT, false, null); }
+        catch (IOException e) { why = e.getMessage(); }
+        ok(why != null && why.contains("勾选") && Arrays.equals(bootC, d.byName.get("boot_b")) && !d.rebooted
+                && (backups.exists() ? backups.list().length : 0) == backupsBefore,
+                "C format is never implied by encryption: refused before any backup/write: " + why);
+        why = null;
+        try { Mu300Internal.install(d, local, r.kernelFamily, Mu300Internal.Kind.PART, 2048, backups, "SERIAL1", Mu300Internal.Route.KEEP, false, null); }
+        catch (IOException e) { why = e.getMessage(); }
+        ok(why != null && why.contains("重新做只读检查"), "C confirmed route mismatch (KEEP) aborts: " + why);
+        d.logs.clear();
+        o = Mu300Internal.install(d, local, r.kernelFamily, Mu300Internal.Kind.PART, 2048, backups, "SERIAL1", Mu300Internal.Route.FORMAT, true, null);
+        ok(o.pending && d.rebooted && o.message.contains("Android 数据全部清空"), "C format: prepare stage written, reboot requested: " + o.message);
+        String joinedC = String.join("\n", d.logs);
+        ok(joinedC.contains("安装路径：格式化 userdata") && joinedC.contains("userdata 已加密"), "C log names the route and the reason");
+        ok(o.next.contains("重新打开 ADB") && o.next.contains("重新安装 Magisk（面具）") && o.next.contains("给 Shell 授予 root")
+                && o.next.contains("“继续格式化后的安装”") && !o.next.contains("【高级】") && !o.next.contains("高级功能") && o.next.contains("5555")
+                && joinedC.contains("  1. 完成 Android 首次设置") && joinedC.contains("  5. 用本应用重新连接目标设备")
+                && joinedC.contains("允许“Shell”"), "C (v1.5.2) stage one tells to reopen ADB, reinstall Magisk and grant Shell root: " + o.next);
+        File txDir = null;
+        for (File f : backups.listFiles()) if (new File(f, "transaction.json").isFile() && (txDir == null || f.lastModified() >= txDir.lastModified())) txDir = f;
+        ok(txDir != null && new File(txDir, "package-manifest.json").isFile() && new File(txDir, "SHA256SUMS").isFile(), "C backup + transaction + manifest snapshot saved: " + txDir);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> tx = (Map<String, Object>) MiniJson.parse(new String(Mu300Internal.readAll(new File(txDir, "transaction.json")), StandardCharsets.UTF_8));
+        long tTarget = Mu300Gpt.allocation(d.udSize, 2048)[0], tNeed = Mu300Gpt.allocation(d.udSize, 2048)[1];
+        String token = String.valueOf(tx.get("token"));
+        ok("prepared-request".equals(tx.get("state")) && token.matches("[0-9a-f]{32}") && Long.valueOf(tTarget).equals(tx.get("target"))
+                && "SERIAL1".equals(tx.get("serial")) && "a".equals(tx.get("android_slot")) && String.valueOf(tx.get("payload_identity")).matches("[0-9a-f]{64}"),
+                "C transaction: state/token/target/serial/slot/payload identity");
+        selfOk = true;
+        try { Mu300Boot.selfCheck(base, d.byName.get("boot_b")); } catch (RuntimeException e) { selfOk = false; }
+        ok(selfOk && !Arrays.equals(bootC, d.byName.get("boot_b")), "C prepare boot image flashed to boot_b");
+        ok(!d.files.containsKey("/data/mu300linux/part-install.conf"), "C no keep-data part-install.conf written");
+        ok(Mu300Gpt.space(d.sectors(0, 34), d.sectors(d.diskSectors - 33, 33), d.diskSectors).find("mu300root") == null,
+                "C GPT not changed online (initramfs shrinks and formats offline)");
+
+        // R: resume after the reset (the prepare stage created mu300root and wrote its token marker)
+        Dev rd = device(cache, false, boot);
+        rd.state = "encrypted"; rd.type = "file";
+        rd.udSize = tTarget; rd.rootNode = "mmcblk0p40"; rd.rootStart = rd.udStart + tTarget; rd.rootSectors = tNeed;
+        byte[] mk = ("MU300-PART-PREPARED-V2 " + token + "\n").getBytes(StandardCharsets.US_ASCII);
+        System.arraycopy(mk, 0, rd.rootHead, 0, mk.length);
+        p = Mu300Internal.check(rd, Mu300Internal.Kind.RESUME);
+        ok(p.rootSize == tNeed && p.rootStart == rd.udStart + tTarget, "R resume check reads the prepared mu300root: " + p.summary);
+        why = null;
+        try { Mu300Internal.install(rd, local, r.kernelFamily, Mu300Internal.Kind.RESUME, 0, backups, "OTHER", null, false, null); }
+        catch (IOException e) { why = e.getMessage(); }
+        ok(why != null && why.contains("序列号"), "R different device serial refused: " + why);
+        rd.rootHead[30] ^= 1;
+        why = null;
+        try { Mu300Internal.install(rd, local, r.kernelFamily, Mu300Internal.Kind.RESUME, 0, backups, "SERIAL1", null, false, null); }
+        catch (IOException e) { why = e.getMessage(); }
+        ok(why != null && why.contains("令牌"), "R wrong prepare token refused: " + why);
+        rd.rootHead[30] ^= 1;
+        rd.udSize = tTarget + 2048;
+        why = null;
+        try { Mu300Internal.install(rd, local, r.kernelFamily, Mu300Internal.Kind.RESUME, 0, backups, "SERIAL1", null, false, null); }
+        catch (IOException e) { why = e.getMessage(); }
+        ok(why != null && why.contains("位置/大小"), "R geometry differing from the record refused: " + why);
+        rd.udSize = tTarget;
+        o = Mu300Internal.install(rd, local, r.kernelFamily, Mu300Internal.Kind.RESUME, 0, backups, "SERIAL1", null, false, null);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> tx2 = (Map<String, Object>) MiniJson.parse(new String(Mu300Internal.readAll(new File(txDir, "transaction.json")), StandardCharsets.UTF_8));
+        ok(!o.pending && o.message.contains("独立分区已安装") && "installed".equals(tx2.get("state")), "R resume writes mu300root, record marked installed: " + o.message);
+        selfOk = true;
+        try { Mu300Boot.selfCheck(base, rd.byName.get("boot_b")); } catch (RuntimeException e) { selfOk = false; }
+        ok(selfOk, "R part boot image flashed to boot_b");
+
         d.logs.clear();
         why = expectFail(d, Mu300Internal.Kind.IMAGE);
         ok(why != null && why.contains("加密"), "C encrypted image refused");
@@ -469,6 +598,102 @@ public class Mu300FlowTest {
             ok(e.getMessage().contains("已变化") && !d.pushed.contains("switch.sh"), "H tampered local copy refused: " + e.getMessage());
         }
         Mu300Internal.writeAll(sw, orig);
+
+        // I: read-only steps run in the foreground (like the original installer), writes detached with a PID
+        d = device(cache, true, boot);
+        d.rootNode = "mmcblk0p40"; d.rootSectors = 3L * 2097152;
+        Mu300Internal.check(d, Mu300Internal.Kind.REPART);
+        o = Mu300Internal.install(d, local, r.kernelFamily, Mu300Internal.Kind.REPART, 0, backups, "SERIAL1", null, null);
+        ok(d.modes.size() == 4 && d.modes.get(0).startsWith("fg ") && d.modes.get(0).contains("android-bootchain.sh\" check")
+                && d.modes.get(1).startsWith("bg ") && d.modes.get(2).startsWith("bg ") && d.modes.get(3).startsWith("bg "), "I step modes: " + d.modes);
+        ok(d.logs.contains("▸ 检查启动链（android-bootchain.sh check）（只读）") && d.logs.contains("  目标设备后台进程 PID 4242")
+                && d.logs.contains("  ✓ mu300-openwrt.tar.gz（" + Mu300Internal.size(new File(local, Mu300Internal.ROOTFS).length()) + "）")
+                && d.logs.contains("安装文件已全部上传并校验"), "I log names every step and uploaded file");
+        ok(d.steps.contains("R 上传 mu300-openwrt.tar.gz") && d.steps.contains("R 校验 mu300-openwrt.tar.gz 的 SHA-256")
+                && d.steps.contains("W 写入 OpenWrt 分区 /dev/block/mmcblk0p40"), "I status names the step being waited on");
+
+        // J (v1.5.1): the detached launcher never starts: each writing step falls back to the foreground
+        // (as the original installer runs it), runs exactly once, and the install completes
+        long saveLaunch = Mu300Internal.LAUNCH_MS;
+        Mu300Internal.LAUNCH_MS = 1500;
+        d = device(cache, true, boot);
+        d.rootNode = "mmcblk0p40"; d.rootSectors = 3L * 2097152;
+        d.launchFails = true;
+        t0 = System.currentTimeMillis();
+        String jErr = null;
+        try { Mu300Internal.install(d, local, r.kernelFamily, Mu300Internal.Kind.REPART, 0, backups, "SERIAL1", null, null); }
+        catch (IOException e) { jErr = e.getMessage(); }
+        long jdt = System.currentTimeMillis() - t0;
+        ok(jErr == null && d.modes.size() == 4 && d.modes.stream().allMatch(x -> x.startsWith("fg ")) && d.runs.size() == 4,
+                "J no detached start: writes fall back to the foreground once each in " + jdt + " ms: " + d.modes + (jErr != null ? " " + jErr : ""));
+        final Dev dj = d;
+        ok(d.logs.stream().anyMatch(l -> l.contains("目标设备上的后台进程没有启动") && l.contains("setsid: applet not found") && l.contains("改为前台执行"))
+                && d.steps.stream().anyMatch(x -> x.endsWith("（前台执行）")), "J fallback reason logged and shown");
+        // J2: the detached process is ended when the launching session closes (seen on a U30 Air over
+        // wireless ADB): it never got the go file, so it ran nothing; the step runs once in the foreground
+        d = device(cache, true, boot);
+        d.rootNode = "mmcblk0p40"; d.rootSectors = 3L * 2097152;
+        d.killedOnClose = true;
+        jErr = null;
+        try { Mu300Internal.install(d, local, r.kernelFamily, Mu300Internal.Kind.REPART, 0, backups, "SERIAL1", null, null); }
+        catch (IOException e) { jErr = e.getMessage(); }
+        ok(jErr == null && d.modes.size() == 4 && d.modes.stream().allMatch(x -> x.startsWith("fg ")) && d.runs.size() == 4,
+                "J2 process ended with its session: foreground once per step: " + d.modes + (jErr != null ? " " + jErr : ""));
+        ok(d.logs.stream().anyMatch(l -> l.contains("（PID 4242）在启动会话结束时被系统结束") && l.contains("尚未执行这一步的任何命令")),
+                "J2 reason logged");
+        Mu300Internal.LAUNCH_MS = saveLaunch;
+
+        // K: the background write process dies without an exit code: reported, never waited on for hours
+        d = device(cache, true, boot);
+        d.rootNode = "mmcblk0p40"; d.rootSectors = 3L * 2097152;
+        d.dieStep = "android-write-part.sh";
+        bootBefore = d.byName.get("boot_b").clone();
+        t0 = System.currentTimeMillis();
+        try {
+            Mu300Internal.install(d, local, r.kernelFamily, Mu300Internal.Kind.REPART, 0, backups, "SERIAL1", null, null);
+            ok(false, "K dead process must propagate");
+        } catch (IOException e) {
+            long dt = System.currentTimeMillis() - t0;
+            ok(e.getMessage().contains("意外结束") && e.getMessage().contains("PID 4242") && e.getMessage().contains("请勿直接重试")
+                    && e.getMessage().contains("writing...") && dt < 20000 && Arrays.equals(bootBefore, d.byName.get("boot_b")),
+                    "K vanished process reported in " + dt + " ms: " + e.getMessage());
+        }
+
+        // L: the user stops waiting on a silent background step: told it may still be writing, boot untouched
+        d = device(cache, true, boot);
+        d.rootNode = "mmcblk0p40"; d.rootSectors = 3L * 2097152;
+        d.stallStep = "android-image.sh";
+        d.cancelAfterPolls = 2;
+        bootBefore = d.byName.get("boot_b").clone();
+        try {
+            Mu300Internal.install(d, local, r.kernelFamily, Mu300Internal.Kind.REPART, 0, backups, "SERIAL1", null, null);
+            ok(false, "L stop must propagate");
+        } catch (IOException e) {
+            ok(e.getMessage().contains("已停止等待") && e.getMessage().contains("不要重启") && Arrays.equals(bootBefore, d.byName.get("boot_b"))
+                    && d.steps.contains("W 生成 OpenWrt 系统镜像（只写临时文件，不改分区）"), "L stop while waiting: " + e.getMessage());
+        }
+
+        // M: the package busybox cannot run on the device: refused before any device step
+        d = device(cache, true, boot);
+        d.bbBroken = true;
+        try {
+            Mu300Internal.install(d, local, r.kernelFamily, Mu300Internal.Kind.PART, 2048, backups, "SERIAL1", true, null);
+            ok(false, "M broken busybox must propagate");
+        } catch (IOException e) {
+            ok(e.getMessage().contains("无法运行安装包里的 busybox") && e.getMessage().contains("not executable") && d.runs.isEmpty(),
+                    "M busybox check: " + e.getMessage());
+        }
+
+        // N: the read-only boot-chain check fails in the foreground: its output and exit code are shown
+        d = device(cache, true, boot);
+        d.failStep = "android-bootchain.sh\" check";
+        try {
+            Mu300Internal.install(d, local, r.kernelFamily, Mu300Internal.Kind.PART, 2048, backups, "SERIAL1", true, null);
+            ok(false, "N failed check must propagate");
+        } catch (IOException e) {
+            ok(e.getMessage().contains("检查启动链") && e.getMessage().contains("退出码 3") && d.logs.contains("simulated failure in android-bootchain.sh\" check")
+                    && d.modes.size() == 1 && d.modes.get(0).startsWith("fg "), "N foreground check failure: " + e.getMessage());
+        }
 
         System.out.println(failures == 0 ? "PASS " + checks + " checks" : "FAILED " + failures + "/" + checks);
         System.exit(failures == 0 ? 0 : 1);

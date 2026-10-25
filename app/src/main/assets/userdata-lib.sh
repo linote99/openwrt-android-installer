@@ -7,17 +7,24 @@
 #                                         试启动槽。缩容/建分区/写入由安装包 boot.img 的 initramfs
 #                                         (etc/install-part.sh) 在下次启动时离线完成。
 #   userdata-lib.sh install image MIB     userdata 镜像安装：/data/e5linux/openwrt.ext4（安装包 userdata-image.sh）
+#   userdata-lib.sh tool SUB ...          格式化 userdata 两阶段安装与重装已有 e5root 用的单步操作（流程由 APK 里的
+#                                         E5Part 按电脑端 scripts/installer/part-two-stage.py 驱动）：
+#                                         preflight | firmware | bootchain-sync | arm | part-write DEV NEED RAW GROW TOKEN
 #
 # 只调用安装包自己的函数和脚本：以库方式载入 files/magisk-tf-install.sh（E5_TF_LIB=1）取得
 # prepare_firmware / write_boot；启动链用 files/android-bootchain.sh；试启动用 files/e5-bootctl。
-# 加密 userdata 的“两阶段（清空 Android）”安装不在这里实现：一律拒绝。
+# 加密 userdata（或用户选择格式化）时的两阶段安装由 E5Part 驱动，这里只提供 tool 单步。
 # 由 owrt-apk.sh 在全局挂载命名空间、随包 BusyBox（ASH_STANDALONE=1）下运行。
 set -eu
 P=${E5_PACKAGE:?}
 BB=$P/files/busybox
 ACTION=${1:-}
 METHOD=${2:-}
-case "$ACTION/$METHOD" in check/part|check/image|install/part|install/image) ;; *) echo "OWRT-APK-ERROR: usage" >&2; exit 2 ;; esac
+case "$ACTION/$METHOD" in
+    check/part|check/image|install/part|install/image) ;;
+    tool/preflight|tool/firmware|tool/bootchain-sync|tool/arm|tool/part-write) ;;
+    *) echo "OWRT-APK-ERROR: usage" >&2; exit 2 ;;
+esac
 D=/data/e5linux
 TMPD=/data/local/tmp
 MIB=1048576
@@ -85,41 +92,83 @@ data_plain() {
     return 0
 }
 
+# 电脑端 part_userdata_policy：state == encrypted、type 为 file/block，或 /data 来自 dm-/mapper 映射，都算加密。
+# 加密时保留数据的缩容不可行，只能走“格式化 userdata 两阶段安装”（E5Part）。
+data_encrypted() {
+    CRYPTO_STATE=$(getprop ro.crypto.state)
+    CRYPTO_TYPE=$(getprop ro.crypto.type)
+    DATA_SOURCE=$(awk '$2 == "/data" {print $1; exit}' /proc/mounts)
+    echo "OWRT-APK-CRYPTO=${CRYPTO_STATE:-unknown}/${CRYPTO_TYPE:-none} ${DATA_SOURCE:-?}"
+    [ "$CRYPTO_STATE" = encrypted ] && return 0
+    case "$CRYPTO_TYPE" in file|block) return 0 ;; esac
+    case "$DATA_SOURCE" in /dev/block/dm-*|/dev/mapper/*) return 0 ;; esac
+    return 1
+}
+
+# 输出两套大小范围：保留数据缩容（KEEP，F2FS 且未加密才可用）和格式化 userdata（WIPE，两阶段）。
+# 电脑端 part_target：min = 镜像 MiB + 256；max = userdata MiB - (格式化时 0，否则已用 MiB) - 2048。
 preflight_part() {
     preflight_common
-    data_plain || fail 'userdata is encrypted or mapped (FBE/metadata/block): the shrink install keeps data only on plain userdata. The two-stage wipe install is not supported by this app; use the TF card method or the desktop installer. Nothing was written.'
+    ENCRYPTED=0
+    if data_encrypted; then ENCRYPTED=1; fi
+    echo "OWRT-APK-ENCRYPTED=$ENCRYPTED"
     DATA_NODE='' DATA_SECTORS='' EXISTING=''
     for u in /sys/class/block/mmcblk*p*/uevent; do
         n=${u%/uevent}; n=${n##*/}
         if grep -qx PARTNAME=userdata "$u" 2>/dev/null; then DATA_NODE=$n; DATA_SECTORS=$(cat "/sys/class/block/$n/size"); fi
         if grep -qx PARTNAME=e5root "$u" 2>/dev/null; then EXISTING=$n; fi
     done
-    [ -z "$EXISTING" ] || fail "the internal partition $EXISTING (e5root) already exists; reinstalling into it needs the desktop installer (--reinstall-part). Nothing was written."
+    [ -z "$EXISTING" ] || fail "the internal partition $EXISTING (e5root) already exists; choose the method 'reinstall the existing internal partition' to write a new system into it (userdata and the partition table stay, nothing is erased). Nothing was written."
     case "$DATA_SECTORS" in ''|*[!0-9]*|0) fail 'userdata is not in the partition table of this device' ;; esac
-    # 与安装包 initramfs (etc/install-part.sh) 相同的判断：只有 F2FS 的 userdata 能离线缩容，否则它会放弃。
-    # 只读 4 字节超级块魔数，提前拒绝，免得重启后才发现没有安装。
-    [ "$(od -An -tx4 -j 1024 -N 4 "/dev/block/$DATA_NODE" | tr -d ' \n')" = f2f52010 ] || \
-        fail 'userdata is not F2FS: the package initramfs can only shrink F2FS userdata. Use the TF card method. Nothing was written.'
-    echo "OWRT-APK-DATA-FS=f2fs"
     used_kb=$(df -Pk /data | awk 'END {print $3}')
     USED_MIB=$((used_kb / 1024))
     UDATA_MIB=$((DATA_SECTORS / 2048))
     IMAGE_MIB=$(mib_up "$RAW_BYTES")
-    PART_MIN=$((IMAGE_MIB + 256))
-    [ "$PART_MIN" -ge 2048 ] || PART_MIN=2048        # initramfs install-part.sh: PART_MIB >= 2048
-    PART_MAX=$((UDATA_MIB - USED_MIB - 2048))
-    [ "$PART_MAX" -ge "$PART_MIN" ] || fail "not enough room: userdata is $UDATA_MIB MiB with $USED_MIB MiB used, the image needs a $PART_MIN MiB partition"
-    PART_DEFAULT=$(( ( (IMAGE_MIB + 1024 + 1023) / 1024 ) * 1024 ))
-    [ "$PART_DEFAULT" -le "$PART_MAX" ] || PART_DEFAULT=$PART_MAX
-    [ "$PART_DEFAULT" -ge "$PART_MIN" ] || PART_DEFAULT=$PART_MIN
-    for f in part-install.conf part-install.img.gz part-install.settings; do
-        [ ! -L "$D/$f" ] || fail 'unsafe staged install path'
-    done
-    [ ! -e "$D/part-install.conf" ] || fail 'a previous shrink install is already pending in /data/e5linux/part-install.conf; inspect it before staging another one'
     echo "OWRT-APK-DATA-NODE=/dev/block/$DATA_NODE"
     echo "OWRT-APK-UDATA-MIB=$UDATA_MIB"
     echo "OWRT-APK-USED-MIB=$USED_MIB"
-    echo "OWRT-APK-PART-RANGE=$PART_MIN $PART_MAX $PART_DEFAULT"
+    # 格式化 userdata（两阶段）：不受已用空间限制。
+    WIPE_MIN=$((IMAGE_MIB + 256))
+    WIPE_MAX=$((UDATA_MIB - 2048))
+    WIPE_DEFAULT=$(( ( (IMAGE_MIB + 1024 + 1023) / 1024 ) * 1024 ))
+    [ "$WIPE_DEFAULT" -le "$WIPE_MAX" ] || WIPE_DEFAULT=$WIPE_MAX
+    if [ "$WIPE_MAX" -ge "$WIPE_MIN" ]; then
+        echo "OWRT-APK-WIPE-RANGE=$WIPE_MIN $WIPE_MAX $WIPE_DEFAULT"
+    else
+        echo "OWRT-APK-WIPE-NO=not enough room: userdata is $UDATA_MIB MiB, the image needs a $WIPE_MIN MiB partition"
+    fi
+    KEEP_NO=''
+    if [ "$ENCRYPTED" = 1 ]; then
+        KEEP_NO='userdata is encrypted (FBE/metadata/block): data cannot be kept; formatting userdata is required'
+    # 与安装包 initramfs (etc/install-part.sh) 相同的判断：只有 F2FS 的 userdata 能离线缩容，否则它会放弃。
+    # 只读 4 字节超级块魔数，提前拒绝，免得重启后才发现没有安装。
+    elif [ "$(od -An -tx4 -j 1024 -N 4 "/dev/block/$DATA_NODE" | tr -d ' \n')" != f2f52010 ]; then
+        KEEP_NO='userdata is not F2FS: the package initramfs can only shrink F2FS userdata while keeping data'
+    else
+        echo "OWRT-APK-DATA-FS=f2fs"
+        for f in part-install.conf part-install.img.gz part-install.settings; do
+            [ ! -L "$D/$f" ] || fail 'unsafe staged install path'
+        done
+        if [ -e "$D/part-install.conf" ]; then
+            KEEP_NO='a previous shrink install is already pending in /data/e5linux/part-install.conf; inspect it before staging another one'
+        fi
+    fi
+    if [ -z "$KEEP_NO" ]; then
+        PART_MIN=$((IMAGE_MIB + 256))
+        [ "$PART_MIN" -ge 2048 ] || PART_MIN=2048        # initramfs install-part.sh: PART_MIB >= 2048
+        PART_MAX=$((UDATA_MIB - USED_MIB - 2048))
+        if [ "$PART_MAX" -ge "$PART_MIN" ]; then
+            PART_DEFAULT=$(( ( (IMAGE_MIB + 1024 + 1023) / 1024 ) * 1024 ))
+            [ "$PART_DEFAULT" -le "$PART_MAX" ] || PART_DEFAULT=$PART_MAX
+            [ "$PART_DEFAULT" -ge "$PART_MIN" ] || PART_DEFAULT=$PART_MIN
+            echo "OWRT-APK-PART-RANGE=$PART_MIN $PART_MAX $PART_DEFAULT"
+        else
+            KEEP_NO="not enough room: userdata is $UDATA_MIB MiB with $USED_MIB MiB used, the image needs a $PART_MIN MiB partition"
+        fi
+    fi
+    [ -z "$KEEP_NO" ] || echo "OWRT-APK-KEEP-NO=$KEEP_NO"
+    [ -n "$KEEP_NO" ] && [ "$WIPE_MAX" -lt "$WIPE_MIN" ] && fail "$KEEP_NO; formatting userdata would not fit either (userdata $UDATA_MIB MiB, partition needs $WIPE_MIN MiB)"
+    true
 }
 
 preflight_image() {
@@ -129,17 +178,111 @@ preflight_image() {
         [ ! -L "$f" ] || fail 'unsafe image path'
     done
     [ ! -e "$D/openwrt.ext4.part" ] && [ ! -e "$D/openwrt.ext4.new" ] || fail 'a pending image or upgrade exists in /data/e5linux; inspect it before retrying'
+    # 电脑端 check：全部按字节计算。free = df 可用 KiB * 1024；uploads = 安装时额外写进 /data 的文件
+    # （电脑端是 openwrt.ext4.gz + boot.img；本机安装复制的是 openwrt.ext4.gz + ext4-tools.tar，
+    # 另外生成一份绑定槽位的 boot，所以按 gz + boot.img + ext4-tools.tar 计）。
+    # minimum = ceil(raw / MiB) MiB；maximum = floor((free - 保留 - 固件预算 - uploads) / MiB) MiB。
+    [ -s "$P/files/ext4-tools.tar" ] || fail 'missing bundled ext4 tools'
     free_kb=$(df -Pk /data | awk 'END {print $4}')
-    FREE_MIB=$((free_kb / 1024))
-    gz_mib=$(mib_up "$(stat -c %s "$P/files/openwrt.ext4.gz")")
-    tools_mib=$(mib_up "$(stat -c %s "$P/files/ext4-tools.tar")")
-    UPLOAD_MIB=$((gz_mib + tools_mib))
+    FREE_BYTES=$((free_kb * 1024))
+    UPLOAD_BYTES=$(( $(stat -c %s "$P/files/openwrt.ext4.gz") + $(stat -c %s "$P/files/boot.img") + $(stat -c %s "$P/files/ext4-tools.tar") ))
     IMG_MIN=$(mib_up "$RAW_BYTES")
-    IMG_MAX=$((FREE_MIB - DATA_RESERVE_MIB - DATA_FIRMWARE_BUDGET_MIB - UPLOAD_MIB))
-    [ "$IMG_MAX" -ge "$IMG_MIN" ] || fail "not enough userdata space for the image and safety reserve (free $FREE_MIB MiB)"
+    IMG_MAX=$(( (FREE_BYTES - DATA_RESERVE_MIB * MIB - DATA_FIRMWARE_BUDGET_MIB * MIB - UPLOAD_BYTES) / MIB ))
+    [ "$(( FREE_BYTES - DATA_RESERVE_MIB * MIB - DATA_FIRMWARE_BUDGET_MIB * MIB - UPLOAD_BYTES ))" -ge 0 ] || IMG_MAX=-1
+    [ "$IMG_MAX" -ge "$IMG_MIN" ] || fail "not enough userdata space for the image and safety reserve (free $((FREE_BYTES / MIB)) MiB, needs $IMG_MIN MiB + 1024 MiB reserve + 512 MiB firmware budget + $(mib_up "$UPLOAD_BYTES") MiB upload)"
+    FREE_MIB=$((FREE_BYTES / MIB))
     echo "OWRT-APK-FREE-MIB=$FREE_MIB"
     echo "OWRT-APK-IMAGE-RANGE=$IMG_MIN $IMG_MAX $IMG_MIN"
 }
+
+gz_listed() {
+    grep -E '^[0-9a-f]{64}  files/openwrt\.ext4\.gz$' "$P/files/SHA256SUMS" | cut -d ' ' -f1
+}
+
+# ------------------------------------------------------------------ tool
+# 两阶段安装 / 重装已有 e5root 的单步操作。流程顺序、事务记录、启动镜像改写都在 APK（E5Part），
+# 与电脑端 part-two-stage.py 一一对应；这里只做必须在目标设备上以 root 完成的部分。
+if [ "$ACTION" = tool ]; then
+    TBASE=/data/adb/e5-tf-install
+    [ ! -L "$TBASE" ] || fail 'unsafe installer directory'
+    mkdir -p "$TBASE"
+    chmod 700 "$TBASE"
+    STATE=$(mktemp -d "$TBASE/tool.XXXXXX")
+    chmod 700 "$STATE"
+    mkdir "$STATE/bin"
+    "$BB" --install -s "$STATE/bin"
+    export PATH="$STATE/bin:/system/bin:$PATH"
+    LOOP= LOOP_ATTACHED=0 VIEW_MOUNTED=0 heartbeat=
+    tool_cleanup() {
+        result=$?
+        trap - EXIT HUP INT TERM
+        [ -z "$heartbeat" ] || { kill -9 "$heartbeat" 2>/dev/null || true; wait "$heartbeat" 2>/dev/null || true; }
+        if [ "$VIEW_MOUNTED" = 1 ]; then umount "$STATE/view" || exit 1; fi
+        [ "$LOOP_ATTACHED" = 0 ] || losetup -d "$LOOP" || exit 1
+        if [ "$METHOD" = part-write ]; then
+            rm -f "$TMPD/openwrt.ext4.gz" "$TMPD/e5-ext4-tools.tar" "$TMPD/e5-part-write.sh" \
+                  "$TMPD/e5-install.conf" "$TMPD/e5-device-files.tar"
+        fi
+        if [ "$result" = 0 ]; then rm -rf "$STATE"; else echo "[TOOL] $METHOD FAILED: log $STATE" >&2; fi
+        exit "$result"
+    }
+    trap tool_cleanup EXIT
+    trap 'exit 130' HUP INT TERM
+    owner=$$
+    (elapsed=0; while sleep 10; do kill -0 "$owner" 2>/dev/null || exit 0; elapsed=$((elapsed+10)); echo "[TOOL] $METHOD: ${elapsed}s elapsed"; done) &
+    heartbeat=$!
+    case "$METHOD" in
+        preflight)
+            # 电脑端 install_preflight + android_checks 中与 TF 相同的部分
+            preflight_common
+            ;;
+        firmware)
+            # 电脑端 pull_device_files：本机固件提取与转换（安装包自己的 prepare_firmware）。
+            preflight_common
+            prepare_firmware
+            [ ! -L "$TMPD/e5-device-files.tar" ] || fail 'unsafe device files path'
+            cp "$STATE/device-files.tar" "$TMPD/e5-device-files.tar"
+            chmod 600 "$TMPD/e5-device-files.tar"
+            echo "OWRT-APK-DEVICE-FILES=$TMPD/e5-device-files.tar"
+            ;;
+        bootchain-sync)
+            # 电脑端 bootchain('sync')
+            sh "$P/files/android-bootchain.sh" sync
+            ;;
+        arm)
+            # 电脑端 arm_slot_b：本机用安装包的 e5-bootctl（与 TF / 缩容方式相同），备份在 /data/adb/e5-boot-control。
+            case "$(getprop ro.boot.slot_suffix)" in _a) ANDROID_SLOT=a ;; _b) ANDROID_SLOT=b ;; *) fail 'Android slot unavailable' ;; esac
+            [ ! -L /data/adb/e5-boot-control ] || fail 'unsafe boot control backup directory'
+            mkdir -p /data/adb/e5-boot-control
+            backup=$(mktemp /data/adb/e5-boot-control/before.XXXXXX)
+            rm -f "$backup"
+            "$P/files/e5-bootctl" arm "$backup" "$ANDROID_SLOT"
+            echo "Boot control backup: $backup"
+            ;;
+        part-write)
+            # 电脑端 finish() 的上传 + part-write.sh（安装包脚本）；install.conf 与 device-files.tar 已由 APK 放好。
+            [ $# -eq 7 ] || fail 'part-write DEV NEED RAW GROW TOKEN'
+            case "$3" in /dev/block/mmcblk[0-9]p[0-9]*) ;; *) fail 'part-write: invalid target' ;; esac
+            case "${3#/dev/block/mmcblk?p}$4$5" in ''|*[!0-9]*) fail 'part-write: invalid size' ;; esac
+            case "$6" in 0|1) ;; *) fail 'part-write: grow flag must be 0 or 1' ;; esac
+            case "$7" in *[!0-9a-f]*) fail 'part-write: invalid token' ;; esac
+            [ ${#7} -eq 32 ] || fail 'part-write: invalid token'
+            [ "$(cat "/sys/class/block/${3#/dev/block/}/partition" 2>/dev/null)" != "" ] || fail 'part-write: target is not a partition'
+            grep -qx PARTNAME=e5root "/sys/class/block/${3#/dev/block/}/uevent" || fail 'part-write: target is not e5root'
+            [ -s "$TMPD/e5-install.conf" ] && [ -s "$TMPD/e5-device-files.tar" ] || fail 'settings or device files missing'
+            want=$(gz_listed)
+            [ -n "$want" ] || fail 'image checksum missing'
+            for f in openwrt.ext4.gz e5-ext4-tools.tar e5-part-write.sh; do [ ! -L "$TMPD/$f" ] || fail 'unsafe temporary path'; done
+            cp "$P/files/openwrt.ext4.gz" "$TMPD/openwrt.ext4.gz"
+            [ "$(sha "$TMPD/openwrt.ext4.gz")" = "$want" ] || fail 'image copy mismatch'
+            cp "$P/files/ext4-tools.tar" "$TMPD/e5-ext4-tools.tar"
+            cp "$P/files/part-write.sh" "$TMPD/e5-part-write.sh"
+            ASH_STANDALONE=1 "$BB" sh "$TMPD/e5-part-write.sh" "$3" "$4" "$5" "$6" "$7"
+            ;;
+    esac
+    echo "OWRT-APK-TOOL-OK $METHOD"
+    exit 0
+fi
 
 if [ "$ACTION" = check ]; then
     STATE=$(mktemp -d /data/adb/owrt-apk/check.XXXXXX)
@@ -182,7 +325,7 @@ ARMED=0
 cleanup() {
     result=$?
     trap - EXIT HUP INT TERM
-    [ -z "$heartbeat" ] || { kill "$heartbeat" 2>/dev/null || true; wait "$heartbeat" 2>/dev/null || true; }
+    [ -z "$heartbeat" ] || { kill -9 "$heartbeat" 2>/dev/null || true; wait "$heartbeat" 2>/dev/null || true; }
     if [ "$VIEW_MOUNTED" = 1 ]; then umount "$STATE/view" || exit 1; fi
     [ "$LOOP_ATTACHED" = 0 ] || losetup -d "$LOOP" || exit 1
     rm -f "$TMPD/openwrt.ext4.gz" "$TMPD/e5-ext4-tools.tar" "$TMPD/e5-android-loop.sh"
@@ -215,6 +358,7 @@ dstage() {
 
 check_size_part() {
     preflight_part
+    [ -z "$KEEP_NO" ] || fail "$KEEP_NO. Nothing was written."
     [ "$SIZE" -ge "$PART_MIN" ] && [ "$SIZE" -le "$PART_MAX" ] || fail "partition size outside the permitted range ($PART_MIN-$PART_MAX MiB)"
     DATA_MIB=$((UDATA_MIB - SIZE))
     [ "$DATA_MIB" -ge 2048 ] || fail 'userdata would be smaller than 2 GiB'
@@ -226,9 +370,6 @@ check_size_image() {
     echo "[DATA] image $D/openwrt.ext4, $SIZE MiB; userdata is not formatted"
 }
 
-gz_listed() {
-    grep -E '^[0-9a-f]{64}  files/openwrt\.ext4\.gz$' "$P/files/SHA256SUMS" | cut -d ' ' -f1
-}
 
 stage_part() {
     want=$(gz_listed)
@@ -256,9 +397,9 @@ write_image() {
     cp "$P/files/ext4-tools.tar" "$TMPD/e5-ext4-tools.tar"
     cp "$P/files/openwrt.ext4.gz" "$TMPD/openwrt.ext4.gz"
     [ "$(sha "$TMPD/openwrt.ext4.gz")" = "$(gz_listed)" ] || fail 'image copy mismatch'
-    # 电脑端：上传和固件收集后复查空间（上传量记为 0）
+    # 电脑端 ensure_userdata_space：上传和固件收集后按字节复查（上传量记为 0）
     free_kb=$(df -Pk /data | awk 'END {print $4}')
-    [ "$SIZE" -le $((free_kb / 1024 - DATA_RESERVE_MIB - DATA_FIRMWARE_BUDGET_MIB)) ] || fail 'userdata free space is insufficient for the new image. Nothing was armed.'
+    [ $((SIZE * MIB + DATA_RESERVE_MIB * MIB + DATA_FIRMWARE_BUDGET_MIB * MIB)) -le $((free_kb * 1024)) ] || fail 'userdata free space is insufficient for the new image. Nothing was armed.'
     raw_mib=$((RAW_BYTES / MIB))
     out=$(sh "$P/files/userdata-image.sh" "$RAW_BYTES" "$((SIZE * MIB))" "$raw_mib" "$SIZE" 2>&1) || { echo "$out"; fail 'userdata image creation failed'; }
     echo "$out"

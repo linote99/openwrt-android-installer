@@ -122,14 +122,15 @@ public final class AboutActivity extends Activity {
                 + "或同一局域网的无线 ADB（5555 端口）。连接其他设备时本机无需 root，但目标设备需要已 root；"
                 + "首次连接请在目标设备上允许调试，并在其 root 管理器中允许 Shell 的超级用户请求。");
         para("2. 安装包：选择与目标设备匹配的完整 ZIP，不用解压。应用会逐个校验 ZIP 内所有文件的 SHA-256。");
-        para("3. 安装方式：TF 卡、独立内置分区（保留数据）或 userdata 镜像（实验性），以机型支持为准。");
-        para("4. 检查与计划：先做只读检查，不写入任何分区；核对“数据影响”，勾选确认并输入 yes 后才开始安装。");
+        para("3. 安装方式：TF 卡或独立内置分区，以机型支持为准；重装已有内置分区、userdata 镜像（实验性）在“高级功能”里，见本页底部。");
+        para("4. 检查与计划：先做只读检查，不写入任何分区；核对“数据影响”，勾选确认并输入 yes 后才开始安装"
+                + "（需要格式化 userdata 时还要另外勾选，并输入“清空数据”）。");
         para("5. 安装与完成：安装在目标设备后台运行，USB 拔线或网络断开不影响；重新连接即可继续查看进度。"
                 + "完成后按提示重启目标设备进入 OpenWrt，默认用户名和密码均为 root，请尽快修改。");
 
         section("支持机型");
         para("每个安装包只能装到对应机型，型号或主板不符时会拒绝安装。");
-        String all = "TF 卡 / 独立内置分区 / userdata 镜像";
+        String all = "TF 卡 / 独立内置分区；高级功能：重装已有内置分区、userdata 镜像（实验性）";
         model("E5", "E5（需 Bootloader 已解锁：orange）", all, "http://192.168.9.1");
         model("远航41S", "ZTE 7546N，主板 P720S11", all, "http://192.168.9.1");
         model("T551M", "T551M（需 orange）", all, "http://192.168.9.1");
@@ -137,13 +138,18 @@ public final class AboutActivity extends Activity {
         model("VIPME M8", "VIPME M8（需 orange）", all, "http://192.168.9.1");
         model("angelcare K1", "angelcare K1，主板 ums9157_2h10（需 orange）", all, "http://192.168.9.1");
         model("MU300（内核 7.2.8 / 6.18.54 两个包）", "ZTE F50 / MU300 / U30 Air，或 V50 / MU3351（UMS9620 平台）",
-                "TF 卡 / 独立内置分区 / 重装已有内置分区 / userdata 镜像（实验性）", "http://192.168.77.1");
+                all, "http://192.168.77.1");
 
         section("注意事项");
         para("• 不要把安装包刷进不在支持列表里的设备（例如用来操作的手机本身）。");
         para("• TF 卡方式会清空 TF 卡上的目标分区或整卡；内部存储和 Android 数据不动。");
         para("• 独立内置分区方式会修改内部存储的分区表，开机时离线缩小 userdata，断电可能损坏数据，请先备份。"
-                + "分区和镜像方式只支持 userdata 未加密的设备，分区方式还要求 userdata 为 F2FS。");
+                + "保留数据缩容要求 userdata 未加密，E5 系还要求 userdata 为 F2FS。");
+        para("• userdata 已加密或空间不够时，与电脑端一样只能“格式化 userdata 后安装”：Android 应用、账号、照片及内部存储文件全部清空。"
+                + "分两阶段：先重建分区并由原厂 recovery 清空数据；Android 重新设置后，目标设备的开发者选项、USB 调试（以及网络 ADB）、"
+                + "Magisk 和 Shell 的 root 授权都没有了：要重新打开 ADB、重新安装 Magisk（面具），连接时在超级用户请求里允许“Shell”，"
+                + "再在「安装方式」选“继续格式化后的安装”写入 OpenWrt。这条路径必须用另一台手机通过 USB/局域网操作，"
+                + "因为备份和续装记录保存在操作的手机上。");
         para("• MU300 独立内置分区：优先用 eMMC 未分配空间，不动 Android 数据；空间不够时才在首次开机离线缩小 userdata，"
                 + "完成后自动重启一次。开始前会把分区表、misc 和两槽启动链备份到本应用目录。"
                 + "MU300 的 userdata 镜像方式为实验性，可能损坏 Android 的 F2FS 文件系统。");
@@ -151,6 +157,16 @@ public final class AboutActivity extends Activity {
         para("• 安装失败后，同一次开机内不能重试，请先查看日志，并按提示重启或处理。");
         para("• 校验只能保证文件完整、没被改过，不能证明安装包的来源，请只使用可信来源的安装包。");
         para("• 刷机有风险，请自行承担后果。");
+
+        section("高级功能");
+        para("开启：连点页面顶部的“OpenWrt 安装器”标题 5 下（从第 3 下起会提示还差几次），提示“已开启高级功能”后，"
+                + "「安装方式」页会多出“高级选项”。状态会记住，下次打开仍然有效。");
+        para("关闭：再连点标题 5 下，或点“高级选项”右侧的“关闭高级功能”。"
+                + "“继续格式化后的安装”是普通安装方式，不受这个开关影响，一直显示在「安装方式」页。");
+        para("• 重装已有内置分区【高级】：清空已有的 OpenWrt 内置分区（e5root / mu300root，含 OpenWrt 系统和设置）并重新写入；"
+                + "不改分区表，保留 Android。适合已有内置 OpenWrt、只想重新安装，无需插 TF 卡。");
+        para("• userdata 镜像安装【实验性】：在 userdata 里创建 OpenWrt 镜像，不格式化 userdata，仅限未加密的 userdata。"
+                + "userdata 镜像是实验性功能，可能损坏 Android F2FS 文件系统，建议优先选择 TF 卡或独立内置分区。");
 
         section("友情链接");
         link(R.drawable.linote_logo, "Lino 笔记", "https://www.linote.top/", false);

@@ -23,13 +23,15 @@ cp "$A/check-lib.sh" "$T/app/files/check-lib.sh"
 sed -e "s|^D=/data/e5linux|D=$T/data/e5linux|" \
     -e "s|^TMPD=/data/local/tmp|TMPD=$T/data/local/tmp|" \
     -e "s|^BASE=/data/adb/e5-tf-install|BASE=$T/adb/e5-tf-install|" \
+    -e "s|TBASE=/data/adb/e5-tf-install|TBASE=$T/adb/e5-tf-install|" \
+    -e "s|/data/adb/e5-boot-control|$T/adb/e5-boot-control|g" \
     -e "s|/data/adb/owrt-apk/check|$T/base/check|" \
     -e "s|/sys/class/block|$T/sys|g" \
     -e "s|/proc/mounts|$T/mounts|" \
     -e "s|/dev/block/by-name|$T/byname|g" \
     -e "s|\"/dev/block/\$DATA_NODE\"|\"$T/blk/\$DATA_NODE\"|" \
     "$A/userdata-lib.sh" > "$T/app/files/userdata-lib.sh"
-grep -n '/data/\|/dev/block/by-name\|/sys/class' "$T/app/files/userdata-lib.sh" | grep -v "$T" | grep -v '^.*#' | grep -v "fail '" | grep -v 'OWRT-APK-DATA-NODE\|dm-\|mapper\|/dev/block/\*' && { echo 'FAIL: unrewritten Android path'; exit 1; }
+grep -n '/data/\|/dev/block/by-name\|/sys/class' "$T/app/files/userdata-lib.sh" | grep -v "$T" | grep -v '^.*#' | grep -v "fail '" | grep -v "KEEP_NO='" | grep -v 'OWRT-APK-DATA-NODE\|dm-\|mapper\|/dev/block/\*' && { echo 'FAIL: unrewritten Android path'; exit 1; }
 cp "$A/mu300-lib.sh" "$T/app/files/mu300-lib.sh"
 # fake partitions and /data mount
 printf 'MAJOR=179\nPARTNAME=userdata\n' > "$T/sys/mmcblk0p70/uevent"; echo 134217728 > "$T/sys/mmcblk0p70/size"   # 64 GiB
@@ -68,6 +70,15 @@ EOF
     printf '#!/bin/sh\necho "bootctl $*" >> %s\n[ "$1" != arm ] || : > "$2"\n' "$LOG" > "$S/files/e5-bootctl"
     printf '#!/bin/sh\necho "bootchain $1" >> %s\n' "$LOG" > "$S/files/android-bootchain.sh"
     printf '# fake android-loop\n' > "$S/files/android-loop.sh"
+    cat > "$S/files/part-write.sh" <<EOF
+#!/bin/sh
+echo "part-write \$*" >> $LOG
+for f in openwrt.ext4.gz e5-ext4-tools.tar e5-part-write.sh e5-install.conf e5-device-files.tar; do
+    [ -s $T/data/local/tmp/\$f ] || { echo "missing \$f" >&2; exit 7; }
+done
+[ "\${MOCK_FAIL:-}" != partwrite ] || { echo 'simulated write failure' >&2; exit 5; }
+echo E5-PART-WRITE-OK
+EOF
     cat > "$S/files/userdata-image.sh" <<EOF
 #!/bin/sh
 echo "userdata-image \$*" >> $LOG
@@ -103,15 +114,25 @@ expect 'part reports userdata' "$out" 'OWRT-APK-DATA-NODE=/dev/block/mmcblk0p70'
 expect 'check rc 0' "$out" 'OWRT-APK-CHECK-RC=0'
 ls "$T/base" | grep -q '^check\.' && bad 'check temp left' || ok 'check temp removed'
 [ -z "$(ls "$T/data/e5linux")" ] && ok 'check wrote nothing to /data/e5linux' || bad 'check wrote files'
+# 1.5.0: encrypted userdata no longer fails the check (PC part_userdata_policy):
+# keep-data shrink is reported impossible, the format-userdata range is offered.
 out=$(MOCK_CRYPTO_TYPE=file $H check-data part 2>&1)
-expect 'FBE refused' "$out" 'userdata is encrypted or mapped'
-expect 'FBE rc nonzero' "$out" 'OWRT-APK-CHECK-RC=1'
-out=$(MOCK_CRYPTO_STATE=encrypted MOCK_CRYPTO_TYPE= $H check-data part 2>&1);  expect 'encrypted state refused' "$out" 'encrypted or mapped'
-out=$(MOCK_CRYPTO_STATE= $H check-data part 2>&1);  expect 'unknown crypto state refused' "$out" 'encrypted or mapped'
+expect 'FBE: check passes' "$out" 'OWRT-APK-CHECK-RC=0'
+expect 'FBE: flagged encrypted' "$out" 'OWRT-APK-ENCRYPTED=1'
+expect 'FBE: keep-data impossible' "$out" 'OWRT-APK-KEEP-NO=userdata is encrypted'
+expect 'FBE: format range (min 2304, max 65536-0-2048)' "$out" 'OWRT-APK-WIPE-RANGE=2304 63488 3072'
+echo "$out" | grep -q 'OWRT-APK-PART-RANGE' && bad 'FBE: keep range offered' || ok 'FBE: no keep range'
+out=$(MOCK_CRYPTO_STATE=encrypted MOCK_CRYPTO_TYPE= $H check-data part 2>&1);  expect 'encrypted state: keep-data impossible' "$out" 'OWRT-APK-KEEP-NO=userdata is encrypted'
+# PC only treats state==encrypted, type file/block or dm-mapped /data as encrypted
+out=$(MOCK_CRYPTO_STATE= $H check-data part 2>&1);  expect 'unknown crypto state: not encrypted (as PC)' "$out" 'OWRT-APK-ENCRYPTED=0'
+expect 'unknown crypto state: keep range offered' "$out" 'OWRT-APK-PART-RANGE=2304 43008 3072'
+out=$(MOCK_CRYPTO_TYPE=file timeout 60 $H start part 4096 1 2>&1); expect 'FBE: keep-data start refused' "$out" 'OWRT-APK-RC=1'
+[ ! -e "$T/data/e5linux/part-install.conf" ] && ok 'FBE: nothing staged' || bad 'FBE: staged on encrypted'
+reboot_sim
 echo "/dev/block/dm-5 /data f2fs rw 0 0" > "$T/mounts"
-out=$($H check-data part 2>&1); expect 'dm-mapped /data refused' "$out" 'encrypted or mapped'
+out=$($H check-data part 2>&1); expect 'dm-mapped /data: keep-data impossible' "$out" 'OWRT-APK-KEEP-NO=userdata is encrypted'
 echo "/dev/block/mmcblk0p70 /data f2fs rw,lazytime 0 0" > "$T/mounts"
-out=$(MOCK_USED_KB=62914560 $H check-data part 2>&1); expect 'full userdata refused' "$out" 'not enough room'
+out=$(MOCK_USED_KB=62914560 $H check-data part 2>&1); expect 'full userdata: keep-data impossible' "$out" 'OWRT-APK-KEEP-NO=not enough room'; expect 'full userdata: format range still offered' "$out" 'OWRT-APK-WIPE-RANGE=2304 63488'
 mkdir -p "$T/sys/mmcblk0p71"; printf 'PARTNAME=e5root\n' > "$T/sys/mmcblk0p71/uevent"; echo 1 > "$T/sys/mmcblk0p71/size"
 out=$($H check-data part 2>&1); expect 'existing e5root refused' "$out" 'already exists'
 rm -rf "$T/sys/mmcblk0p71"
@@ -161,7 +182,7 @@ out=$(timeout 60 $H start part 4096 0 2>&1); expect 'same-boot retry blocked by 
 rm -rf "$T/data/e5linux/"*; reboot_sim; restage; : > "$LOG"
 out=$($H check-data image 2>&1)
 expect 'image check ok' "$out" 'OWRT-APK-CHECK-OK'
-expect 'image range (2048 .. 30720-1024-512-1-1)' "$out" 'OWRT-APK-IMAGE-RANGE=2048 29182 2048'
+expect 'image range (2048 .. floor((30720 MiB-1 GiB-512 MiB-upload bytes)/MiB), as PC choose_userdata_size)' "$out" 'OWRT-APK-IMAGE-RANGE=2048 29183 2048'
 out=$(MOCK_CRYPTO_TYPE=file $H check-data image 2>&1); expect 'image: FBE refused' "$out" 'requires confirmed unencrypted'
 echo old > "$T/data/e5linux/openwrt.ext4"; echo oldconf > "$T/data/e5linux/openwrt-install.conf"
 out=$(timeout 60 $H start image 4096 2>&1)
@@ -182,5 +203,58 @@ expect 'image failure rc' "$out" 'OWRT-APK-RC=1'
 [ ! -e "$T/data/e5linux/boot-os" ] && ! grep -q 'bootctl arm' "$LOG" && ok 'image failure: not armed' || bad 'image failure armed'
 [ -z "$(ls "$T/data/local/tmp")" ] && ok 'image failure: tmp cleaned' || bad 'image failure tmp leftovers'
 out=$($H start image 99999999 2>&1); expect 'job refused while lock held / range' "$out" 'OWRT-APK'
+# ---------------- e5-tool (two-stage / reinstall single steps, E5Part)
+rm -rf "$T/data/e5linux/"*; reboot_sim; restage; : > "$LOG"; rm -f "$T/data/local/tmp/"*
+out=$($H e5-tool bogus 2>&1); expect 'e5-tool: unknown sub refused' "$out" 'e5-tool preflight|firmware'
+out=$($H e5-tool preflight 2>&1)
+expect 'e5-tool preflight ok' "$out" 'OWRT-APK-TOOL-OK preflight'
+expect 'e5-tool preflight rc 0' "$out" 'OWRT-APK-TOOL-RC=0'
+ls "$T/adb/e5-tf-install" | grep -q '^tool\.' && bad 'tool state dir left' || ok 'tool state dir removed on success'
+out=$($H e5-tool firmware 2>&1)
+expect 'e5-tool firmware ok' "$out" 'OWRT-APK-TOOL-OK firmware'
+expect 'e5-tool firmware path' "$out" "OWRT-APK-DEVICE-FILES=$T/data/local/tmp/e5-device-files.tar"
+[ "$(cat "$T/data/local/tmp/e5-device-files.tar" 2>/dev/null)" = devfiles ] && ok 'device files copied' || bad 'device files'
+[ "$(stat -c %a "$T/data/local/tmp/e5-device-files.tar" 2>/dev/null)" = 600 ] && ok 'device files mode 600' || bad 'device files mode'
+expect 'e5-tool firmware streams hotspot' "$out" 'Hotspot / 热点：E5-OpenWrt-77'
+out=$(MOCK_FAIL=firmware $H e5-tool firmware 2>&1)
+expect 'e5-tool firmware failure rc' "$out" 'OWRT-APK-TOOL-RC=1'
+expect 'e5-tool failure keeps log' "$out" '\[TOOL\] firmware FAILED: log'
+rm -rf "$T/adb/e5-tf-install"/tool.*
+: > "$LOG"
+out=$($H e5-tool bootchain-sync 2>&1); expect 'e5-tool bootchain-sync rc 0' "$out" 'OWRT-APK-TOOL-RC=0'
+grep -qx 'bootchain sync' "$LOG" && ok 'bootchain sync called' || bad 'bootchain sync'
+out=$($H e5-tool arm 2>&1); expect 'e5-tool arm rc 0' "$out" 'OWRT-APK-TOOL-RC=0'
+expect 'e5-tool arm backup path' "$out" "Boot control backup: $T/adb/e5-boot-control/before\."
+grep -q "^bootctl arm $T/adb/e5-boot-control/before\.[A-Za-z0-9]* a\$" "$LOG" && ok 'bootctl arm BACKUP a' || { bad 'bootctl arm args'; cat "$LOG"; }
+# part-write argument validation (nothing copied, nothing run)
+TOK=0123456789abcdef0123456789abcdef
+mkdir -p "$T/sys/mmcblk0p71"; printf 'MAJOR=179\nPARTNAME=e5root\n' > "$T/sys/mmcblk0p71/uevent"; echo 71 > "$T/sys/mmcblk0p71/partition"; echo 8388608 > "$T/sys/mmcblk0p71/size"
+echo 70 > "$T/sys/mmcblk0p70/partition"
+: > "$LOG"
+out=$($H e5-tool part-write /dev/block/mmcblk0p71 4096 2048 1 2>&1); expect 'part-write: arg count' "$out" 'part-write DEV NEED RAW GROW TOKEN'
+out=$($H e5-tool part-write /dev/sda1 4096 2048 1 $TOK 2>&1); expect 'part-write: target outside mmcblk' "$out" 'invalid target'
+out=$($H e5-tool part-write /dev/block/mmcblk0p71 40x 2048 1 $TOK 2>&1); expect 'part-write: bad size' "$out" 'invalid size'
+out=$($H e5-tool part-write /dev/block/mmcblk0p71 4096 2048 2 $TOK 2>&1); expect 'part-write: bad grow' "$out" 'grow flag must be 0 or 1'
+out=$($H e5-tool part-write /dev/block/mmcblk0p71 4096 2048 1 0123 2>&1); expect 'part-write: short token' "$out" 'invalid token'
+out=$($H e5-tool part-write /dev/block/mmcblk0p71 4096 2048 1 0123456789ABCDEF0123456789abcdef 2>&1); expect 'part-write: upper-case token' "$out" 'invalid token'
+out=$($H e5-tool part-write /dev/block/mmcblk0p70 4096 2048 1 $TOK 2>&1); expect 'part-write: userdata is not e5root' "$out" 'target is not e5root'
+out=$($H e5-tool part-write /dev/block/mmcblk0p99 4096 2048 1 $TOK 2>&1); expect 'part-write: missing partition' "$out" 'target is not a partition'
+rm -f "$T/data/local/tmp/e5-device-files.tar"
+out=$($H e5-tool part-write /dev/block/mmcblk0p71 4096 2048 1 $TOK 2>&1); expect 'part-write: device files required' "$out" 'settings or device files missing'
+expect 'part-write refusal rc' "$out" 'OWRT-APK-TOOL-RC=1'
+! grep -q '^part-write' "$LOG" && ok 'part-write.sh never ran on refusals' || bad 'part-write.sh ran on refusal'
+rm -rf "$T/adb/e5-tf-install"/tool.*
+# part-write success: package image + tools + script copied, script run with the 5 args, tmp cleaned
+printf 'devfiles' > "$T/data/local/tmp/e5-device-files.tar"; printf 'E5_WIFI_SSID=x\n' > "$T/data/local/tmp/e5-install.conf"
+out=$($H e5-tool part-write /dev/block/mmcblk0p71 4096 2048 1 $TOK 2>&1)
+expect 'part-write ok' "$out" 'OWRT-APK-TOOL-OK part-write'
+expect 'part-write marker' "$out" 'E5-PART-WRITE-OK'
+grep -qx "part-write /dev/block/mmcblk0p71 4096 2048 1 $TOK" "$LOG" && ok 'part-write.sh args (DEV NEED RAW GROW TOKEN)' || { bad 'part-write args'; cat "$LOG"; }
+[ -z "$(ls "$T/data/local/tmp")" ] && ok 'part-write: tmp cleaned' || { bad 'part-write tmp leftovers'; ls "$T/data/local/tmp"; }
+printf 'devfiles' > "$T/data/local/tmp/e5-device-files.tar"; printf 'E5_WIFI_SSID=x\n' > "$T/data/local/tmp/e5-install.conf"
+out=$(MOCK_FAIL=partwrite $H e5-tool part-write /dev/block/mmcblk0p71 4096 2048 1 $TOK 2>&1)
+expect 'part-write failure rc (script rc passed through)' "$out" 'OWRT-APK-TOOL-RC=5'
+[ -z "$(ls "$T/data/local/tmp")" ] && ok 'part-write failure: tmp cleaned' || bad 'part-write failure tmp leftovers'
+rm -rf "$T/adb/e5-tf-install"/tool.* "$T/sys/mmcblk0p71"
 echo "mock-data result: $pass passed, $fail failed"
 [ "$fail" = 0 ]

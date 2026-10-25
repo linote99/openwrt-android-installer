@@ -52,13 +52,18 @@ final class JobManager {
     enum Method {
         TF("TF 卡安装", "清空所选 TF 卡并写入 OpenWrt；内部存储与 Android 数据不变",
                 "TF 卡安装", "清空所选 TF 卡并写入 OpenWrt；内部存储与 Android 数据不变"),
-        PART("缩容 userdata 安装", "保留 Android 数据：下次启动时离线缩小 userdata，新建 e5root 分区写入 OpenWrt（仅限未加密 userdata）",
-                "独立内置分区安装", "优先使用 eMMC 未分配空间（不动 Android 数据）；空间不够时离线缩小 userdata 并保留数据"
-                        + "（仅限未加密 userdata），首次开机自动重启一次"),
+        PART("缩容 userdata 安装", "下次启动时离线缩小 userdata，新建 e5root 分区写入 OpenWrt；未加密时保留 Android 数据，"
+                        + "userdata 已加密或数据放不下时可选“格式化 userdata”（Android 数据全部清空，分两阶段完成）",
+                "独立内置分区安装", "优先使用 eMMC 未分配空间（不动 Android 数据）；空间不够时离线缩小 userdata 并保留数据；"
+                        + "userdata 已加密或数据放不下时可选“格式化 userdata”（Android 数据全部清空），首次开机自动重启一次"),
         IMAGE("userdata 镜像安装【实验性】", "在 /data/e5linux 中创建 openwrt.ext4 镜像，不格式化 userdata（仅限未加密 userdata）",
                 "userdata 镜像安装【实验性】", "在 /data/mu300linux 中创建 OpenWrt 镜像，不格式化 userdata（仅限未加密）；可能损坏 Android 的 F2FS 文件系统"),
-        REPART("重装已有内置分区【高级】", "",
-                "重装已有内置分区【高级】", "清空已有的 mu300root 分区（含 OpenWrt 设置）并重新写入；不改分区表，不动 Android 数据");
+        REPART("重装已有内置分区【高级】", "清空已有的 e5root 分区（OpenWrt 系统及其配置）并重新写入；不改分区表，不动 Android 数据",
+                "重装已有内置分区【高级】", "清空已有的 mu300root 分区（含 OpenWrt 设置）并重新写入；不改分区表，不动 Android 数据"),
+        RESUME("继续格式化后的安装", "“格式化 userdata”安装的第二阶段：Android 重置后先重新打开 ADB、重新安装 Magisk（面具）并给 Shell 授予 root，再"
+                        + "把 OpenWrt 写入已准备好的 e5root（需要第一阶段在本机保存的记录）",
+                "继续格式化后的安装", "“格式化 userdata”安装的第二阶段：Android 重置后先重新打开 ADB、重新安装 Magisk（面具）并给 Shell 授予 root，再"
+                        + "把 OpenWrt 写入已准备好的 mu300root（需要第一阶段在本机保存的记录）");
         final String title, summary, muTitle, muSummary;
         Method(String t, String s, String mt, String ms) { title = t; summary = s; muTitle = mt; muSummary = ms; }
     }
@@ -114,12 +119,30 @@ final class JobManager {
     // MU300 internal-storage methods (ported computer-side flows)
     Mu300Internal.Plan muPlan;
     Mu300Internal.Outcome muOutcome;
+    /** The last install was the first stage of a "format userdata" install (device is resetting). */
+    boolean stage1;
     String muBackup;
+    // Independent partition: the three routes of the original (unallocated space / keep data / format userdata)
+    /** The user ticked "格式化 userdata（Android 数据全部清空）"; never on by default, reset by every check. */
+    volatile boolean formatUserdata;
+    long[] keepRange, wipeRange;       // E5 PART: preserving shrink / format userdata (min, max, default)
+    String keepNo, wipeNo;             // why a route is unavailable
+    boolean e5Encrypted;
+    E5Part.Pkg e5Pkg;
+    String resumeInfo;
     String lastJob = "none";       // none | running | done N | lost
     String hotspot;                // "SSID / key" from the installer log
     boolean installOk;
     String installRc;              // null while running/unknown
     volatile String lastLine = "";
+    /** The step of the running task now waiting on the target, and whether that step writes to it. */
+    volatile String step;
+    volatile boolean stepWrites;
+    volatile long stepSince;
+    /** Last time the running task showed any sign of life (log line, upload progress). */
+    volatile long lastActivity;
+    /** The user pressed "停止" on the running task. */
+    volatile boolean stopRequested;
     /** Message of the last task that failed (null after a success) and that task's description. */
     volatile String lastFail, lastFailTask;
     volatile long taskStarted;
@@ -232,6 +255,111 @@ final class JobManager {
         if (muPlan == null) return -1;
         try { return Mu300Gpt.allocation(muPlan.s.size, mib)[0] / 2048; } catch (IllegalArgumentException e) { return -1; }
     }
+    /** Methods the desktop installer lists under 「高级选项」; shown in step 3 only after the title is tapped 5 times. */
+    static boolean advanced(Method m) { return m == Method.IMAGE || m == Method.REPART; }
+
+    enum Route { FREE, KEEP, FORMAT }
+    private static boolean in(long[] r, long v) { return r != null && v >= r[0] && v <= r[1]; }
+    /** PART: the route the chosen size and the "格式化 userdata" box lead to, as the original decides it; null = none. */
+    Route route() {
+        if (method != Method.PART || rangeMax <= 0) return null;
+        if (muInternal(method)) {
+            if (muPlan == null) return null;
+            Mu300Internal.Route r = Mu300Internal.route(muPlan, chosenMib, formatUserdata);
+            if (r == Mu300Internal.Route.FORMAT && formatNo() != null) return null;
+            return r == null ? null : Route.valueOf(r.name());
+        }
+        boolean wipeOk = wipeNo == null && in(wipeRange, chosenMib);
+        if (formatUserdata) return wipeOk ? Route.FORMAT : null;
+        if (keepNo == null && in(keepRange, chosenMib)) return Route.KEEP;
+        return wipeOk ? Route.FORMAT : null;
+    }
+    /** Why formatting userdata cannot be offered at all (null = it can). */
+    String formatNo() {
+        if (method != Method.PART) return "只用于独立内置分区安装";
+        if (muInternal(method)) {
+            if (muPlan == null || muPlan.formatMax < muPlan.min) return "格式化 userdata 后也放不下（或 userdata 加密状态无法确认/起点未对齐）";
+            if (mode == Mode.LOCAL) return "格式化 userdata 会清空这台手机自己的数据，包括本应用保存的备份和续装记录，第二阶段无法续上；请用另一台手机通过 USB/局域网操作";
+            return null;
+        }
+        return wipeNo;
+    }
+    /** The format box may be ticked (formatting is possible for this check). */
+    boolean formatOffered() { return method == Method.PART && checkPassed() && formatNo() == null; }
+    /** The chosen size can only be installed by formatting userdata (encrypted, or the data does not fit). */
+    boolean formatRequired() {
+        if (!formatOffered()) return false;
+        if (muInternal(method)) return muPlan != null && Mu300Internal.formatRequired(muPlan, chosenMib);
+        return !(keepNo == null && in(keepRange, chosenMib)) && in(wipeRange, chosenMib);
+    }
+    void setFormatUserdata(boolean v) {
+        if (busy != null) return;
+        if (v && !formatOffered()) { append("不能格式化 userdata：" + formatNo()); changed(); return; }
+        formatUserdata = v;
+        append(v ? "已勾选：格式化 userdata（Android 数据全部清空）" : "已取消勾选格式化 userdata");
+        changed();
+    }
+    /** One line: the route and why, for the plan page and the log. */
+    String routeText() {
+        Route r = route();
+        if (muInternal(method)) return muPlan == null ? "" : r == Route.FORMAT && !formatUserdata
+                ? Mu300Internal.why(muPlan, chosenMib, true) + "。需要勾选“格式化 userdata”才能继续"
+                : r == null && formatNo() != null && Mu300Internal.route(muPlan, chosenMib, true) == Mu300Internal.Route.FORMAT
+                ? "此大小只能格式化 userdata，但" + formatNo()
+                : Mu300Internal.why(muPlan, chosenMib, formatUserdata);
+        if (r == Route.KEEP) return "离线缩小 userdata 并保留 Android 数据：userdata 未加密，" + chosenMib + " MiB 放得下现有数据和余量";
+        if (r == Route.FORMAT) return "格式化 userdata（Android 数据全部清空）：" + (e5Encrypted ? "userdata 已加密，加密数据无法离线保留"
+                : formatUserdata ? "按你的选择不保留数据" : "已用数据放不进缩小后的 userdata") + (formatUserdata ? "" : "。需要勾选“格式化 userdata”才能继续");
+        if (formatUserdata && wipeNo != null) return "不能格式化 userdata：" + wipeNo;
+        return "所选大小没有可用的安装路径" + (keepNo != null ? "（保留数据：" + keepNo + "）" : "") + (wipeNo != null ? "（格式化：" + wipeNo + "）" : "");
+    }
+    /** Null when the install button may proceed; otherwise what is missing. */
+    String installBlocker() {
+        if (method != Method.PART) return null;
+        Route r = route();
+        if (r == null) return routeText();
+        if (r == Route.FORMAT && !formatUserdata) return "此大小需要格式化 userdata（Android 数据全部清空），请先勾选确认";
+        return null;
+    }
+    /** Methods that continue an unfinished record; never hidden behind the advanced switch. */
+    static boolean continuation(Method m) { return m == Method.RESUME; }
+    /** Unfinished local transaction records (formatting install stage 1, uninstall), shown even when
+     *  the advanced options are hidden. Returns a short Chinese description or null. */
+    /** Message when no usable target is connected; points at the re-setup steps while a formatting install is unfinished. */
+    String notReady(boolean withRoot) {
+        if (mode == Mode.LOCAL) return "本机没有 root";
+        String s = withRoot ? "请先连接目标设备（USB 或局域网）并取得 root" : "请先连接目标设备（USB 或局域网）";
+        if (pendingRecord() != null)
+            s += "。格式化后的续装：先在目标设备上重新打开 ADB、重新安装 Magisk（面具），连接时给 Shell 授予 root（见「设备」页的提示）";
+        return s;
+    }
+    String pendingRecord() {
+        String[][] kinds = {{"e5-part", "phase", "complete", "格式化后的安装（E5 系）"},
+                            {"mu300-backup", "state", "installed", "格式化后的安装（MU300）"}};
+        for (String[] k : kinds) {
+            File[] dirs = backupBase(k[0]).listFiles();
+            if (dirs == null) continue;
+            for (File d : dirs) {
+                File t = new File(d, "transaction.json");
+                if (!t.isFile()) continue;
+                try {
+                    Object o = MiniJson.parse(new String(java.nio.file.Files.readAllBytes(t.toPath()), java.nio.charset.StandardCharsets.UTF_8));
+                    if (!(o instanceof java.util.Map)) continue;
+                    Object v = ((java.util.Map<?, ?>) o).get(k[1]);
+                    if (v != null && !k[2].equals(String.valueOf(v))) return k[3] + "，记录 " + d.getName() + "，状态 " + v;
+                } catch (Exception e) { /* unreadable record: the check step reports it */ }
+            }
+        }
+        return null;
+    }
+    File backupBase(String name) {
+        File ext = app.getExternalFilesDir(null);
+        return new File(ext != null ? ext : app.getFilesDir(), name);
+    }
+    String targetSerial() {
+        Device d = target();
+        return d != null && d.serial != null && !d.serial.isEmpty() ? d.serial : Build.MODEL;
+    }
     boolean localCopyAvailable() {
         return new File(localPkgDir(), "files/magisk-tf-install.sh").isFile()
                 || new File(localPkgDir(), "payload/tf-install-worker.sh").isFile();
@@ -239,9 +367,9 @@ final class JobManager {
 
     boolean methodAllowed(Method m) {
         if (m == Method.TF) return true;
-        if (pkg == null) return m != Method.REPART;
+        if (pkg == null) return m != Method.REPART && m != Method.RESUME;
         if (pkg.isMu300()) return pkg.internalProblem == null;
-        return m != Method.REPART && !pkg.tfOnly;
+        return !pkg.tfOnly;
     }
 
     String adminUrl() { return pkg != null ? pkg.adminUrl : "http://192.168.9.1"; }
@@ -271,6 +399,12 @@ final class JobManager {
         muPlan = null;
         dataNode = crypto = null;
         udataMib = usedMib = freeMib = rangeMin = rangeMax = rangeDefault = chosenMib = 0;
+        formatUserdata = false;
+        keepRange = wipeRange = null;
+        keepNo = wipeNo = resumeInfo = null;
+        e5Encrypted = false;
+        e5Pkg = null;
+        muPlan = null;
     }
 
     void setMethod(Method m) {
@@ -305,6 +439,7 @@ final class JobManager {
     }
 
     void append(String line) {
+        lastActivity = System.currentTimeMillis();
         final String l = now() + "  " + line;
         synchronized (log) {
             log.add(l);
@@ -330,6 +465,10 @@ final class JobManager {
         if (busy != null) { append("正在执行：" + busy + "，请稍候"); return false; }
         busy = what;
         cancel = false;
+        stopRequested = false;
+        step = null;
+        stepWrites = false;
+        stepSince = lastActivity = System.currentTimeMillis();
         progress = -1;
         taskStarted = System.currentTimeMillis();
         lastLine = "";
@@ -354,6 +493,8 @@ final class JobManager {
                 recordCrash(Thread.currentThread(), e, false);
             } finally {
                 busy = null;
+                step = null;
+                stepWrites = false;
                 progress = -1;
                 if (foreground) InstallService.stop(app);
                 append("■ 结束：" + what);
@@ -365,6 +506,7 @@ final class JobManager {
 
     // ------------------------------------------------------------ target execution
     private AdbConnection adb() throws IOException {
+        if (stopRequested && busy != null) throw new IOException("已按要求停止");
         if (remote == null || remote.endpoint == null) throw new IOException("尚未连接其他设备");
         if ((adb == null || adb.isClosed()) && remote.usbName != null) {
             UsbManager um = (UsbManager) app.getSystemService(Context.USB_SERVICE);
@@ -518,6 +660,8 @@ final class JobManager {
 
     /** Common part after a wired or wireless ADB connection: device properties and root. */
     private void finishRemote(Device d, AdbConnection c) throws IOException {
+            if (c.staleDropped > 0 || c.staleBytes > 0)
+                append("已丢弃上一次会话残留的数据（" + c.staleDropped + " 个报文" + (c.staleBytes > 0 ? "，" + c.staleBytes + " 字节" : "") + "）");
             append("✓ 已连接（" + (c.banner.containsKey("ro.product.model") ? c.banner.get("ro.product.model") : "设备") + "）");
             parseProps(d, c.shellText(propsScriptPlain()));
             d.probed = true;
@@ -532,7 +676,11 @@ final class JobManager {
             }
             describe(d, d.usbName != null ? "USB 设备" : "局域网设备");
             if (d.root == null) {
-                append("✗ 目标设备没有可用的 root：请在其 Magisk / KernelSU / KSUNext 中允许 Shell 的超级用户请求后重新连接。");
+                if (pendingRecord() != null) {
+                    append("✗ 目标设备没有可用的 root。本机有未完成的“格式化后的安装”：格式化后目标设备的 Magisk 和 Shell 的 root 授权都已清空。");
+                    for (String l : Mu300Internal.resumePrep().split("\n")) append("  " + l);
+                } else
+                    append("✗ 目标设备没有可用的 root：请在其 Magisk / KernelSU / KSUNext 中允许 Shell 的超级用户请求后重新连接。");
                 changed();
                 return;
             }
@@ -704,13 +852,26 @@ final class JobManager {
     /** Target access for the ported MU300 computer-side flow. */
     private Mu300Internal.Io muIo() {
         return new Mu300Internal.Io() {
-            @Override public String sh(String script, boolean root) throws IOException {
+            @Override public String sh(String script, boolean root) throws IOException { return sh(script, root, 600); }
+            @Override public String sh(String script, boolean root, int silenceSec) throws IOException {
+                return sh(script, root, silenceSec, null);
+            }
+            @Override public String sh(String script, boolean root, int silenceSec,
+                                       java.util.function.Consumer<String> live) throws IOException {
                 StringBuilder b = new StringBuilder();
-                RootShell.LineSink sink = l -> b.append(l).append('\n');
+                RootShell.LineSink sink = l -> {
+                    b.append(l).append('\n');
+                    if (live != null) live.accept(l);
+                };
                 int rc;
-                if (mode == Mode.LOCAL) rc = RootShell.run(script, sink, 1800);
-                else if (root) rc = rootRun(script, sink, 1800);
-                else rc = adb().shell(script, sink::line);
+                int ms = silenceSec <= 0 ? 0 : silenceSec * 1000;
+                if (mode == Mode.LOCAL) rc = RootShell.run(script, sink, silenceSec <= 0 ? 6 * 3600 : Math.max(silenceSec, 60));
+                else {
+                    Device d = remote;
+                    String cmd = !root || d == null || d.root == null || d.root.isEmpty() ? script : d.root + " -c " + RootShell.q(script);
+                    if (root && (d == null || d.root == null)) throw new IOException("目标设备没有可用的 root");
+                    rc = adb().shell(cmd, sink::line, ms);
+                }
                 if (rc != 0) {
                     String[] ls = b.toString().trim().split("\n");
                     throw new IOException("目标设备命令失败（" + rc + "）" + (ls.length > 0 && !ls[ls.length - 1].isEmpty() ? "：" + ls[ls.length - 1] : ""));
@@ -718,13 +879,23 @@ final class JobManager {
                 return b.toString();
             }
 
-            @Override public void pull(String remote, File dest) throws IOException {
-                try (OutputStream o = new FileOutputStream(dest)) {
+            @Override public void pull(String remote, File dest) throws IOException { pull(remote, dest, null); }
+            @Override public void pull(String remote, File dest, java.util.function.LongConsumer received) throws IOException {
+                try (OutputStream file = new FileOutputStream(dest)) {
+                    OutputStream o = received == null ? file : new java.io.FilterOutputStream(file) {
+                        long n;
+                        @Override public void write(int x) throws IOException { file.write(x); received.accept(++n); }
+                        @Override public void write(byte[] d, int off, int len) throws IOException {
+                            file.write(d, off, len);
+                            n += len;
+                            received.accept(n);
+                        }
+                    };
                     if (mode == Mode.LOCAL) {
                         int rc = RootShell.readBinary("cat " + RootShell.q(remote), o, 1800);
                         if (rc != 0) throw new IOException("读取失败（" + rc + "）：" + remote);
                     } else {
-                        adb().execRaw("cat " + RootShell.q(remote), o);
+                        adb().execRaw("cat " + RootShell.q(remote), o, 600_000);
                     }
                 }
             }
@@ -742,9 +913,11 @@ final class JobManager {
                         if (!big) return;
                         int pct = (int) (done * 100 / total);
                         String l = "上传 " + local.getName() + " " + pct + "%";
+                        lastActivity = System.currentTimeMillis();
                         if (!l.equals(lastLine)) { lastLine = l; changed(); }
                     }
-                    @Override public boolean cancelled() { return false; }   // never abandon a half-written stage
+                    // Only a staging file in /data/local/tmp is being written: stopping here changes nothing else.
+                    @Override public boolean cancelled() { return stopRequested; }
                 });
             }
 
@@ -766,16 +939,30 @@ final class JobManager {
 
             @Override public void progress(int percent) { progress = percent; changed(); }
 
+            @Override public void status(String line) {
+                lastLine = line;
+                lastActivity = System.currentTimeMillis();
+                changed();
+            }
             @Override public File cacheDir() { return app.getCacheDir(); }
+            @Override public void step(String what, boolean writes) {
+                if (!what.equals(step)) stepSince = System.currentTimeMillis();
+                step = what;
+                stepWrites = writes;
+                lastActivity = System.currentTimeMillis();
+                changed();
+            }
+            @Override public boolean cancelled() { return stopRequested; }
         };
     }
 
     private static Mu300Internal.Kind kind(Method m) {
-        return m == Method.PART ? Mu300Internal.Kind.PART : m == Method.REPART ? Mu300Internal.Kind.REPART : Mu300Internal.Kind.IMAGE;
+        return m == Method.PART ? Mu300Internal.Kind.PART : m == Method.REPART ? Mu300Internal.Kind.REPART
+                : m == Method.RESUME ? Mu300Internal.Kind.RESUME : Mu300Internal.Kind.IMAGE;
     }
 
     private void checkMu300(Method m) throws IOException {
-        if (!targetReady()) throw new IOException(mode == Mode.LOCAL ? "本机没有 root" : "请先连接目标设备（USB 或局域网）并取得 root");
+        if (!targetReady()) throw new IOException(notReady(true));
         if (!muLocalReady()) throw new IOException("本机已没有内置安装文件，请重新选择安装包");
         String why = problemFor(pkg, target());
         if (why != null) throw new IOException(why + "；不要跨机型刷入");
@@ -789,7 +976,11 @@ final class JobManager {
         udataMib = p.s.size / 2048;
         freeMib = p.s.free / 1024;
         usedMib = Math.max(0, udataMib - freeMib);
-        if (m == Method.REPART) {
+        if (m == Method.RESUME) {
+            Mu300Internal.Resume rec = Mu300Internal.loadResume(muIo(), p, muLocal(), backupBase("mu300-backup"), targetSerial());
+            resumeInfo = "续装记录 " + rec.file.getParentFile().getName() + "，状态 " + rec.r.get("state") + "；" + p.summary;
+            rangeMin = rangeMax = rangeDefault = chosenMib = p.rootMib;
+        } else if (m == Method.REPART) {
             rangeMin = rangeMax = rangeDefault = chosenMib = p.rootMib;
         } else {
             rangeMin = p.min;
@@ -799,35 +990,44 @@ final class JobManager {
         }
         checkedFingerprint = checkKey();
         append("✓ 检查通过，未修改任何分区。设备 " + p.model + "（" + p.profile + "），Android 槽 " + p.slot + "，Linux 槽 " + p.linux);
-        append("  " + p.summary + (m == Method.REPART ? "" : "；大小可选 " + rangeMin + "–" + rangeMax + " MiB（默认 " + rangeDefault + " MiB）"));
+        append("  " + p.summary + (m == Method.REPART || m == Method.RESUME ? "" : "；大小可选 " + rangeMin + "–" + rangeMax + " MiB（默认 " + rangeDefault + " MiB）"));
+        if (m == Method.PART) {
+            if (p.formatMax >= p.min && mode == Mode.LOCAL) append("  格式化 userdata 路径在本机模式下不提供：" + formatNo());
+            append("  默认 " + chosenMib + " MiB 的路径：" + routeText());
+        }
     }
 
     private void installMu300(Method m) throws IOException {
         if (muPlan == null) throw new IOException("请先完成只读检查");
-        if (m != Method.REPART && (chosenMib < rangeMin || chosenMib > rangeMax))
+        if (m != Method.REPART && m != Method.RESUME && (chosenMib < rangeMin || chosenMib > rangeMax))
             throw new IOException("所选大小不在检查给出的范围内（" + rangeMin + "–" + rangeMax + " MiB）");
-        Boolean expectFree = m == Method.PART ? muUsesFree() : null;
+        String block = installBlocker();
+        if (block != null) throw new IOException(block + "；未做任何修改");
+        Route rt = m == Method.PART ? route() : null;
+        Mu300Internal.Route expect = rt == null ? null : Mu300Internal.Route.valueOf(rt.name());
+        boolean fmt = rt == Route.FORMAT && formatUserdata;   // never implied by encryption alone
+        if (rt != null) append("安装路径：" + Mu300Internal.routeName(expect) + "。原因：" + routeText());
         installOk = false;
         installRc = null;
         hotspot = null;
         muOutcome = null;
         installedMethod = m;
+        stage1 = false;
         lastJob = "running";
         changed();
-        File ext = app.getExternalFilesDir(null);
-        File backups = new File(ext != null ? ext : app.getFilesDir(), "mu300-backup");
-        Device d = target();
+        File backups = backupBase("mu300-backup");
         try {
             Mu300Internal.Outcome o = Mu300Internal.install(muIo(), muLocal(), pkg.kernelFamily, kind(m), chosenMib, backups,
-                    d != null && d.serial != null && !d.serial.isEmpty() ? d.serial : Build.MODEL, expectFree, path -> muBackup = path);
+                    targetSerial(), expect, fmt, path -> muBackup = path);
             muOutcome = o;
+            stage1 = fmt;
             installOk = true;
             installRc = "0";
             lastJob = "done 0";
             append("✓ " + o.message);
             append("  " + o.next);
             if (muBackup != null) append("  分区备份（GPT、misc、两槽启动链）：" + muBackup);
-            append("  管理地址：" + adminUrl() + "  用户 root，初始密码 root（请尽快修改）");
+            if (!stage1) append("  管理地址：" + adminUrl() + "  用户 root，初始密码 root（请尽快修改）");
         } catch (IOException | RuntimeException e) {
             installRc = "1";
             lastJob = "done 1";
@@ -842,8 +1042,8 @@ final class JobManager {
     /** Puts the verified subset onto the current target (move locally, wireless-ADB push for LAN). */
     private void ensureStaged() throws IOException {
         if (pkg == null) throw new IOException("请先选择安装包");
-        if (!targetReady()) throw new IOException(mode == Mode.LOCAL ? "本机没有 root" : "请先连接目标设备（USB 或局域网）并取得 root");
-        if (pkg.fingerprint.equals(stagedFingerprint)) return;
+        if (!targetReady()) throw new IOException(notReady(true));
+        if (pkg.fingerprint.equals(stagedFingerprint) && verifyStaged()) return;
         if (!localCopyAvailable())
             throw new IOException("本地已没有解出的安装文件（已暂存到其他设备或已清理），请重新选择安装包");
         final String[] fp = {null};
@@ -870,6 +1070,82 @@ final class JobManager {
         stagedFingerprint = fp[0];
         append("✓ 已暂存到目标设备（指纹 " + fp[0].substring(0, 12) + "…）");
         changed();
+    }
+
+    static final String[] HELPER_FILES = {"owrt-apk.sh", "check-lib.sh", "userdata-lib.sh", "mu300-lib.sh"};
+
+    /** Shell (root, on the target) that lists files missing from the staged package's checksum list and the helper hashes. */
+    static String verifyScript() {
+        StringBuilder b = new StringBuilder();
+        b.append("P=").append(BASE).append("/pkg; if ! cd \"$P\" 2>/dev/null; then echo OWRT-APK-VERIFY=nopkg; else ")
+         .append("if [ -f OWRT-APK-LAYOUT ] && [ \"$(cat OWRT-APK-LAYOUT)\" = mu300 ]; then L=OWRT-APK-SUMS; else L=files/SHA256SUMS; fi; ")
+         .append("n=0; m=0; if [ -f \"$L\" ]; then while IFS= read -r line || [ -n \"$line\" ]; do [ -n \"$line\" ] || continue; n=$((n+1)); ")
+         .append("f=${line#*  }; [ -f \"$f\" ] || { m=$((m+1)); echo \"OWRT-APK-MISSING=$f\"; }; done < \"$L\"; else echo OWRT-APK-MISSING=$L; m=1; fi; ")
+         .append("echo \"OWRT-APK-VERIFY=$n $m\"; fi; ")
+         .append("for h in");
+        for (String h : HELPER_FILES) b.append(' ').append(h);
+        b.append("; do echo \"OWRT-APK-HELPER=$h $(sha256sum ").append(BASE).append("/$h 2>/dev/null | cut -d ' ' -f1)\"; done");
+        return b.toString();
+    }
+
+    /**
+     * The status probe only says a package with this fingerprint was staged. Before reusing it, confirm on the
+     * target that every file in its checksum list is still there (a successful install deletes the large payload,
+     * like the package's customize.sh) and that the helper scripts are this APK's; refresh outdated helpers.
+     */
+    private boolean verifyStaged() throws IOException {
+        final List<String> missing = new ArrayList<>();
+        final java.util.Map<String, String> helpers = new java.util.HashMap<>();
+        final String[] v = {null};
+        rootRun(verifyScript(), l -> {
+            if (l.startsWith("OWRT-APK-MISSING=")) missing.add(l.substring(17).trim());
+            else if (l.startsWith("OWRT-APK-VERIFY=")) v[0] = l.substring(16).trim();
+            else if (l.startsWith("OWRT-APK-HELPER=")) {
+                String[] t = l.substring(16).trim().split(" ", 2);
+                helpers.put(t[0], t.length > 1 ? t[1].trim() : "");
+            }
+        }, 120);
+        if (v[0] == null || v[0].equals("nopkg") || !missing.isEmpty()) {
+            append("目标设备上暂存的安装包不完整" + (missing.isEmpty() ? "" : "：缺少 " + missing.size() + " 个文件（"
+                    + String.join("、", missing.subList(0, Math.min(3, missing.size()))) + (missing.size() > 3 ? " 等" : "") + "）")
+                    + "。上次安装成功后安装器会删除镜像文件，这是正常的；现在重新暂存。");
+            stagedFingerprint = null;
+            return false;
+        }
+        List<String> old = new ArrayList<>();
+        for (String h : HELPER_FILES) {
+            String want = PackageInspector.hex(PackageInspector.sha256().digest(Mu300Internal.readAll(new File(app.getFilesDir(), h))));
+            if (!want.equals(helpers.get(h))) old.add(h);
+        }
+        if (old.isEmpty()) return true;
+        append("目标设备上的助手脚本来自其他版本的 APK（" + String.join("、", old) + "），更新为本版 ……");
+        final boolean[] ok = {false};
+        if (mode == Mode.LOCAL) {
+            RootShell.run("sh " + RootShell.q(helper().getAbsolutePath()) + " helpers", l -> {
+                if (l.equals("OWRT-APK-HELPERS-OK")) ok[0] = true;
+                append(l);
+            }, 120);
+        } else {
+            AdbConnection c = adb();
+            c.shellText("rm -rf " + REMOTE_STAGE + " && mkdir -p " + REMOTE_STAGE);
+            File[] fs = new File[HELPER_FILES.length];
+            String[] rs = new String[HELPER_FILES.length];
+            int[] ms = new int[HELPER_FILES.length];
+            for (int i = 0; i < fs.length; i++) {
+                fs[i] = new File(app.getFilesDir(), HELPER_FILES[i]);
+                rs[i] = REMOTE_STAGE + "/" + HELPER_FILES[i];
+                ms[i] = 0700;
+            }
+            c.push(fs, rs, ms, null);
+            rootRun("sh " + REMOTE_STAGE + "/owrt-apk.sh helpers", l -> {
+                if (l.equals("OWRT-APK-HELPERS-OK")) ok[0] = true;
+                append(l);
+            }, 120);
+            try { c.shellText("rm -rf " + REMOTE_STAGE); } catch (IOException ignored) { }
+        }
+        if (!ok[0]) throw new IOException("更新目标设备上的助手脚本失败，未写入任何分区");
+        append("✓ 助手脚本已更新");
+        return true;
     }
 
     private void pushToRemote() throws IOException {
@@ -928,7 +1204,10 @@ final class JobManager {
             clearDataCheck();
             if (muInternal(m)) { checkMu300(m); return; }
             ensureStaged();
-            if (m == Method.TF) checkTf(); else checkData(m);
+            if (m == Method.TF) checkTf();
+            else if (m == Method.REPART) checkE5Reinstall();
+            else if (m == Method.RESUME) checkE5Resume();
+            else checkData(m);
         });
     }
 
@@ -979,30 +1258,130 @@ final class JobManager {
             else if (l.startsWith("OWRT-APK-USED-MIB=")) usedMib = parseLong(l.substring(18));
             else if (l.startsWith("OWRT-APK-FREE-MIB=")) freeMib = parseLong(l.substring(18));
             else if (l.startsWith("OWRT-APK-PART-RANGE=") && m == Method.PART) range[0] = three(l.substring(20));
+            else if (l.startsWith("OWRT-APK-WIPE-RANGE=") && m == Method.PART) wipeRange = three(l.substring(20));
+            else if (l.startsWith("OWRT-APK-KEEP-NO=")) keepNo = l.substring(17).trim();
+            else if (l.startsWith("OWRT-APK-WIPE-NO=")) wipeNo = l.substring(17).trim();
+            else if (l.startsWith("OWRT-APK-ENCRYPTED=")) e5Encrypted = "1".equals(l.substring(19).trim());
             else if (l.startsWith("OWRT-APK-IMAGE-RANGE=") && m == Method.IMAGE) range[0] = three(l.substring(21));
         });
+        if (m == Method.PART && ok[0] && rc[0] == 0) { checkE5Part(range[0]); return; }
         if (ok[0] && rc[0] == 0 && range[0] != null && range[0][0] <= range[0][1]) {
             rangeMin = range[0][0];
             rangeMax = range[0][1];
             rangeDefault = Math.max(rangeMin, Math.min(rangeMax, range[0][2]));
             chosenMib = rangeDefault;
             checkedFingerprint = pkg.fingerprint + ":" + m.name();
-            if (m == Method.PART)
-                append("✓ 检查通过，未修改任何分区。userdata " + dataNode + "：" + udataMib + " MiB，已用 " + usedMib
-                        + " MiB；OpenWrt 分区可选 " + rangeMin + "–" + rangeMax + " MiB（默认 " + rangeDefault + " MiB）");
-            else
-                append("✓ 检查通过，未修改任何分区。/data 可用 " + freeMib + " MiB；镜像大小可选 " + rangeMin + "–" + rangeMax
-                        + " MiB（默认 " + rangeDefault + " MiB）");
+            append("✓ 检查通过，未修改任何分区。/data 可用 " + freeMib + " MiB；镜像大小可选 " + rangeMin + "–" + rangeMax
+                    + " MiB（默认 " + rangeDefault + " MiB）");
         } else {
             append("✗ 检查未通过（退出码 " + rc[0] + "）。请根据上面的 E5-DATA-ERROR / E5-TF-ERROR / BOOTCHAIN-ERROR 提示处理，未写入任何分区。");
         }
     }
-
+    /** E5 PART: preserving shrink (KEEP) and/or the two-stage format-userdata install, as part_target()/part_userdata_policy(). */
+    private void checkE5Part(long[] keep) throws IOException {
+        keepRange = keep != null && keep[0] <= keep[1] ? keep : null;
+        if (keepRange == null && keepNo == null) keepNo = "保留数据缩容放不下";
+        if (wipeRange != null && wipeRange[0] > wipeRange[1]) wipeRange = null;
+        if (wipeRange == null && wipeNo == null) wipeNo = "userdata 太小";
+        if (wipeRange != null && wipeNo == null) {
+            if (mode == Mode.LOCAL) {
+                wipeNo = "格式化 userdata 会清空这台手机自己的数据，包括本应用保存的事务记录和备份，第二阶段无法续上；请用另一台手机通过 USB/局域网操作";
+            } else {
+                append("  只读检查两阶段安装的前提（启动镜像、启动控制块、BCB、分区表）…");
+                e5Pkg = E5Part.loadPkg(muIo(), pkg.rawBytes);
+                E5Part.WipeCheck w = E5Part.checkWipe(muIo(), e5Pkg, false);
+                if (!w.ok) wipeNo = w.reason;
+            }
+        }
+        if (wipeNo != null) wipeRange = null;
+        if (keepRange == null && wipeRange == null) {
+            append("✗ 检查未通过：保留数据缩容不可用（" + keepNo + "）；格式化 userdata 不可用（" + wipeNo + "）。未写入任何分区。");
+            return;
+        }
+        rangeMin = Math.min(keepRange != null ? keepRange[0] : Long.MAX_VALUE, wipeRange != null ? wipeRange[0] : Long.MAX_VALUE);
+        rangeMax = Math.max(keepRange != null ? keepRange[1] : 0, wipeRange != null ? wipeRange[1] : 0);
+        // The default never lands on the destructive route when the data can be kept.
+        rangeDefault = keepRange != null ? keepRange[2] : wipeRange[2];
+        chosenMib = rangeDefault;
+        checkedFingerprint = pkg.fingerprint + ":" + Method.PART.name();
+        append("✓ 检查通过，未修改任何分区。userdata " + dataNode + "：" + udataMib + " MiB，已用 " + usedMib + " MiB，"
+                + (e5Encrypted ? "已加密" : "未加密") + "（" + crypto + "）");
+        append("  路径一 保留数据缩容：" + (keepRange != null ? keepRange[0] + "–" + keepRange[1] + " MiB" : "不可用，" + keepNo));
+        append("  路径二 格式化 userdata（Android 数据全部清空，分两阶段）：" + (wipeRange != null ? wipeRange[0] + "–" + wipeRange[1] + " MiB" : "不可用，" + wipeNo));
+        append("  默认 " + chosenMib + " MiB 的路径：" + routeText());
+    }
+    private void checkE5Reinstall() throws IOException {
+        e5Pkg = E5Part.loadPkg(muIo(), pkg.rawBytes);
+        E5Part.Reinstall r = E5Part.checkReinstall(muIo(), e5Pkg);
+        rangeMin = rangeMax = rangeDefault = chosenMib = r.root.size / 2048;
+        dataNode = "/dev/block/" + r.data.node;
+        checkedFingerprint = pkg.fingerprint + ":" + Method.REPART.name();
+        append("✓ 检查通过，未修改任何分区。将重装 /dev/block/" + r.root.node + "（e5root，" + chosenMib + " MiB）；userdata 与分区表不动");
+    }
+    private void checkE5Resume() throws IOException {
+        e5Pkg = E5Part.loadPkg(muIo(), pkg.rawBytes);
+        resumeInfo = E5Part.checkResume(muIo(), e5Pkg, backupBase("e5-part"));
+        checkedFingerprint = pkg.fingerprint + ":" + Method.RESUME.name();
+        append("✓ 检查通过，未修改任何分区。" + resumeInfo);
+    }
+    /** E5 internal flows ported from part-two-stage.py; bookkeeping as installMu300(). */
+    private void installE5(Method m) throws IOException {
+        String block = installBlocker();
+        if (block != null) throw new IOException(block + "；未做任何修改");
+        installOk = false;
+        installRc = null;
+        hotspot = null;
+        muOutcome = null;
+        installedMethod = m;
+        stage1 = false;
+        lastJob = "running";
+        changed();
+        try {
+            E5Part.Pkg ep = E5Part.loadPkg(muIo(), pkg.rawBytes);
+            if (e5Pkg != null && !(ep.bootSha.equals(e5Pkg.bootSha) && String.valueOf(ep.imageSha).equals(String.valueOf(e5Pkg.imageSha))))
+                throw new IOException("目标设备上暂存的安装包与检查时不同；请重新做只读检查");
+            File base = backupBase("e5-part");
+            Mu300Internal.Outcome o;
+            if (m == Method.PART) {
+                append("安装路径：格式化 userdata（两阶段）。原因：" + routeText());
+                String ssid = ep.hotspotDefault, key = E5Part.randomKey();
+                hotspot = ssid + " / " + key;
+                o = E5Part.start(muIo(), ep, base, dataNode, chosenMib, udataMib - chosenMib, growFs ? 1 : 0, "", ssid, key, mode == Mode.LOCAL);
+            } else if (m == Method.REPART) {
+                o = E5Part.reinstall(muIo(), ep, base, growFs ? 1 : 0);
+            } else {
+                o = E5Part.resume(muIo(), ep, base);
+            }
+            muOutcome = o;
+            stage1 = m == Method.PART;
+            installOk = true;
+            installRc = "0";
+            lastJob = "done 0";
+            append("✓ " + o.message);
+            append("  " + o.next);
+            append("  事务记录与备份保存在本机：" + base);
+            if (hotspot != null) append("  热点：" + hotspot);
+        } catch (IOException | RuntimeException e) {
+            installRc = "1";
+            lastJob = "done 1";
+            changed();
+            throw e;
+        } finally {
+            progress = -1;
+        }
+        changed();
+    }
     void runInstall() {
         final Method m = method;
         submit("传输及安装系统（" + titleOf(m) + "）", true, () -> {
             if (!checkPassed()) throw new IOException("请先对当前安装包和安装方式完成只读检查");
             if (muInternal(m)) { installMu300(m); return; }
+            if (m == Method.REPART || m == Method.RESUME || (m == Method.PART && route() == Route.FORMAT)) { installE5(m); return; }
+            if (m == Method.PART) {
+                String block = installBlocker();
+                if (block != null) throw new IOException(block + "；未做任何修改");
+                append("安装路径：保留数据缩容。原因：" + routeText());
+            }
             String args;
             if (m == Method.TF) {
                 long need = pkg.rawBytes + pkg.bootBytes + (256L << 20);
@@ -1026,7 +1405,7 @@ final class JobManager {
 
     void attach() {
         submit("查看安装进度", true, () -> {
-            if (!targetReady()) throw new IOException(mode == Mode.LOCAL ? "本机没有 root" : "请先连接目标设备（USB 或局域网）");
+            if (!targetReady()) throw new IOException(notReady(false));
             followOutput("follow");
         });
     }
@@ -1058,6 +1437,8 @@ final class JobManager {
         if ("0".equals(rc[0]) && ok[0]) {
             installOk = true;
             lastJob = "done 0";
+            // 与安装包 customize.sh 相同，成功后目标设备上的大文件已删除；下次检查必须重新暂存。
+            stagedFingerprint = null;
             if (installedMethod == Method.PART) {
                 append("✓ 缩容安装已就绪：载荷、内核和启动槽已写入并校验，userdata 尚未改动。");
                 append("  请手动重启：下次启动时 initramfs 会先离线检查并缩小 userdata，再新建 e5root 分区写入 OpenWrt，"
@@ -1087,6 +1468,12 @@ final class JobManager {
             append("已删除本机解出的安装文件");
             if (targetReady()) {
                 helperRunIfPresent("clean");
+                // MU300 internal installs stage in /data/local/tmp/mu300-desktop-*; a directory whose background
+                // step is still alive (run.pid) is left alone.
+                rootRun("for d in /data/local/tmp/mu300-desktop-* /data/local/tmp/openwrt-read-*; do [ -d \"$d\" ] || continue; "
+                        + "p=$(cat \"$d/run.pid\" 2>/dev/null); "
+                        + "if [ -n \"$p\" ] && [ ! -f \"$d/run.rc\" ] && kill -0 \"$p\" 2>/dev/null; then echo \"保留（后台步骤仍在运行，PID $p）：$d\"; "
+                        + "else rm -rf \"$d\" && echo \"已删除目标设备暂存目录：$d\"; fi; done; true", this::append, 300);
                 if (mode == Mode.LAN) { try { adb().shellText("rm -rf " + REMOTE_STAGE); } catch (IOException ignored) { } }
                 refreshStatus();
             }
@@ -1117,6 +1504,23 @@ final class JobManager {
     }
 
     void requestCancel() { cancel = true; }
+
+    /**
+     * Stops waiting for the running task: closes the link so a blocked read returns at once. A step running
+     * detached on the target is not killed (killing a write half-way is worse than letting it finish).
+     */
+    void stopTask() {
+        if (busy == null) return;
+        stopRequested = true;
+        cancel = true;
+        String st = step;
+        append("■ 已请求停止" + (st != null ? "（当前步骤：" + st + "）" : "") + (stepWrites
+                ? "。目标设备上的写入在后台继续，不会被中途打断：请保持目标设备通电、不要重启，几分钟后重新连接查看状态"
+                : "。当前步骤不写入目标设备"));
+        AdbConnection c = adb;
+        if (c != null) c.close();
+        changed();
+    }
 
     // ------------------------------------------------------------ helpers
     private String displayName(Uri uri) {

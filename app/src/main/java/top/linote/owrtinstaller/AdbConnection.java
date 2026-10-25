@@ -24,7 +24,7 @@ import java.util.Map;
  * Not supported: Android 11+ "Wireless debugging" pairing/TLS ports (adbd answers
  * STLS there), which this client reports as a clear error.
  */
-final class AdbConnection {
+final class AdbConnection implements AutoCloseable {
     interface AuthListener { void waitingForUser(String fingerprint); }
     interface LineSink { void line(String s); }
     interface Progress { void bytes(long done); boolean cancelled(); }
@@ -68,9 +68,18 @@ final class AdbConnection {
     private final Transport sock;
     private final InputStream in;
     private final OutputStream out;
+    /** Longest wait for a protocol reply (OPEN/WRTE acknowledgement). */
+    static int REPLY_MS = 120_000;
+    /** Longest wait for adbd's status after the last bytes of a pushed file (it closes and syncs the file first). */
+    static int SYNC_DONE_MS = 300_000;
     private int maxData = 4096;
     private int nextLocal = 1;
+    private int curTimeout = -1;
     private volatile boolean closed;
+    /** Packets of an earlier session discarded during the handshake (USB keeps them queued in the device). */
+    int staleDropped;
+    /** Bytes of earlier-session data drained from the USB IN endpoint before the handshake. */
+    long staleBytes;
     final Map<String, String> banner = new LinkedHashMap<>();
     String bannerRaw = "";
 
@@ -78,6 +87,11 @@ final class AdbConnection {
         int cmd, arg0, arg1;
         byte[] data;
     }
+
+    /** A header whose magic or length is wrong: the stream is out of step (e.g. half a packet left over). */
+    static final class BadPacket extends IOException { BadPacket(String m) { super(m); } }
+    /** No reply in time; the connection has been closed because its state is unknown. */
+    static final class Timeout extends IOException { Timeout(String m) { super(m); } }
 
     private AdbConnection(String host, int port, Transport t) throws IOException {
         this.host = host;
@@ -152,13 +166,25 @@ final class AdbConnection {
     }
 
     private void handshake(AdbKey key, String keyName, AuthListener l) throws IOException {
-        sock.setTimeout(10000);
+        // Over USB the device may still hold packets of an earlier session (one that was force-stopped or
+        // whose cable was pulled) in its IN queue: read them away before saying hello.
+        if (port <= 0) drain(250, 3000);
+        setTimeout(10000);
         send(A_CNXN, VERSION, MY_MAX, "host::\0".getBytes(StandardCharsets.UTF_8));
         boolean signed = false, sentKey = false;
+        int resent = 0;
         while (true) {
             Packet p;
             try {
-                p = read();
+                p = read(port <= 0);
+            } catch (BadPacket e) {
+                // USB only (TCP closes in read): out of step with a leftover half packet; flush and start over.
+                if (resent >= 2) { close(); throw new IOException("USB ADB 握手失败：设备持续发送无法识别的数据，请拔插 OTG 线后重试"); }
+                resent++;
+                drain(250, 3000);
+                setTimeout(10000);
+                send(A_CNXN, VERSION, MY_MAX, "host::\0".getBytes(StandardCharsets.UTF_8));
+                continue;
             } catch (SocketTimeoutException e) {
                 throw new IOException(sentKey ? "等待设备授权超时：请在目标设备屏幕上点“允许”后重试"
                         : (port > 0 ? "设备没有响应 ADB 握手（端口可能不是无线 ADB）" : "设备没有响应 USB ADB 握手（请确认目标设备已开启 USB 调试）"));
@@ -166,7 +192,7 @@ final class AdbConnection {
             if (p.cmd == A_CNXN) {
                 maxData = Math.max(1024, Math.min(p.arg1, MY_MAX));
                 parseBanner(p.data);
-                sock.setTimeout(0);
+                setTimeout(0);
                 return;
             } else if (p.cmd == A_STLS) {
                 throw new IOException("该端口要求 Android 11+ 无线调试配对（TLS），本应用暂不支持；"
@@ -179,14 +205,40 @@ final class AdbConnection {
                     sentKey = true;
                     send(A_AUTH, AUTH_RSAPUBLICKEY, 0, key.publicKeyPayload(keyName));
                     if (l != null) l.waitingForUser(key.fingerprint());
-                    sock.setTimeout(120000);
+                    setTimeout(120000);
                 } else {
                     throw new IOException("设备拒绝了授权");
                 }
+            } else if (p.cmd == A_CLSE || p.cmd == A_OKAY || p.cmd == A_WRTE || p.cmd == A_OPEN || p.cmd == A_SYNC) {
+                // Stream traffic of an earlier session (e.g. CLSE of a stream it never closed): not for us.
+                if (++staleDropped > 256) { close(); throw new IOException("握手时持续收到上一次会话的残留报文，请拔插 OTG 线后重试"); }
             } else {
+                close();
                 throw new IOException("意外的握手报文 0x" + Integer.toHexString(p.cmd));
             }
         }
+    }
+
+    /** Discards whatever arrives until the line is quiet for quietMs (at most maxMs in total). */
+    private void drain(int quietMs, int maxMs) throws IOException {
+        setTimeout(quietMs);
+        byte[] junk = new byte[16384];
+        long end = System.currentTimeMillis() + maxMs;
+        try {
+            while (System.currentTimeMillis() < end) {
+                int r = in.read(junk, 0, junk.length);
+                if (r < 0) { close(); throw new EOFException("与设备的 ADB 连接已断开"); }
+                staleBytes += r;
+            }
+        } catch (SocketTimeoutException quiet) {
+            // nothing more queued
+        }
+    }
+
+    private void setTimeout(int ms) throws IOException {
+        if (ms == curTimeout) return;
+        sock.setTimeout(ms);
+        curTimeout = ms;
     }
 
     private void parseBanner(byte[] d) {
@@ -202,7 +254,7 @@ final class AdbConnection {
 
     boolean isClosed() { return closed || sock.isClosed(); }
 
-    void close() {
+    @Override public void close() {
         closed = true;
         sock.close();
     }
@@ -224,7 +276,20 @@ final class AdbConnection {
         }
     }
 
-    private Packet read() throws IOException {
+    private Packet read() throws IOException { return read(false); }
+
+    /** Reads the next packet, waiting at most ms (0 = forever); on timeout closes and names what was awaited. */
+    private Packet read(int ms, String what) throws IOException {
+        setTimeout(ms);
+        try {
+            return read(false);
+        } catch (SocketTimeoutException e) {
+            close();
+            throw new Timeout("等待设备应答超时：" + what + "（" + (ms / 1000) + " 秒无响应）。连接已断开，未继续后续步骤");
+        }
+    }
+
+    private Packet read(boolean lenient) throws IOException {
         byte[] h = new byte[24];
         readFully(h);
         ByteBuffer b = ByteBuffer.wrap(h).order(ByteOrder.LITTLE_ENDIAN);
@@ -235,8 +300,8 @@ final class AdbConnection {
         int len = b.getInt();
         b.getInt(); // checksum: not required from protocol 0x01000001 peers
         int magic = b.getInt();
-        if (magic != (p.cmd ^ 0xffffffff)) { close(); throw new IOException("ADB 报文损坏"); }
-        if (len < 0 || len > 16 * 1024 * 1024) { close(); throw new IOException("ADB 报文长度异常"); }
+        if (magic != (p.cmd ^ 0xffffffff)) { if (lenient) throw new BadPacket("ADB 报文损坏"); close(); throw new IOException("ADB 报文损坏"); }
+        if (len < 0 || len > 16 * 1024 * 1024) { if (lenient) throw new BadPacket("ADB 报文长度异常"); close(); throw new IOException("ADB 报文长度异常"); }
         p.data = new byte[len];
         readFully(p.data);
         return p;
@@ -265,13 +330,16 @@ final class AdbConnection {
         int remote;
         boolean remoteClosed;
         final ByteArrayOutputStream pending = new ByteArrayOutputStream();
+        final String what;
 
-        Stream(int local) { this.local = local; }
+        Stream(int local, String what) { this.local = local; this.what = what; }
 
-        /** Reads the next packet for this stream; returns data, or null when the stream closed. */
-        byte[] next() throws IOException {
+        byte[] next() throws IOException { return next(0); }
+
+        /** Reads the next packet for this stream; returns data, or null when the stream closed. ms: longest silence, 0 = forever. */
+        byte[] next(int ms) throws IOException {
             while (true) {
-                Packet p = read();
+                Packet p = read(ms, what);
                 if (p.arg1 != local) {
                     // Stale packet of an earlier stream: close it politely, otherwise ignore.
                     if (p.cmd == A_WRTE) send(A_CLSE, 0, p.arg0, null);
@@ -294,7 +362,7 @@ final class AdbConnection {
                 send(A_WRTE, local, remote, chunk);
                 // Flow control: wait for OKAY before the next WRTE; buffer any data arriving meanwhile.
                 while (true) {
-                    Packet p = read();
+                    Packet p = read(REPLY_MS, "发送数据后等待确认（" + what + "）");
                     if (p.arg1 != local) continue;
                     if (p.cmd == A_OKAY) break;
                     if (p.cmd == A_WRTE) { pending.write(p.data, 0, p.data.length); send(A_OKAY, local, remote, null); continue; }
@@ -312,12 +380,12 @@ final class AdbConnection {
         }
     }
 
-    private Stream open(String service) throws IOException {
+    private Stream open(String service, String what) throws IOException {
         if (isClosed()) throw new IOException("与设备的 ADB 连接已断开");
-        Stream s = new Stream(nextLocal++);
+        Stream s = new Stream(nextLocal++, what);
         send(A_OPEN, s.local, 0, (service + "\0").getBytes(StandardCharsets.UTF_8));
         while (true) {
-            Packet p = read();
+            Packet p = read(REPLY_MS, "打开 " + service.split(":")[0] + " 服务（" + what + "）");
             if (p.arg1 != s.local) continue;
             if (p.cmd == A_OKAY) { s.remote = p.arg0; return s; }
             if (p.cmd == A_CLSE) throw new IOException("设备拒绝了服务请求：" + service.split(":")[0]);
@@ -328,15 +396,24 @@ final class AdbConnection {
      * Runs a command through "shell:" (raw, no PTY) and streams its output lines.
      * Returns the command's exit status (appended marker), or -1 if unknown.
      */
-    int shell(String command, LineSink sink) throws IOException {
+    int shell(String command, LineSink sink) throws IOException { return shell(command, sink, 0); }
+
+    /** Short label of a command for error messages. */
+    static String brief(String command) {
+        String c = command.replace('\n', ' ').replaceAll("\\s+", " ").trim();
+        return c.length() > 80 ? c.substring(0, 77) + "…" : c;
+    }
+
+    /** silenceMs: longest wait without any output before giving up (0 = forever). */
+    int shell(String command, LineSink sink, int silenceMs) throws IOException {
         // Subshell: an "exit" inside the command still reaches the marker; the newline
         // ends a trailing comment. Output without a final newline puts the marker mid-line.
-        Stream s = open("shell:(" + command + "\n); echo " + RC_MARK + "$?");
+        Stream s = open("shell:(" + command + "\n); echo " + RC_MARK + "$?", "执行命令 " + brief(command));
         int rc = -1;
         ByteArrayOutputStream line = new ByteArrayOutputStream();
         try {
             byte[] d;
-            while ((d = s.next()) != null) {
+            while ((d = s.next(silenceMs)) != null) {
                 for (byte b : d) {
                     if (b == '\n') {
                         rc = emit(line, sink, rc);
@@ -365,12 +442,14 @@ final class AdbConnection {
     }
 
     /** Runs a command through "exec:" (raw, binary-safe, no stdin) and copies its stdout to out. */
-    long execRaw(String command, OutputStream out) throws IOException {
-        Stream s = open("exec:" + command);
+    long execRaw(String command, OutputStream out) throws IOException { return execRaw(command, out, 0); }
+
+    long execRaw(String command, OutputStream out, int silenceMs) throws IOException {
+        Stream s = open("exec:" + command, "读取 " + brief(command));
         long n = 0;
         try {
             byte[] d;
-            while ((d = s.next()) != null) { out.write(d); n += d.length; }
+            while ((d = s.next(silenceMs)) != null) { out.write(d); n += d.length; }
         } finally {
             s.close();
         }
@@ -380,8 +459,8 @@ final class AdbConnection {
     /** adb reboot: the service may drop the link before acknowledging. */
     void reboot() {
         try {
-            Stream s = open("reboot:");
-            try { while (s.next() != null) { /* drain */ } } finally { s.close(); }
+            Stream s = open("reboot:", "重启设备");
+            try { while (s.next(30000) != null) { /* drain */ } } finally { s.close(); }
         } catch (IOException ignored) {
             // the device is going down
         }
@@ -401,7 +480,7 @@ final class AdbConnection {
 
     /** Pushes local files (in order) to remote paths with the given modes over one sync stream. */
     void push(File[] locals, String[] remotes, int[] modes, Progress p) throws IOException {
-        Stream s = open("sync:");
+        Stream s = open("sync:", "推送 " + (remotes.length == 1 ? remotes[0] : remotes.length + " 个文件"));
         try {
             long done = 0;
             byte[] buf = new byte[SYNC_DATA_MAX];
@@ -432,11 +511,17 @@ final class AdbConnection {
                 req.write(syncHeader(ID_DONE, (int) (System.currentTimeMillis() / 1000)));
                 byte[] a = req.toByteArray();
                 s.write(a, 0, a.length);
-                byte[] resp = syncRead(s, 8);
+                byte[] resp;
+                try {
+                    resp = syncRead(s, 8, SYNC_DONE_MS);
+                } catch (Timeout e) {
+                    throw new Timeout("推送 " + remotes[i] + "：数据已全部发送，等待目标设备确认写入完成超时（" + SYNC_DONE_MS / 1000
+                            + " 秒无响应）。连接已断开，未继续后续步骤");
+                }
                 ByteBuffer rb = ByteBuffer.wrap(resp).order(ByteOrder.LITTLE_ENDIAN);
                 int id = rb.getInt(), len = rb.getInt();
                 if (id == ID_FAIL) {
-                    String msg = len > 0 && len < 4096 ? new String(syncRead(s, len), StandardCharsets.UTF_8) : "";
+                    String msg = len > 0 && len < 4096 ? new String(syncRead(s, len, REPLY_MS), StandardCharsets.UTF_8) : "";
                     throw new IOException("推送 " + remotes[i] + " 失败：" + msg);
                 }
                 if (id != ID_OKAY) throw new IOException("推送应答异常");
@@ -452,9 +537,9 @@ final class AdbConnection {
         return ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putInt(id).putInt(v).array();
     }
 
-    private byte[] syncRead(Stream s, int n) throws IOException {
+    private byte[] syncRead(Stream s, int n, int ms) throws IOException {
         while (s.pending.size() < n) {
-            byte[] d = s.next();
+            byte[] d = s.next(ms);
             if (d == null) throw new IOException("设备提前关闭了推送通道");
             s.pending.write(d, 0, d.length);
         }
