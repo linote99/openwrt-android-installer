@@ -120,6 +120,8 @@ final class JobManager {
     boolean installOk;
     String installRc;              // null while running/unknown
     volatile String lastLine = "";
+    /** Message of the last task that failed (null after a success) and that task's description. */
+    volatile String lastFail, lastFailTask;
     volatile long taskStarted;
 
     volatile String busy;          // task description or null
@@ -133,7 +135,45 @@ final class JobManager {
         local.model = Build.MODEL;
         local.device = Build.DEVICE;
         installHelpers();
+        reportLastCrash();
+        final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+            recordCrash(t, e, true);
+            if (prev != null) prev.uncaughtException(t, e);
+        });
     }
+
+    /** The last read-only check ended with an error (shown on the check page). */
+    boolean checkFailed() {
+        String t = lastFailTask;
+        return busy == null && lastFail != null && t != null && t.startsWith("只读检查") && !checkPassed();
+    }
+
+    File crashFile() { return new File(app.getFilesDir(), "last-crash.txt"); }
+
+    /** Keeps the stack trace of an internal error so it can be shown (and copied from the log) later. */
+    void recordCrash(Thread t, Throwable e, boolean fatal) {
+        try (java.io.PrintWriter w = new java.io.PrintWriter(new FileOutputStream(crashFile()))) {
+            w.println((fatal ? "闪退" : "内部错误") + " · " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date())
+                    + " · v" + versionName() + " · Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ") · 线程 " + t.getName());
+            e.printStackTrace(w);
+        } catch (Throwable ignored) { }
+    }
+
+    private void reportLastCrash() {
+        File f = crashFile();
+        if (!f.isFile()) return;
+        try {
+            String text = new String(Mu300Internal.readAll(f), java.nio.charset.StandardCharsets.UTF_8);
+            String[] ls = text.split("\n");
+            append("上次运行记录到异常（可在日志页复制后反馈）：");
+            for (int i = 0; i < Math.min(ls.length, 25); i++) append("  " + ls[i]);
+        } catch (Throwable ignored) { }
+        //noinspection ResultOfMethodCallIgnored
+        f.delete();
+    }
+
+    private String versionName() { return BuildInfo.VERSION_NAME; }
 
     File helper() { return new File(app.getFilesDir(), "owrt-apk.sh"); }
     File checkLib() { return new File(app.getFilesDir(), "check-lib.sh"); }
@@ -293,6 +333,8 @@ final class JobManager {
         progress = -1;
         taskStarted = System.currentTimeMillis();
         lastLine = "";
+        lastFail = null;
+        lastFailTask = what;
         changed();
         if (foreground) InstallService.start(app, what);
         worker.execute(() -> {
@@ -300,9 +342,16 @@ final class JobManager {
             try {
                 t.run();
             } catch (PackageInspector.PackageException e) {
+                lastFail = e.getMessage();
                 append("✗ " + e.getMessage());
             } catch (Exception e) {
-                append("✗ " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+                lastFail = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                append("✗ " + lastFail);
+            } catch (Throwable e) {
+                // An Error here (class init, linkage, memory) must not take the whole app down mid-task.
+                lastFail = "内部错误：" + e;
+                append("✗ " + lastFail);
+                recordCrash(Thread.currentThread(), e, false);
             } finally {
                 busy = null;
                 progress = -1;
@@ -637,7 +686,7 @@ final class JobManager {
                 });
                 Mu300Internal.writeAll(new File(out, "FINGERPRINT"), (r.fingerprint + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
                 append("  ✓ 内置存储安装文件已就绪（启动镜像生成自检通过，未连接任何设备）");
-            } catch (IOException | RuntimeException e) {
+            } catch (IOException | RuntimeException | LinkageError e) {
                 PackageInspector.deleteTree(out);
                 r.internalProblem = "内置安装文件准备失败：" + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
             } catch (OutOfMemoryError e) {

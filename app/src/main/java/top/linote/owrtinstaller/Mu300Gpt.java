@@ -198,7 +198,7 @@ final class Mu300Gpt {
     /** allocation(): {userdata target sectors, root sectors}. */
     static long[] allocation(long before, long partMib) {
         long need = partMib * 2048;
-        long target = Math.floorDiv(before - need, 2048) * 2048;
+        long target = Math.floorDiv(before - need, 2048L) * 2048;
         if (target < MIN_SECTORS || need < MIN_SECTORS) throw new IllegalArgumentException("At least 2 GiB is required for each system");
         return new long[]{target, need};
     }
@@ -226,7 +226,8 @@ final class Mu300Gpt {
         throw new IllegalArgumentException("Not a supported MU300/F50/V50/U30Air: " + model.trim());
     }
 
-    private static final Pattern SAFE = Pattern.compile("^[\\w@%+=:,./-]+$", Pattern.UNICODE_CHARACTER_CLASS);
+    // shlex.quote() uses re.ASCII; Android rejects Pattern.UNICODE_CHARACTER_CLASS, so spell the ASCII set out.
+    private static final Pattern SAFE = Pattern.compile("^[A-Za-z0-9_@%+=:,./-]+$");
 
     /** shlex.quote(). */
     static String quote(String s) {

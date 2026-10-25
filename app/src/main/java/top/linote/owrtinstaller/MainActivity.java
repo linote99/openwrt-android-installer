@@ -40,7 +40,6 @@ import java.util.Locale;
  */
 public class MainActivity extends Activity implements JobManager.Listener {
     private static final int PICK_ZIP = 7;
-    static final String VERSION = "1.4.0";
 
     static final int T_DEVICE = 0, T_PACKAGE = 1, T_METHOD = 2, T_PLAN = 3, T_INSTALL = 4, T_DONE = 5, T_LOG = 6;
     private static final String[] TAB_NAMES = {"设备", "安装包", "安装方式", "检查与计划", "安装", "完成", "日志"};
@@ -52,6 +51,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
     private HorizontalScrollView tabScroll;
     private ScrollView scroll;
     private LinearLayout content;
+    private TextWatcher logWatcher;
     private TextView logView, logCount, statusLine, stageLine, timerLine, tabBadge;
     private ProgressBar bar;
     private TextView sizeInfo, startBtn;
@@ -194,7 +194,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
         return tab + "|" + jm.mode + "|" + (jm.busy != null) + "|" + jm.busy + "|" + (d == null ? "-" : d.probed + "," + d.root + "," + d.model + "," + d.endpoint)
                 + "|" + (jm.pkg == null ? "-" : jm.pkg.fingerprint) + "|" + jm.stagedFingerprint + "|" + jm.checkPassed()
                 + "|" + jm.method + "|" + jm.scanning + "|" + jm.scanHits.size() + "|" + jm.usbHits.size() + "|" + jm.installOk + "|" + jm.lastJob
-                + "|" + jm.rangeMin + "-" + jm.rangeMax + "|" + jm.hotspot + "|" + (jm.progress >= 0) + "|" + jm.localCopyAvailable() + "|" + methodSeen;
+                + "|" + jm.lastFail + "|" + jm.rangeMin + "-" + jm.rangeMax + "|" + jm.hotspot + "|" + (jm.progress >= 0) + "|" + jm.localCopyAvailable() + "|" + methodSeen;
     }
 
     @Override
@@ -276,7 +276,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
         LinearLayout ht = ui.col();
         ht.setPadding(ui.dp(12), 0, 0, 0);
         ht.addView(ui.text("OpenWrt 安装器", 16, ui.text, true));
-        ht.addView(ui.text("安装、更新与恢复 · 安卓版 v" + VERSION, 12, ui.muted, false));
+        ht.addView(ui.text("安装、更新与恢复 · 安卓版 v" + BuildInfo.VERSION_NAME, 12, ui.muted, false));
         head.addView(ht, ui.weight(1));
         TextView about = ui.text("使用说明", 13, ui.text, true);
         about.setGravity(Gravity.CENTER);
@@ -628,9 +628,18 @@ public class MainActivity extends Activity implements JobManager.Listener {
                     : "检查会暂存安装文件并运行预检：包完整性、型号、槽位、解锁、启动控制块、启动链"
                     + (jm.method == JobManager.Method.TF ? "、TF 卡识别与空间。" : "、userdata 加密状态与可用空间。"), 13, ui.muted, false), ui.mw(8));
             if (!match) card.addView(ui.text(why + "，检查会失败。", 13, ui.danger, true), ui.mw(6));
+            if (jm.checkFailed()) {
+                card.addView(ui.notice("!", "检查未通过", jm.lastFail + checkHint(), 1), ui.mw(8));
+                if (jm.method != JobManager.Method.TF) {
+                    TextView alt = ui.button("更换安装方式", 0, v -> go(T_METHOD));
+                    alt.setEnabled(idle);
+                    card.addView(alt, ui.mw(8));
+                }
+            }
             View pad = new View(this);
             card.addView(pad, new LinearLayout.LayoutParams(1, ui.dp(10)));
             add(card, 12);
+            add(logCard(220), 12);
             return;
         }
         JobManager.Method m = jm.method;
@@ -728,7 +737,22 @@ public class MainActivity extends Activity implements JobManager.Listener {
         add(startBtn, 8);
         refreshStart();
         if (!match) add(ui.text(why + "，禁止安装。", 13, ui.danger, true), 6);
+        add(logCard(220), 12);
     }
+
+    /** What the user can do about the most common check failures. */
+    private String checkHint() {
+        String f = jm.lastFail == null ? "" : jm.lastFail;
+        if (jm.method == JobManager.Method.IMAGE && f.contains("加密"))
+            return "\n\n这台设备的 userdata 是加密的（Android 默认的文件级加密），userdata 镜像方式不可用。请在「安装方式」页改选 TF 卡安装或独立内置分区安装。";
+        if (f.contains("mu300root") && f.contains("重装"))
+            return "\n\n请在「安装方式」页改选“重装已有内置分区”。";
+        if (f.contains("空间") || f.contains("未分配"))
+            return "\n\n可以改用 TF 卡安装，或清理 Android 存储后重新检查。";
+        return "\n\n每一步的输出见下方日志，可复制后反馈。";
+    }
+
+
 
     private void addSizePicker(LinearLayout card, JobManager.Method m, boolean idle) {
         String label = m == JobManager.Method.PART ? "OpenWrt 分区大小（MiB）" : "镜像大小（MiB）";
@@ -934,7 +958,9 @@ public class MainActivity extends Activity implements JobManager.Listener {
                 : Math.max(ui.dp(260), getResources().getDisplayMetrics().heightPixels - ui.dp(380));
         card.addView(box, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, hpx));
         box.post(() -> box.fullScroll(View.FOCUS_DOWN));
-        logView.addTextChangedListener(watcher(s -> box.post(() -> box.fullScroll(View.FOCUS_DOWN))));
+        if (logWatcher != null) logView.removeTextChangedListener(logWatcher);   // one listener for the current box only
+        logWatcher = watcher(s -> box.post(() -> box.fullScroll(View.FOCUS_DOWN)));
+        logView.addTextChangedListener(logWatcher);
         View pad = new View(this);
         card.addView(pad, new LinearLayout.LayoutParams(1, ui.dp(8)));
         return card;

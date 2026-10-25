@@ -13,6 +13,15 @@ note() { summary+=("$1"); echo "== $1"; }
 MUJ="$J/Mu300Internal.java $J/Mu300Gpt.java $J/Mu300Boot.java $J/Lz4.java $J/RootfsFilter.java"
 javac -encoding UTF-8 -nowarn -d "$B/cls" $J/MiniJson.java $J/PackageInspector.java $MUJ test/DesktopInspect.java test/RuleTest.java test/Mu300FlowTest.java 2>&1 | grep -v '^Note'
 java -cp "$B/cls" top.linote.owrtinstaller.RuleTest > "$B/rule.txt" 2>&1; note "RuleTest rc=$? $(tail -1 "$B/rule.txt")"
+bash test/version-check.sh > "$B/version.txt" 2>&1; note "version-check rc=$? $(tail -1 "$B/version.txt")"
+# Android compatibility of the APK's own classes (build.sh output): APIs must exist at minSdk 26 and
+# regex flags must be ones Android accepts (v1.4.0 crashed on Pattern.UNICODE_CHARACTER_CLASS).
+API_XML=${ANDROID_HOME:-$HOME/android-sdk}/platforms/android-34/data/api-versions.xml
+if [ -d build/classes ] && [ -f "$API_XML" ]; then
+  python3 test/api-level-scan.py build/classes "$API_XML" 26 > "$B/apiscan.txt" 2>&1; note "android-compat-scan rc=$? $(tail -1 "$B/apiscan.txt")"
+else
+  note "android-compat-scan rc=1 missing build/classes (run ./build.sh first) or $API_XML"
+fi
 
 for z in "$Z"/*.zip; do
   n=$(basename "$z")

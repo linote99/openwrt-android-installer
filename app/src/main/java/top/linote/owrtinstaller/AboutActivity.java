@@ -52,10 +52,8 @@ public final class AboutActivity extends Activity {
         build();
     }
 
-    private String version() {
-        try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionName; }
-        catch (Exception e) { return MainActivity.VERSION; }
-    }
+    /** Same value as the APK's versionName: both come from version.properties via build.sh. */
+    private String version() { return BuildInfo.VERSION_NAME; }
 
     private void copy(String s, float sp, int color, boolean bold, int top, int bottom) {
         TextView v = ui.text(s, sp, color, bold);

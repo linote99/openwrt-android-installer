@@ -215,7 +215,8 @@ public class Mu300FlowTest {
         }
 
         @Override public void reboot() { rebooted = true; }
-        @Override public void log(String line) { }
+        final List<String> logs = new ArrayList<>();
+        @Override public void log(String line) { logs.add(line); }
         @Override public void progress(int percent) { }
         @Override public File cacheDir() { return cache; }
     }
@@ -298,6 +299,11 @@ public class Mu300FlowTest {
         work.mkdirs();
         File cache = new File(work, "cache");
         cache.mkdirs();
+        // shlex.quote() parity (ASCII safe set; v1.4.1 dropped the Android-unsupported regex flag)
+        ok(Mu300Gpt.quote("").equals("''") && Mu300Gpt.quote("/data/local/tmp/a_b-1.img").equals("/data/local/tmp/a_b-1.img")
+                && Mu300Gpt.quote("a b").equals("'a b'") && Mu300Gpt.quote("\u00fc").equals("'\u00fc'")
+                && Mu300Gpt.quote("it's").equals("'it'\"'\"'s'") && Mu300Gpt.quote("K=v@x:1,2%+").equals("K=v@x:1,2%+"),
+                "quote() matches shlex.quote for safe, spaced, non-ASCII and quoted strings");
         PackageInspector.Result r;
         try (InputStream in = new BufferedInputStream(new FileInputStream(zip), 1 << 16)) {
             r = PackageInspector.inspect(in, zip.length(), new File(work, "stage"), null);
@@ -396,8 +402,13 @@ public class Mu300FlowTest {
         d.state = "encrypted"; d.type = "file";
         String why = expectFail(d, Mu300Internal.Kind.PART);
         ok(why != null && why.contains("加密"), "C encrypted + no gap refused: " + why);
+        d.logs.clear();
         why = expectFail(d, Mu300Internal.Kind.IMAGE);
         ok(why != null && why.contains("加密"), "C encrypted image refused");
+        String joined = String.join("\n", d.logs);
+        ok(joined.contains("设备：") && joined.contains("userdata：/dev/block/") && joined.contains("ro.crypto.type=file")
+                && joined.contains("加密判断：userdata 已加密（文件级加密 FBE）"),
+                "C check logs each step before the refusal (device, userdata, crypto props, verdict)");
         // C2: unknown encryption state
         d = device(cache, false, boot);
         d.state = ""; d.magic = "00000000";

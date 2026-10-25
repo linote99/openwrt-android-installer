@@ -536,9 +536,15 @@ final class Mu300Internal {
     enum Kind { PART, REPART, IMAGE }
 
     static Plan check(Io io, Kind kind) throws IOException {
+        io.log("  读取设备型号、平台与启动槽…");
         Plan p = identify(io);
+        io.log("  设备：" + p.model + "（" + p.profile + "），Android 槽 " + p.slot + "，Linux 槽 " + p.linux);
+        io.log("  读取 userdata、eMMC 与加密状态…");
         Storage s = storage(io);
         p.s = s;
+        io.log("  userdata：/dev/block/" + s.node + "，" + s.size / 2048 + " MiB，可用 " + s.free / 1024 + " MiB，文件系统 " + fsName(s));
+        io.log("  加密属性：ro.crypto.state=" + orDash(s.state) + "，ro.crypto.type=" + orDash(s.type) + (s.source.isEmpty() ? "" : "，挂载源 " + s.source));
+        io.log("  eMMC：" + s.disk() + "，" + s.diskSize / 2048 + " MiB" + (s.root != null ? "；已有 mu300root：/dev/block/" + s.root : "；没有 mu300root 分区"));
         try {
             p.encrypted = Mu300Gpt.encrypted(s.state, s.type, s.source, "53ef".equals(s.ext) ? s.ext : s.magic);
             if (p.encrypted) p.encryptedNote = "userdata 已加密";
@@ -546,6 +552,7 @@ final class Mu300Internal {
             p.encrypted = true;
             p.encryptedNote = "无法确认 userdata 的加密状态";
         }
+        io.log("  加密判断：" + (p.encrypted ? p.encryptedNote + ("file".equals(s.type) ? "（文件级加密 FBE）" : "block".equals(s.type) ? "（全盘加密 FDE）" : "") : "未加密"));
         if (kind == Kind.REPART) {
             if (s.root == null) throw new IOException("没有已有的 mu300root 分区可重装");
             String cap = io.sh("cat /sys/class/block/" + s.root + "/size", true).trim();
@@ -555,7 +562,7 @@ final class Mu300Internal {
             return p;
         }
         if (kind == Kind.IMAGE) {
-            if (p.encrypted) throw new IOException(p.encryptedNote + "，不能放置可启动镜像；请改用 TF 卡或独立内置分区");
+            if (p.encrypted) throw new IOException(p.encryptedNote + "，不能放置可启动镜像（启动 Linux 时无法解密读取 userdata 里的镜像）；请改用 TF 卡或独立内置分区");
             p.maximum = s.free / 1024 - 1024 - 256;
             if (p.maximum < p.min) throw new IOException("userdata 可用空间不足（至少需要约 " + (p.min + 1280) + " MiB）");
             p.def = Math.min(4096, p.maximum) / 4 * 4;
@@ -563,8 +570,10 @@ final class Mu300Internal {
             return p;
         }
         if (s.root != null) throw new IOException("已有 mu300root 分区：请选择“重装已有内置分区”");
+        io.log("  读取并校验 GPT（主表与备份表）…");
         Mu300Gpt.Space space = gpt(io, s);
         p.space = space;
+        io.log("  GPT：空闲分区表项 " + space.empty.size() + " 个，最大连续未分配 " + space.largest / 2048 + " MiB");
         if (space.find(Mu300Gpt.ROOT_NAME) != null)
             throw new IOException("GPT 中已有 mu300root：请重启 Android 刷新分区节点后选择“重装已有内置分区”");
         if (space.empty.isEmpty()) throw new IOException("GPT 没有空闲的分区表项；未做任何修改");
@@ -587,6 +596,14 @@ final class Mu300Internal {
                 : "；" + (p.encryptedNote != null ? p.encryptedNote : "userdata 未对齐") + "，不能缩容");
         return p;
     }
+
+    private static String fsName(Storage s) {
+        if ("53ef".equals(s.ext)) return "ext4";
+        if ("1020f5f2".equals(s.magic)) return "F2FS";
+        return "未识别（签名 " + orDash(s.magic) + "）";
+    }
+
+    private static String orDash(String v) { return v == null || v.isEmpty() ? "-" : v; }
 
     /** True when a PART install of this size uses unallocated space (no shrink). */
     static boolean usesFreeSpace(Plan p, long mib) {

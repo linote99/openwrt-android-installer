@@ -1,8 +1,25 @@
-# OpenWrt 安装器（安卓版）v1.4.0
+# OpenWrt 安装器（安卓版）v1.4.2
 
 这个 APK 是从各机型「OpenWrt 一键刷入包」移植来的手机版安装器。在手机上选择完整安装包 ZIP，APK 会先校验、再提取安装文件，然后调用安装包自带的设备端脚本完成安装，全程不需要电脑。
 
-- APK：`dist/OpenWrt-Installer-Android-1.4.0.apk`（包名 `top.linote.owrtinstaller`，Android 8.0+，versionCode 5，签名与之前各版相同，可以直接覆盖升级）
+- APK：`dist/OpenWrt-Installer-Android-1.4.2.apk`（包名 `top.linote.owrtinstaller`，Android 8.0+，versionCode 7，签名与之前各版相同，可以直接覆盖升级）
+
+## 1.4.2：检查页直接显示日志和失败原因
+
+- **检查页加日志框**：第 4 步「检查与计划」页面下方新增和安装页一样的日志框，检查时实时滚动显示每一步输出，可以“复制”或“导出日志”，不用再切到日志页。
+- **失败原因直接显示**：检查没通过时，检查卡片里会用红色提示写明原因和处理办法；内置方式检查失败时还提供“更换安装方式”按钮。
+- **MU300 检查逐步输出**：读取到的型号与启动槽、userdata 节点/大小/可用空间/文件系统、`ro.crypto.state` / `ro.crypto.type`、加密判断结果、GPT 空闲表项与最大未分配空间，都会逐行写进日志。
+- **userdata 镜像方式与加密**：与原安装程序一致，userdata 已加密时（Android 默认的文件级加密 FBE 就算）不能使用 userdata 镜像方式，因为启动 Linux 时无法解密读取 userdata 里的镜像。这种设备请选 TF 卡安装或独立内置分区安装。
+- **版本号统一**：之前头部卡片的版本号单独写死在代码里（`VERSION = "1.4.0"`），1.4.1 升级时只改了构建脚本，没改这里，所以安装包是 1.4.1、页面却显示 v1.4.0（使用说明页读的是安装包信息，没受影响）。现在版本号只写在 `version.properties` 一处：`build.sh` 由它生成 APK 文件名、versionName/versionCode 和 `BuildInfo`，头部卡片、使用说明页、闪退记录都读 `BuildInfo`。构建结束会核对清单与 `BuildInfo` 一致，`test/version-check.sh`（已加入 `run-all.sh`）再核对文件名、清单、编译常量、.sha256、README 和发行说明，并禁止源码里写死版本号。
+- **构建更稳**：修正构建脚本在签名校验输出处偶发中途退出的问题；`.sha256` 文件只写文件名，可直接作为发行附件。
+
+## 1.4.1：修复 MU300 内置方式只读检查时闪退
+
+- **问题**：在 1.4.0 中给 MU300 选择任一种内置存储方式（独立内置分区、重装已有内置分区、userdata 镜像）后，点击“只读检查”会立刻闪退。
+- **原因**：MU300 分区表模块在给 shell 参数加引号时，用了正则标志 `Pattern.UNICODE_CHARACTER_CLASS`。电脑上的 Java 支持这个标志，但 Android 的正则引擎不支持，遇到就会抛出异常（[AOSP 源码说明](https://android.googlesource.com/platform/libcore/+/refs/heads/master/ojluni/src/main/java/java/util/regex/Pattern.java)）。这个异常发生在该模块第一次加载时，变成了任务执行器拦不住的类初始化错误，于是整个应用退出。只读检查正是第一次用到这个模块的地方。TF 卡方式和其他机型不受影响。
+- **修复**：改用与原程序 `shlex.quote` 完全相同的 ASCII 字符集，不再使用该标志。另外把一处只在 Android 12 以上才有的 `Math.floorDiv(long, int)` 改为 Android 8 就有的写法。
+- **防止再次闪退**：后台任务里即使出现意外的内部错误，也只会在日志里显示“✗ 内部错误”并结束该步骤，不再让应用退出。万一仍然闪退，下次打开时日志页会显示上次的异常信息，可以直接复制反馈。
+- **新增测试**：`test/api-level-scan.py` 逐条检查 APK 编译出的代码：用到的每个系统 API 都必须在 Android 8（API 26）上存在，正则标志也必须是 Android 支持的。这项检查已加入 `run-all.sh`，用 1.4.0 的代码跑会报出这两个问题，1.4.1 为 0。
 
 ## 1.4.0：MU300 内置存储安装
 
@@ -139,6 +156,10 @@ javac -d build-test/cls $J/{MiniJson,PackageInspector}.java test/DesktopInspect.
 java -cp build-test/cls DesktopInspect <安装包.zip> build-test/work
 python3 test/negative-package-test.py <E5系列安装包.zip> build-test/cls build-test/neg   # 11 种异常包（含机型规则）
 python3 test/negative-mu300-test.py <MU300安装包.zip> build-test/cls build-test/neg-mu  # 12 种 MU300 篡改/异常包
+# 5. Android 兼容性（先 ./build.sh）：API 不高于 minSdk 26、正则标志 Android 可用
+python3 test/api-level-scan.py build/classes ~/android-sdk/platforms/android-34/data/api-versions.xml 26
+# 6. 版本号一致性（先 ./build.sh）：文件名、versionName/versionCode、BuildInfo、.sha256、README、发行说明
+bash test/version-check.sh
 java -cp build-test/cls top.linote.owrtinstaller.RuleTest                         # 18 条机型规则
 # 2. 无线 ADB 客户端 + 模拟 adbd（真实验证 RSA 签名、公钥结构、流控、sync push）
 javac -d build-test/adb $J/{AdbConnection,AdbKey}.java test/AdbTest.java
@@ -150,7 +171,7 @@ sudo bash test/mock-helper-test.sh     # TF 流程 + 局域网暂存（26 项）
 sudo bash test/mock-userdata-test.sh   # 分区 / 镜像方式（56 项）
 sudo bash test/mock-mu300-test.sh      # MU300 TF：暂存、预检参数、安装成功/失败、篡改拒绝（12 项）
 # 4. MU300 内置存储：模拟设备（带真实 GPT 的稀疏 eMMC、by-name 分区、假 shell），包内脚本只模拟效果、不执行
-java -Xmx3g -cp build-test/cls top.linote.owrtinstaller.Mu300FlowTest <MU300安装包.zip> build-test/muflow   # 40 项
+java -Xmx3g -cp build-test/cls top.linote.owrtinstaller.Mu300FlowTest <MU300安装包.zip> build-test/muflow   # 42 项
 # 一次运行全部：
 bash test/run-all.sh <放安装包 ZIP 的目录>
 ```
@@ -185,5 +206,8 @@ bash test/run-all.sh <放安装包 ZIP 的目录>
 - 流程对比后的修正：userdata 模拟测试增加「非 F2FS 被拒绝 / F2FS 通过」两项（共 58 项），全部回归测试重跑通过。
 
 - 1.4.0 MU300 内置存储：模拟设备测试 40 项，两个 MU300 包都全部通过，覆盖：未分配空间安装（GPT 新增 `mu300root`、userdata 不变、另一槽 boot 自检通过、Android 槽不变、misc 只切一次、备份及其 `SHA256SUMS` 可校验）；空闲区残留旧文件系统签名时不当作空闲空间；无空闲空间时的离线缩容（只写请求文件、不在线改分区表、请求重启）；加密或加密状态不明时拒绝；机型不符拒绝；已有 `mu300root` 时拒绝新建、重装可用；镜像方式的大小范围与超限拒绝；设备端步骤失败时不碰启动槽和 misc；本机暂存文件被改动时在上传前拒绝；检查结果与开始时不一致时，在备份和写入前中止。MU300 异常包测试增加到 12 种（内置安装相关文件被改动时只停用内置方式、TF 照常可用）。原有全部测试重跑通过。
+
+- 1.4.2：版本一致性检查 11 项全部通过；MU300 模拟设备测试新增“加密 userdata + userdata 镜像”时逐步日志与拒绝原因的检查（共 42 项），两个 MU300 包都通过；Android 兼容性扫描为 0；其余全部测试重跑通过。
+- 1.4.1：新增 Android 兼容性扫描（API 级别 ≤ 26、正则标志），v1.4.0 的代码被它查出 `UNICODE_CHARACTER_CLASS` 和 `Math.floorDiv(long, int)` 两处问题，1.4.1 为 0；MU300 模拟设备测试增加 `quote()` 与原程序 `shlex.quote` 一致性的检查（共 41 项），两个 MU300 包都通过；其余全部测试重跑通过。
 
 建议的实测顺序是：先在匹配机型上走一遍「只读检查」，确认没问题后再用 TF 卡方式安装；分区方式请在备份好数据之后再试。
