@@ -195,7 +195,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
 
     private String sig() {
         JobManager.Device d = jm.target();
-        return tab + "|" + jm.mode + "|" + (jm.busy != null) + "|" + jm.busy + "|" + (d == null ? "-" : d.probed + "," + d.root + "," + d.model + "," + d.endpoint)
+        return tab + "|" + jm.mode + "|" + (jm.busy != null) + "|" + jm.busy + "|" + (d == null ? "-" : d.probed + "," + d.root + "," + d.model + "," + d.endpoint + "," + d.wait + "," + d.waitHint) + "|" + jm.waiting
                 + "|" + (jm.pkg == null ? "-" : jm.pkg.fingerprint) + "|" + jm.stagedFingerprint + "|" + jm.checkPassed()
                 + "|" + jm.method + "|" + jm.scanning + "|" + jm.scanHits.size() + "|" + jm.usbHits.size() + "|" + jm.installOk + "|" + jm.lastJob
                 + "|" + jm.lastFail + "|" + jm.rangeMin + "-" + jm.rangeMax + "|" + jm.hotspot + "|" + (jm.progress >= 0) + "|" + jm.localCopyAvailable() + "|" + methodSeen;
@@ -535,11 +535,14 @@ public class MainActivity extends Activity implements JobManager.Listener {
                 TargetProbe.State ws = d.wait;
                 if (ws != null) {
                     // adapter.probe ladder: one hint per state; the app retries by itself.
+                    String uh = jm.ufiHint(ws, d.usbName != null);
                     String body = (d.waitHint == null ? "" : d.waitHint)
+                            + (uh != null ? "\n\n" + uh : "")
                             + (jm.pendingRecord() != null ? "\n\n恢复出厂后的准备清单（✓ 已完成，→ 现在这一步）：\n" + TargetProbe.checklist(ws, d.usbName == null) : "")
                             + (jm.waiting ? "\n\n本应用每 3 秒自动重试，完成后自动往下走，不用手动点重试；也可以改用别的连接。"
                                           : "\n\n已停止等待。做完上面的操作后点“重新连接”。");
                     card.addView(ui.notice(jm.waiting ? "…" : "!", (jm.waiting ? "等待目标设备：" : "未就绪：") + TargetProbe.title(ws), body, 1), ui.mw(8));
+                    if (uh != null) card.addView(ufiButton(), ui.mw(4));
                     if (jm.waiting) {
                         TextView st = ui.button("停止等待", 3, v -> jm.stopTask());
                         card.addView(st, ui.mw(4));
@@ -549,10 +552,20 @@ public class MainActivity extends Activity implements JobManager.Listener {
                         again.setEnabled(idle);
                         card.addView(again, ui.mw(4));
                     }
-                } else if (d.probed && d.root == null)
+                } else if (d.probed && d.root == null && jm.waiting) {
+                    // Between reading the properties and the first ladder result: the root probe (su -c id) is running
+                    // and the root manager may be showing its prompt right now; not a failure.
+                    card.addView(ui.notice("…", "正在检查 root 授权", "本应用正在请求 root（su -c id）。目标设备上弹出超级用户请求时请点“允许”；"
+                            + "检查完会自动往下走，不用重新连接。\n\n" + UfiTool.rootGrant(jm.mu300Family(), d.usbName != null), 0), ui.mw(8));
+                    card.addView(ufiButton(), ui.mw(4));
+                } else if (d.probed && d.root == null) {
                     card.addView(ui.notice("!", "目标设备没有可用的 root", jm.pendingRecord() != null
                             ? "格式化后目标设备的 Magisk 和 Shell 的 root 授权都已清空。\n" + Mu300Internal.resumePrep()
-                            : "在目标设备的 root 管理器中允许 Shell 的超级用户请求后重新连接。", 1), ui.mw(8));
+                                    + "\n\n" + UfiTool.rootGrant(jm.mu300Family(), d.usbName != null)
+                            : "在目标设备的 root 管理器中允许 Shell 的超级用户请求后重新连接。\n\n"
+                                    + UfiTool.rootGrant(jm.mu300Family(), d.usbName != null), 1), ui.mw(8));
+                    card.addView(ufiButton(), ui.mw(4));
+                }
                 TextView dis = ui.button("断开所选设备", 3, v -> jm.disconnectLan());
                 dis.setEnabled(canConnect);
                 card.addView(dis, ui.mw(4));
@@ -562,8 +575,11 @@ public class MainActivity extends Activity implements JobManager.Listener {
             card.addView(pad, new LinearLayout.LayoutParams(1, ui.dp(6)));
         }
         add(card, 12);
-        if (!local && jm.pendingRecord() != null && !(d != null && d.probed && d.root != null) && !(d != null && d.wait != null))
-            add(ui.notice("!", "继续格式化后的安装：先准备目标设备", Mu300Internal.resumePrep(), 1), 10);
+        if (!local && jm.pendingRecord() != null && !(d != null && d.probed && d.root != null) && !(d != null && d.wait != null)) {
+            String na = jm.noAdbHint();
+            add(ui.notice("!", "继续格式化后的安装：先准备目标设备", na != null ? na : Mu300Internal.resumePrep(), 1), 10);
+            if (na != null) add(ufiButton(), 6);
+        }
         if (!local) {
             add(ui.notice("i", "USB 有线连接（OTG）",
                     "1. 用 OTG 转接头 / OTG 线把本机接到目标设备的 USB 口（本机作主机，会给目标设备供电）。\n"
@@ -576,6 +592,16 @@ public class MainActivity extends Activity implements JobManager.Listener {
                             + "3. 首次连接时在目标设备上允许调试，并在其 root 管理器中允许 Shell 的超级用户请求。\n"
                             + "Android 11+ 的“无线调试”配对码方式暂不支持。", 0), 10);
         }
+    }
+
+    /** "打开 Lino-UFI 工具", or "未安装 … 点此安装" opening the blog article; state re-read on every render (onResume). */
+    private TextView ufiButton() {
+        final boolean has = UfiTool.installed(this);
+        return ui.button(UfiTool.buttonLabel(has), has ? 1 : 0, v -> {
+            if (has) {
+                if (!UfiTool.open(this)) Toast.makeText(this, "无法启动 " + UfiTool.NAME + "，已打开下载文章", Toast.LENGTH_SHORT).show();
+            } else UfiTool.openBlog(this);
+        });
     }
 
     private void describeDevice(LinearLayout card, JobManager.Device d) {
@@ -727,12 +753,15 @@ public class MainActivity extends Activity implements JobManager.Listener {
             methodRow(m, idle);
         }
         String pending = jm.pendingRecord();
+        String noAdb = pending != null && !jm.targetReady() ? jm.noAdbHint() : null;
         if (pending != null && pending.startsWith("未完成的卸载"))
             add(ui.notice("!", "有未完成的卸载", pending + "。请选上面的“卸载并归还空间”，重新检查会自动接上这份记录；完成之前不要开始新的安装或卸载，"
-                    + "也不要删除本应用的备份。如果卸载时选择了恢复出厂：先完成 Android 设置，重新打开 ADB、重新安装 Magisk（面具）并给 Shell 授予 root，再继续。", 0), 10);
+                    + "也不要删除本应用的备份。如果卸载时选择了恢复出厂：先完成 Android 设置，重新打开 ADB、重新安装 Magisk（面具）并给 Shell 授予 root，再继续。"
+                    + (noAdb != null ? "\n\n" + noAdb : ""), 0), 10);
         else if (pending != null)
             add(ui.notice("!", "有未完成的操作", pending + "。请选上面的“继续格式化后的安装”完成它；在完成之前不要开始新的安装。\n"
-                    + Mu300Internal.resumePrep(), 0), 10);
+                    + (noAdb != null ? noAdb : Mu300Internal.resumePrep()), 0), 10);
+        if (noAdb != null) add(ufiButton(), 6);
         if (advancedOn && anyAdvanced) {
             LinearLayout ah = ui.row();
             ah.setGravity(Gravity.CENTER_VERTICAL);
@@ -954,6 +983,16 @@ public class MainActivity extends Activity implements JobManager.Listener {
             impact = "在 userdata 中新建 OpenWrt 镜像文件（占用所选大小的空间），不格式化 userdata；已有镜像会被移到 /data/e5linux/previous.* 保留。"
                     + "此方式为实验性。";
         add(ui.notice("!", wipe ? "数据影响 · Android 数据全部清空" : "数据影响", impact, 1), 10);
+        if (wipe && !(un && jm.unResume != null) && jm.mode != JobManager.Mode.LOCAL) {
+            add(ui.notice("!", "格式化前先备份面具和软件", UfiTool.backupBeforeFormat(un), 1), 10);
+            add(ufiButton(), 6);
+        } else if (m == JobManager.Method.RESUME || (un && jm.unResume != null)) {
+            String na = jm.targetReady() ? null : jm.noAdbHint();
+            if (na != null) {
+                add(ui.notice("!", "没有检测到目标设备的 ADB", na, 1), 10);
+                add(ufiButton(), 6);
+            }
+        }
         if (un)
             add(ui.notice("i", "步骤顺序（与电脑端相同）", "只读检查 → 备份 GPT / misc / 启动镜像到本应用 → 上传离线卸载启动镜像与维护工具并校验 → 写入 Linux 槽和 misc 启动请求 → "
                     + "目标设备重启离线卸载 → 回到 Android 后重新连接继续：校验容量、清除启动请求、恢复 Linux 槽为 Android 启动镜像。关闭本应用或断开连接不会撤销已写入的离线卸载请求。", 0), 8);
@@ -1239,6 +1278,8 @@ public class MainActivity extends Activity implements JobManager.Listener {
         card.addView(pad, new LinearLayout.LayoutParams(1, ui.dp(10)));
         add(card, 12);
         add(ui.notice("!", "继续之前必须做的准备", Mu300Internal.resumePrep(), 1), 12);
+        add(ui.notice("i", "格式化后 ADB 会关闭", UfiTool.noAdbAfterFormat(jm.mu300Family(), false), 0), 10);
+        add(ufiButton(), 6);
     }
     // ------------------------------------------------------------ 日志
     private void logPage() {

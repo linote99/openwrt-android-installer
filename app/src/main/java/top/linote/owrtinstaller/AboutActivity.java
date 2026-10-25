@@ -188,6 +188,19 @@ public final class AboutActivity extends Activity {
                 + "分区备份与卸载记录须先导出为 ZIP 并回读校验通过才能删除；未完成的续装 / 卸载记录和 ADB 授权密钥不会删除。");
         TextView clean = ui.button("打开「清理本机占用」", 0, v -> startActivity(new android.content.Intent(this, CleanupActivity.class)));
         body.addView(clean, ui.mw(8));
+        section("配合 " + UfiTool.NAME);
+        para(UfiTool.NAME + "（安卓版）提供 ADB 投屏、安装包备份 / 恢复和一键安装 UFI-TOOLS。需要 root 授权、格式化前备份或格式化后重新打开 ADB 时，"
+                + "本应用会显示“打开 " + UfiTool.NAME + "”；没有安装时显示“点此安装”，用浏览器打开下载文章。");
+        para("• 格式化前：用它的「ADB 工具」→「备份安装包」备份 Magisk（面具）和自己要保留的软件（只备份安装包，不含 App 数据，其他资料请自行备份）。");
+        para("• MU300 系列（MU300 / F50 / U30 Air / V50）：格式化后检测不到 ADB 时，先用它给目标设备安装 UFI-TOOLS，在 UFI-TOOLS（"
+                + UfiTool.UFI_TOOLS_URL + "）里开启 ADB；再用它恢复面具和软件，并用「ADB 投屏」在目标设备上给 Shell 授予 root。");
+        para("• E5 系（E5、远航 41S、T551M、T512N、M8、K1）：设备有屏幕，直接在开发者选项里打开 USB 调试，恢复备份的面具和软件（可以用它恢复），"
+                + "在设备屏幕上给 Shell 授权；投屏只是可选方式。");
+        para("• " + UfiTool.USB_NOTE);
+        TextView ufi = ui.button(UfiTool.buttonLabel(UfiTool.installed(this)), 0, v -> {
+            if (UfiTool.installed(this)) UfiTool.open(this); else UfiTool.openBlog(this);
+        });
+        body.addView(ufi, ui.mw(8));
         section("友情链接");
         link(R.drawable.linote_logo, "Lino 笔记", "https://www.linote.top/", false);
         link(R.drawable.github_invertocat, "GitHub 主页", "https://github.com/linote99", true);

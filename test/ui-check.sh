@@ -44,6 +44,17 @@ t "uninstall dispatched before MU300 internal" 'grep -q "if (m == Method.UNINSTA
 t "cleanup: backups need a verified export" 'grep -q "backups && !exportVerified" "$CL" && grep -q "verifyZip(uri)" "$CL"'
 t "cleanup: never deletes adbkey or unfinished records" 'grep -q "adbkey" "$CL" && grep -q "kept(f)) return 0" "$CL"'
 t "cleanup activity registered and linked" 'grep -q "CleanupActivity" app/src/main/AndroidManifest.xml && grep -q "CleanupActivity.class" "$A"'
+U=$J/UfiTool.java
+t "ufi: package visible (<queries>)" 'grep -q "<package android:name=\"top.linote.ufiinstaller\" />" app/src/main/AndroidManifest.xml'
+t "ufi: missing app opens the blog article" 'grep -q "else UfiTool.openBlog(this)" "$M" && grep -q "posts/lino-ufi-tools-android/" "$U"'
+t "ufi: waiting card shows family hint + button" 'grep -q "String uh = jm.ufiHint(ws, d.usbName != null);" "$M" && grep -q "if (uh != null) card.addView(ufiButton()" "$M"'
+t "ufi: no-root card offers mirroring by family" '[ "$(grep -c "UfiTool.rootGrant(jm.mu300Family()" "$M")" -ge 3 ]'
+t "ufi: root probe window is not shown as failure" 'grep -q "正在检查 root 授权" "$M"'
+t "ufi: page redraws on ladder state" 'grep -q "d.wait + \",\" + d.waitHint) + \"|\" + jm.waiting" "$M"'
+t "ufi: backup notice on formatting plans" 'grep -q "UfiTool.backupBeforeFormat(un)" "$M"'
+t "ufi: no-ADB steps on resume / method / done pages" 'grep -q "没有检测到目标设备的 ADB" "$M" && grep -q "String noAdb = pending != null" "$M" && grep -q "UfiTool.noAdbAfterFormat(jm.mu300Family(), false)" "$M"'
+t "ufi: ladder log + foreground while waiting" 'grep -q "String uh = ufiHint(r.state" "$JM" && grep -q "if (ownFg) InstallService.start(app" "$JM" && grep -q "if (ownFg) InstallService.stop(app)" "$JM"'
+t "ufi: about documents both families" 'grep -q "section(\"配合 \" + UfiTool.NAME)" "$A" && grep -q "MU300 系列" "$A" && grep -q "E5 系" "$A"'
 t "about documents uninstall + cleanup" 'grep -q "卸载并归还空间【高级】" "$A" && grep -q "section(\"清理本机占用\")" "$A"'
 echo "ui check: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -343,9 +343,55 @@ final class JobManager {
     String notReady(boolean withRoot) {
         if (mode == Mode.LOCAL) return "本机没有 root";
         String s = withRoot ? "请先连接目标设备（USB 或局域网）并取得 root" : "请先连接目标设备（USB 或局域网）";
-        if (pendingRecord() != null)
+        String na = noAdbHint();
+        if (na != null) s += "。\n" + na;
+        else if (pendingRecord() != null)
             s += "。格式化后的续装：先在目标设备上重新打开 ADB、重新安装 Magisk（面具），连接时给 Shell 授予 root（见「设备」页的提示）";
         return s;
+    }
+
+    /**
+     * MU300 family (MU300 / F50 / U30 Air / V50: no usable screen, ADB from UFI-TOOLS, root through
+     * screen mirroring) or E5 family (phones with a screen). From the unfinished record, else the
+     * chosen package, else the connected device.
+     */
+    boolean mu300Family() {
+        File un = UninstallRun.pending(uninstallRoot());
+        if (un != null) {
+            try { return "mu300".equals(UninstallRun.load(un).s("family")); } catch (IOException ignored) { }
+        }
+        String p = pendingRecord();
+        if (p != null && p.contains("（MU300）")) return true;
+        if (p != null && p.contains("（E5 系）")) return false;
+        if (pkg != null) return pkg.isMu300();
+        Device d = remote;
+        return d != null && d.probed && PackageInspector.Result.mu300Problem(d.model, d.device, d.platform) == null;
+    }
+
+    /** True when the unfinished record follows a factory reset of the target (formatting install, or an uninstall with reset). */
+    boolean afterReset() {
+        File un = UninstallRun.pending(uninstallRoot());
+        if (un != null) {
+            try { return Boolean.TRUE.equals(UninstallRun.load(un).plan().get("wipe")); } catch (IOException | RuntimeException e) { return false; }
+        }
+        return pendingRecord() != null;
+    }
+
+    /** Steps when no ADB is visible after a factory reset (per family), or null when not in that situation. */
+    String noAdbHint() {
+        if (mode == Mode.LOCAL || !afterReset()) return null;
+        Device d = remote;
+        if (d != null && d.probed && d.wait != TargetProbe.State.ANDROID_BOOT && d.wait != TargetProbe.State.USB_DEBUGGING) return null;
+        return UfiTool.noAdbAfterFormat(mu300Family(), UninstallRun.pending(uninstallRoot()) != null);
+    }
+
+    /** Companion-app hint for a waiting state (root grant / Magisk), or null. */
+    String ufiHint(TargetProbe.State s, boolean usb) {
+        if (mode == Mode.LOCAL || s == null) return null;
+        if (s == TargetProbe.State.ROOT_PERMISSION) return UfiTool.rootGrant(mu300Family(), usb);
+        if (s == TargetProbe.State.MAGISK) return UfiTool.magisk(mu300Family(), usb);
+        if (s == TargetProbe.State.ANDROID_BOOT || s == TargetProbe.State.USB_DEBUGGING) return noAdbHint();
+        return null;
     }
     String pendingRecord() {
         File un = UninstallRun.pending(uninstallRoot());
@@ -525,6 +571,7 @@ final class JobManager {
         lastFail = null;
         lastFailTask = what;
         changed();
+        taskForeground = foreground;
         if (foreground) InstallService.start(app, what);
         worker.execute(() -> {
             append("▶ " + what);
@@ -715,6 +762,8 @@ final class JobManager {
     // ------------------------------------------------------------ readiness ladder (adapter.probe)
     /** True while the running task only waits for the target to become ready (no device writes). */
     volatile boolean waiting;
+    /** The running task already holds the foreground service (submit(..., true, ..)). */
+    private volatile boolean taskForeground;
     /** Set by a reboot of the target inside a task: reconnect and wait once that task ends. */
     private volatile boolean reconnectAfter;
     private final java.util.Set<String> usbAsked = new java.util.HashSet<>();
@@ -801,6 +850,10 @@ final class JobManager {
      */
     private void waitReady(Device d) throws IOException {
         waiting = true;
+        // While the user works in another app (e.g. Lino-UFI 工具 mirroring), a cached process may be
+        // frozen (Android 12+): keep a foreground notification so the retries go on.
+        final boolean ownFg = !taskForeground;
+        if (ownFg) InstallService.start(app, "等待目标设备就绪");
         try {
             TargetProbe.State last = null;
             String lastSerial = d.serial;
@@ -853,6 +906,8 @@ final class JobManager {
                 d.waitHint = hint;
                 if (r.state != last) {
                     append("… " + TargetProbe.title(r.state) + "（" + TargetProbe.stage(r.state) + "）：" + hint);
+                    String uh = ufiHint(r.state, d.usbName != null);
+                    if (uh != null) for (String l : uh.split("\n")) append("  " + l);
                     if (pendingRecord() != null) {
                         append("  恢复出厂后的准备清单（✓ 已完成，→ 现在这一步）：");
                         for (String l : TargetProbe.checklist(r.state, d.usbName == null).split("\n")) append("  " + l);
@@ -871,6 +926,7 @@ final class JobManager {
             }
         } finally {
             waiting = false;
+            if (ownFg) InstallService.stop(app);
         }
     }
 

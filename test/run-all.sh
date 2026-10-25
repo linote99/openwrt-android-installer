@@ -114,6 +114,8 @@ fi
 if [ -d build/gen ] && [ -f "$AJ" ]; then
   javac -encoding UTF-8 -nowarn -cp "$AJ" -sourcepath app/src/main/java:build/gen -d "$B/tp" test/TargetProbeTest.java 2>&1 | grep -v '^Note'
   java -cp "$B/tp:$AJ" top.linote.owrtinstaller.TargetProbeTest > "$B/targetprobe.txt" 2>&1; note "TargetProbeTest rc=$? $(tail -1 "$B/targetprobe.txt")"
+  javac -encoding UTF-8 -nowarn -cp "$AJ" -sourcepath app/src/main/java:build/gen -d "$B/ufi" test/UfiToolTest.java 2>&1 | grep -v '^Note'
+  java -cp "$B/ufi:$AJ" top.linote.owrtinstaller.UfiToolTest > "$B/ufitool.txt" 2>&1; note "UfiToolTest rc=$? $(tail -1 "$B/ufitool.txt")"
 else
   note "TargetProbeTest rc=1 FAIL: run ./build.sh first (needs build/gen and android.jar)"
 fi
