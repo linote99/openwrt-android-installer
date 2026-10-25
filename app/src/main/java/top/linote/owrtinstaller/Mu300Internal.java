@@ -54,6 +54,10 @@ final class Mu300Internal {
         default void status(String line) { }
         /** The user asked to stop waiting. */
         default boolean cancelled() { return false; }
+        /** The ADB connection in use ("usb:<serial>" / "tcp:<host:port>"); "" when not applicable. */
+        default String transport() { return ""; }
+        /** The target passed the readiness ladder (Android set up, debugging authorised, root). */
+        default boolean ready() { return true; }
         /** Copies a remote file that the shell user can read into dest, byte for byte. */
         void pull(String remote, File dest) throws IOException;
         /** pull() reporting the bytes received so far. */
@@ -1042,7 +1046,7 @@ final class Mu300Internal {
             byte[] aa = androidBlock(live, p.slot);
             String request = token + ":" + s.cid + ":" + s.node + ":" + s.start + ":" + s.size + ":" + target + ":" + need + ":" + hex(aa);
             LinkedHashMap<String, Object> r = new LinkedHashMap<>();
-            r.put("format", 1L); r.put("state", "prepared-request"); r.put("serial", serial); r.put("android_slot", p.slot);
+            r.put("format", 1L); r.put("state", "prepared-request"); r.put("serial", serial); r.put("transport", io.transport()); r.put("android_slot", p.slot);
             r.put("storage", storageMap(s)); r.put("target", target); r.put("need", need); r.put("token", token);
             r.put("package", hashFile(new File(local, MANIFEST)));
             File rec = new File(b, "transaction.json");
@@ -1252,8 +1256,16 @@ final class Mu300Internal {
         Storage s = p.s;
         if (s.root == null) throw new IOException("没有找到已准备的 mu300root");
         Map<String, Object> st = (Map<String, Object>) r.get("storage");
-        if (st == null || !s.cid.equals(st.get("CID")) || !s.node.equals(st.get("NODE")) || s.start != num(st.get("START"))
-                || !p.slot.equals(r.get("android_slot")) || !String.valueOf(serial).equals(r.get("serial")))
+        String mismatch = st == null ? "记录缺少存储信息" : Rebind.diff("eMMC CID", String.valueOf(st.get("CID")), s.cid,
+                "userdata 节点", String.valueOf(st.get("NODE")), s.node,
+                "userdata 起点", String.valueOf(st.get("START")), String.valueOf(s.start),
+                "Android 槽位", String.valueOf(r.get("android_slot")), p.slot, "序列号", String.valueOf(r.get("serial")), String.valueOf(serial));
+        // adb_connect / rebind: continuing over another connection needs the same device and slot.
+        if (Rebind.apply(r, io.transport(), io.ready(), mismatch, System.currentTimeMillis() / 1000)) {
+            writeJson(rec, r);
+            if (r.get("transport_history") != null) io.log("  已改用新的连接继续：" + io.transport() + "（设备身份核对一致，已记入连接历史）");
+        }
+        if (mismatch != null)
             throw new IOException("续装的设备或启动槽与记录不同（eMMC、userdata 位置、Android 槽或序列号不一致）；未做任何修改");
         long target = num(r.get("target")), need = num(r.get("need"));
         if (s.size != target || p.rootStart != s.start + target || p.rootSize != need)
@@ -1351,25 +1363,16 @@ final class Mu300Internal {
 
     /** How long a background step may take to record its PID after being launched. */
     static long LAUNCH_MS = 20_000;
-    /**
-     * What the user must redo on the target after the formatting first stage (Android data, developer
-     * options, the Magisk app and the Shell root grant are all gone) before "继续格式化后的安装".
-     */
-    static final String[] RESUME_PREP = {
-            "完成 Android 首次设置（格式化后原来的设置全部清空）。",
-            "重新打开 ADB：在开发者选项里打开“USB 调试”（开发者选项一般在“关于手机”里连点版本号打开；没有设置界面的设备用原来开启 ADB 的方法）。",
-            "重新安装 Magisk（面具）App，确认显示已安装、已 root；如果显示未安装，按原来的方法重新 root。",
-            "用局域网（无线 ADB）连接的，还要重新开启 5555 端口的网络 ADB（例如用 USB 执行 adb tcpip 5555，或 root 后执行 setprop service.adb.tcp.port 5555 再重启 adbd）。",
-            "用本应用重新连接目标设备：先在目标设备上允许 USB 调试，再在弹出的超级用户请求里允许“Shell”（或在 Magisk「超级用户」列表里打开 Shell）。",
-    };
     static final String RESUME_ENTRY = "完成后在「安装方式」页选“继续格式化后的安装”";
-    /** RESUME_PREP as a numbered block. */
+    /** What to redo on the target after the formatting first stage, numbered (the readiness ladder steps). */
     static String resumePrep() {
-        StringBuilder b = new StringBuilder("继续之前，请先在目标设备上：");
-        for (int i = 0; i < RESUME_PREP.length; i++) b.append('\n').append(i + 1).append(". ").append(RESUME_PREP[i]);
+        // One list with the readiness ladder (TargetProbe): the same steps the connection checks one by one.
+        StringBuilder b = new StringBuilder("继续之前，请先在目标设备上（本应用连接时会逐项自动检测，做完一项自动往下走）：");
+        String[] steps = TargetProbe.checklist(null, null).split("\n");
+        for (int i = 0; i < steps.length; i++) b.append('\n').append(i + 1).append(". ").append(steps[i].substring(2));
         return b.append('\n').append(RESUME_ENTRY).append('。').toString();
     }
-    /** RESUME_PREP in one sentence, for outcome lines. */
+    /** resumePrep() in one sentence, for outcome lines. */
     static final String RESUME_PREP_SHORT = "回到 Android 后先完成首次设置，再在目标设备上重新打开 ADB（USB 调试；用局域网的还要重新开启 5555 网络 ADB）、"
             + "重新安装 Magisk（面具），连接时在超级用户请求里给 Shell 授予 root；" + RESUME_ENTRY + "续装，不要重复运行第一阶段";
     /** How long a parked detached step waits for its go file before exiting without running. */

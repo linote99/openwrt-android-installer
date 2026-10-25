@@ -63,7 +63,11 @@ final class JobManager {
         RESUME("继续格式化后的安装", "“格式化 userdata”安装的第二阶段：Android 重置后先重新打开 ADB、重新安装 Magisk（面具）并给 Shell 授予 root，再"
                         + "把 OpenWrt 写入已准备好的 e5root（需要第一阶段在本机保存的记录）",
                 "继续格式化后的安装", "“格式化 userdata”安装的第二阶段：Android 重置后先重新打开 ADB、重新安装 Magisk（面具）并给 Shell 授予 root，再"
-                        + "把 OpenWrt 写入已准备好的 mu300root（需要第一阶段在本机保存的记录）");
+                        + "把 OpenWrt 写入已准备好的 mu300root（需要第一阶段在本机保存的记录）"),
+        UNINSTALL("卸载并归还空间【高级】", "删除内置 e5root 分区，空间还给 Android（相邻时）或释放为未分配空间；能保留时保留 Android 数据，"
+                        + "不能保留时说明原因并需额外确认恢复出厂。只能通过 USB / 局域网操作另一台设备",
+                "卸载并归还空间【高级】", "删除内置 mu300root 分区，空间还给 Android（相邻时）或释放为未分配空间；能保留时保留 Android 数据，"
+                        + "不能保留时说明原因并需额外确认恢复出厂。只能通过 USB / 局域网操作另一台设备");
         final String title, summary, muTitle, muSummary;
         Method(String t, String s, String mt, String ms) { title = t; summary = s; muTitle = mt; muSummary = ms; }
     }
@@ -74,6 +78,9 @@ final class JobManager {
         boolean probed;
         String endpoint;      // remote only: "host:port", or a USB label
         String usbName;       // remote over USB OTG: UsbDevice.getDeviceName()
+        String usbLabel;      // remote over USB OTG: manufacturer + product (finds it again after a reboot)
+        volatile TargetProbe.State wait;   // readiness ladder state while waiting, null otherwise
+        volatile String waitHint;          // what the user has to do now
     }
 
     static final String BASE = "/data/adb/owrt-apk";
@@ -90,6 +97,7 @@ final class JobManager {
 
     final Context app;
     private final Handler main = new Handler(Looper.getMainLooper());
+    { AdbConnection.abort = () -> this.stopRequested && this.busy != null; }
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final List<Listener> listeners = new ArrayList<>();
     private final ArrayDeque<String> log = new ArrayDeque<>();
@@ -256,7 +264,7 @@ final class JobManager {
         try { return Mu300Gpt.allocation(muPlan.s.size, mib)[0] / 2048; } catch (IllegalArgumentException e) { return -1; }
     }
     /** Methods the desktop installer lists under 「高级选项」; shown in step 3 only after the title is tapped 5 times. */
-    static boolean advanced(Method m) { return m == Method.IMAGE || m == Method.REPART; }
+    static boolean advanced(Method m) { return m == Method.IMAGE || m == Method.REPART || m == Method.UNINSTALL; }
 
     enum Route { FREE, KEEP, FORMAT }
     private static boolean in(long[] r, long v) { return r != null && v >= r[0] && v <= r[1]; }
@@ -315,6 +323,12 @@ final class JobManager {
     }
     /** Null when the install button may proceed; otherwise what is missing. */
     String installBlocker() {
+        if (method == Method.UNINSTALL) {
+            if (mode == Mode.LOCAL) return "本机模式不提供卸载";
+            if (unResume == null && unPrep == null) return "请先完成只读检查";
+            if (unResume == null && unPrep.wipe && !unResetOk) return "无法保留 Android 数据，需要先勾选“格式化 userdata（恢复出厂）后卸载”";
+            return null;
+        }
         if (method != Method.PART) return null;
         Route r = route();
         if (r == null) return routeText();
@@ -334,6 +348,12 @@ final class JobManager {
         return s;
     }
     String pendingRecord() {
+        File un = UninstallRun.pending(uninstallRoot());
+        if (un != null) {
+            String st = "?";
+            try { st = UninstallRun.load(un).s("stage"); } catch (IOException e) { /* the check step reports it */ }
+            return "未完成的卸载，记录 " + un.getName() + "，阶段 " + st;
+        }
         String[][] kinds = {{"e5-part", "phase", "complete", "格式化后的安装（E5 系）"},
                             {"mu300-backup", "state", "installed", "格式化后的安装（MU300）"}};
         for (String[] k : kinds) {
@@ -352,6 +372,32 @@ final class JobManager {
         }
         return null;
     }
+    /** Dirs of unfinished resume / uninstall records (never deleted by the local cleanup). */
+    java.util.Set<File> protectedDirs() {
+        java.util.LinkedHashSet<File> out = new java.util.LinkedHashSet<>();
+        File un = uninstallRoot();
+        File[] all = un.listFiles();
+        if (all != null) for (File d : all) {
+            if (!new File(d, UninstallRun.RECORD).isFile()) continue;
+            try { UninstallRun.Rec r = UninstallRun.load(d); if (!r.b("complete") && !r.b("abandoned")) out.add(d); }
+            catch (IOException | RuntimeException e) { out.add(d); }   // unreadable: keep
+        }
+        String[][] kinds = {{"e5-part", "phase", "complete"}, {"mu300-backup", "state", "installed"}};
+        for (String[] k : kinds) {
+            File[] dirs = backupBase(k[0]).listFiles();
+            if (dirs == null) continue;
+            for (File d : dirs) {
+                File t = new File(d, "transaction.json");
+                if (!t.isFile()) continue;
+                try {
+                    Object o = MiniJson.parse(new String(java.nio.file.Files.readAllBytes(t.toPath()), java.nio.charset.StandardCharsets.UTF_8));
+                    Object v = o instanceof java.util.Map ? ((java.util.Map<?, ?>) o).get(k[1]) : null;
+                    if (v == null || !k[2].equals(String.valueOf(v))) out.add(d);
+                } catch (Exception e) { out.add(d); }
+            }
+        }
+        return out;
+    }
     File backupBase(String name) {
         File ext = app.getExternalFilesDir(null);
         return new File(ext != null ? ext : app.getFilesDir(), name);
@@ -367,7 +413,7 @@ final class JobManager {
 
     boolean methodAllowed(Method m) {
         if (m == Method.TF) return true;
-        if (pkg == null) return m != Method.REPART && m != Method.RESUME;
+        if (pkg == null) return m != Method.REPART && m != Method.RESUME && m != Method.UNINSTALL;
         if (pkg.isMu300()) return pkg.internalProblem == null;
         return !pkg.tfOnly;
     }
@@ -405,6 +451,10 @@ final class JobManager {
         e5Encrypted = false;
         e5Pkg = null;
         muPlan = null;
+        unPrep = null;
+        unResume = null;
+        unResetOk = false;
+        unSummary = null;
     }
 
     void setMethod(Method m) {
@@ -499,6 +549,10 @@ final class JobManager {
                 if (foreground) InstallService.stop(app);
                 append("■ 结束：" + what);
                 changed();
+                if (reconnectAfter) {
+                    reconnectAfter = false;
+                    if (mode != Mode.LOCAL && remote != null && remote.endpoint != null) main.postDelayed(this::reconnectAfterReboot, 3000);
+                }
             }
         });
         return true;
@@ -582,6 +636,7 @@ final class JobManager {
     }
 
     void connectLan(String endpointText) {
+        if (busy != null) { switchConnection(() -> connectLan(endpointText)); return; }
         submit("连接局域网设备", false, () -> {
             String[] hp = AdbConnection.parseEndpoint(endpointText);
             String ep = hp[0].contains(":") ? "[" + hp[0] + "]:" + hp[1] : hp[0] + ":" + hp[1];
@@ -592,9 +647,8 @@ final class JobManager {
             remote = d;
             changed();
             append("连接无线 ADB " + ep + " ……");
-            AdbConnection c = adb();
             prefs.edit().putString("endpoint", ep).apply();
-            finishRemote(d, c);
+            waitReady(d);
         });
     }
 
@@ -619,7 +673,7 @@ final class JobManager {
 
     /** Asks for USB permission if needed (system dialog), then connects over wired ADB. */
     void connectUsb(String deviceName) {
-        if (busy != null) { append("正在执行：" + busy + "，完成后再连接"); return; }
+        if (busy != null) { switchConnection(() -> connectUsb(deviceName)); return; }
         UsbManager um = usbManager();
         UsbDevice dev = um == null ? null : um.getDeviceList().get(deviceName);
         if (dev == null) { append("✗ USB 设备已断开：请重新插好 OTG 线后点“检测 USB 设备”"); scanUsb(); return; }
@@ -650,45 +704,203 @@ final class JobManager {
             Device d = new Device();
             d.endpoint = "USB · " + label;
             d.usbName = deviceName;
+            d.usbLabel = label;
             remote = d;
             changed();
             append("通过 USB 连接 " + label + " ……");
-            AdbConnection c = adb();
-            finishRemote(d, c);
+            waitReady(d);
         });
     }
 
-    /** Common part after a wired or wireless ADB connection: device properties and root. */
-    private void finishRemote(Device d, AdbConnection c) throws IOException {
-            if (c.staleDropped > 0 || c.staleBytes > 0)
-                append("已丢弃上一次会话残留的数据（" + c.staleDropped + " 个报文" + (c.staleBytes > 0 ? "，" + c.staleBytes + " 字节" : "") + "）");
-            append("✓ 已连接（" + (c.banner.containsKey("ro.product.model") ? c.banner.get("ro.product.model") : "设备") + "）");
-            parseProps(d, c.shellText(propsScriptPlain()));
-            d.probed = true;
-            if ("0".equals(c.shellText("id -u").trim())) {
-                d.root = "";
-            } else {
-                append("正在请求目标设备的 root：如目标设备弹出超级用户请求，请允许“Shell”。");
-                for (String s : new String[]{"su", "/debug_ramdisk/su", "/sbin/su"}) {
-                    String out = c.shellText(s + " -c id 2>/dev/null");
-                    if (out.matches("(?s).*\\buid=0\\b.*")) { d.root = s; break; }
+    // ------------------------------------------------------------ readiness ladder (adapter.probe)
+    /** True while the running task only waits for the target to become ready (no device writes). */
+    volatile boolean waiting;
+    /** Set by a reboot of the target inside a task: reconnect and wait once that task ends. */
+    private volatile boolean reconnectAfter;
+    private final java.util.Set<String> usbAsked = new java.util.HashSet<>();
+
+    /** No ADB interface on any attached USB device although something is attached. */
+    private static final class NoAdbInterface extends IOException { NoAdbInterface() { super("USB 设备没有 ADB 接口"); } }
+
+    /**
+     * adb_connect: the connection may only change while the task is waiting for the device / the
+     * user (desktop: status waiting_user / waiting_device in one of Rebind.WAIT_STAGES).
+     */
+    private void switchConnection(Runnable then) {
+        if (!waiting) { append("✗ " + Rebind.PAUSE_FIRST + "（正在执行：" + busy + "）"); return; }
+        append("停止等待当前连接，改用新的连接……");
+        stopRequested = true;
+        AdbConnection c = adb;
+        if (c != null) c.close();
+        new Thread(() -> {
+            for (int i = 0; i < 200 && busy != null; i++) {
+                try { Thread.sleep(50); } catch (InterruptedException e) { return; }
+            }
+            main.post(() -> { if (busy == null) then.run(); else append("✗ 当前等待没有及时结束，请稍后再试"); });
+        }, "switch-conn").start();
+    }
+
+    /** The ADB connection for the waiting loop; finds a USB target again after it re-enumerated. */
+    private AdbConnection adbWait(Device d) throws IOException {
+        if (adb != null && !adb.isClosed()) return adb;
+        AdbConnection.AuthListener al = fp -> {
+            if (d.wait != TargetProbe.State.DEBUG_AUTHORIZATION)
+                append("请在目标设备屏幕上允许调试（建议勾选“始终允许”）。本应用密钥指纹：" + fp);
+        };
+        if (d.usbName != null) {
+            UsbManager um = usbManager();
+            if (um == null) throw new AdbConnection.Permanent("本机不支持 USB 主机模式，请改用局域网连接");
+            UsbDevice dev = um.getDeviceList().get(d.usbName);
+            if (dev == null || UsbAdbTransport.findAdbInterface(dev) == null) {
+                // A reboot gives the target a new device node: take the same product again, or the only ADB device.
+                List<UsbAdbTransport.Candidate> l = UsbAdbTransport.list(um);
+                usbHits = l;
+                UsbAdbTransport.Candidate pick = null;
+                for (UsbAdbTransport.Candidate c : l) if (pick == null && c.label.equals(d.usbLabel)) pick = c;
+                if (pick == null && l.size() == 1) pick = l.get(0);
+                if (pick == null) {
+                    if (!l.isEmpty()) throw new IOException("连接着多台 USB ADB 设备，请只连接目标设备");
+                    if (!um.getDeviceList().isEmpty()) throw new NoAdbInterface();
+                    throw new IOException("看不到 USB 设备");
                 }
+                dev = pick.dev;
+                d.usbName = pick.name;
             }
-            describe(d, d.usbName != null ? "USB 设备" : "局域网设备");
-            if (d.root == null) {
-                if (pendingRecord() != null) {
-                    append("✗ 目标设备没有可用的 root。本机有未完成的“格式化后的安装”：格式化后目标设备的 Magisk 和 Shell 的 root 授权都已清空。");
-                    for (String l : Mu300Internal.resumePrep().split("\n")) append("  " + l);
-                } else
-                    append("✗ 目标设备没有可用的 root：请在其 Magisk / KernelSU / KSUNext 中允许 Shell 的超级用户请求后重新连接。");
+            if (!um.hasPermission(dev)) {
+                if (usbAsked.add(dev.getDeviceName())) {
+                    append("目标设备重新出现：请在本机弹出的对话框里允许“OpenWrt 安装器”访问该 USB 设备");
+                    Intent pi = new Intent(ACTION_USB_PERMISSION).setPackage(app.getPackageName());
+                    int flags = Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0;
+                    um.requestPermission(dev, PendingIntent.getBroadcast(app, 2, pi, flags | PendingIntent.FLAG_UPDATE_CURRENT));
+                }
+                throw new IOException("等待本机允许访问 USB 设备");
+            }
+            adb = AdbConnection.connect(UsbAdbTransport.open(um, dev), d.endpoint, adbKey(), "owrt-installer@" + Build.MODEL, al);
+        } else {
+            String[] hp = AdbConnection.parseEndpoint(d.endpoint);
+            adb = AdbConnection.connect(hp[0], Integer.parseInt(hp[1]), adbKey(), "owrt-installer@" + Build.MODEL, al);
+        }
+        return adb;
+    }
+
+    private static String waitSh(AdbConnection c, String cmd, int ms) throws IOException {
+        StringBuilder b = new StringBuilder();
+        try {
+            c.shell(cmd, l -> b.append(l).append('\n'), ms);
+        } catch (IOException e) {
+            if (c.isClosed()) throw new TargetProbe.Fatal(e.getMessage() == null ? "连接已断开" : e.getMessage());
+            throw e;
+        }
+        return b.toString();
+    }
+
+    /**
+     * Polls the readiness ladder until the target is ready (root usable) or the user stops: every
+     * state but READY is a waiting state (desktop: waiting_device for android_boot, waiting_user
+     * otherwise) with its own hint; the target reconnects by itself after reboots.
+     */
+    private void waitReady(Device d) throws IOException {
+        waiting = true;
+        try {
+            TargetProbe.State last = null;
+            String lastSerial = d.serial;
+            while (true) {
+                if (stopRequested) throw new IOException("已停止等待目标设备（可随时重新连接）");
+                TargetProbe.Result r;
+                boolean booted = false;
+                try {
+                    boolean fresh = adb == null || adb.isClosed();
+                    AdbConnection c = adbWait(d);
+                    if (fresh) {
+                        if (c.staleDropped > 0 || c.staleBytes > 0)
+                            append("已丢弃上一次会话残留的数据（" + c.staleDropped + " 个报文" + (c.staleBytes > 0 ? "，" + c.staleBytes + " 字节" : "") + "）");
+                        append("✓ 已连接（" + (c.banner.containsKey("ro.product.model") ? c.banner.get("ro.product.model") : "设备") + "）");
+                        parseProps(d, c.shellText(propsScriptPlain()));
+                        d.probed = true;
+                        if (lastSerial != null && !lastSerial.isEmpty() && !lastSerial.equals(d.serial))
+                            append("! 现在连上的设备序列号与之前不同（" + maskSerial(lastSerial) + " → " + maskSerial(d.serial) + "）：如果不是同一台设备，续装/卸载会拒绝继续");
+                        lastSerial = d.serial;
+                        describe(d, d.usbName != null ? "USB 设备" : "局域网设备");
+                    }
+                    booted = true;
+                    r = TargetProbe.evaluate((cmd, ms) -> waitSh(c, cmd, ms));
+                } catch (AdbConnection.Permanent e) {
+                    throw e;
+                } catch (AdbConnection.AuthPending e) {
+                    closeAdb();
+                    r = new TargetProbe.Result(TargetProbe.State.DEBUG_AUTHORIZATION, null, null);
+                } catch (NoAdbInterface e) {
+                    r = new TargetProbe.Result(TargetProbe.State.USB_DEBUGGING, null, null);
+                } catch (IOException e) {
+                    if (stopRequested) throw new IOException("已停止等待目标设备（可随时重新连接）");
+                    closeAdb();
+                    booted = false;
+                    r = new TargetProbe.Result(TargetProbe.State.ANDROID_BOOT, null, null);
+                }
+                if (r.state == TargetProbe.State.READY) {
+                    d.root = r.su;
+                    d.wait = null;
+                    d.waitHint = null;
+                    append("✓ 目标设备已就绪：Android 已启动、调试已授权，root 可用（" + (r.su.isEmpty() ? "adbd 已是 root" : r.su) + "）");
+                    if (pendingRecord() != null) append("本机有未完成的记录（" + pendingRecord() + "），可以在「安装方式」里接着继续。");
+                    refreshStatus();
+                    changed();
+                    return;
+                }
+                d.root = null;
+                String hint = TargetProbe.hint(r, d.usbName != null, booted);
+                d.wait = r.state;
+                d.waitHint = hint;
+                if (r.state != last) {
+                    append("… " + TargetProbe.title(r.state) + "（" + TargetProbe.stage(r.state) + "）：" + hint);
+                    if (pendingRecord() != null) {
+                        append("  恢复出厂后的准备清单（✓ 已完成，→ 现在这一步）：");
+                        for (String l : TargetProbe.checklist(r.state, d.usbName == null).split("\n")) append("  " + l);
+                    }
+                    append("  本应用每 3 秒自动重试，完成后自动往下走；不想等了可以点“停止”。");
+                    last = r.state;
+                }
+                step = TargetProbe.title(r.state) + "（自动重试中）";
+                stepWrites = false;
+                lastActivity = System.currentTimeMillis();
                 changed();
-                return;
+                for (int i = 0; i < 12 && !stopRequested; i++) {
+                    try { Thread.sleep(250); } catch (InterruptedException e) { throw new IOException("已停止等待目标设备"); }
+                }
+                lastActivity = System.currentTimeMillis();
             }
-            append("✓ 目标设备 root 可用（" + (d.root.isEmpty() ? "adbd 已是 root" : d.root) + "）");
-            refreshStatus();
+        } finally {
+            waiting = false;
+        }
+    }
+
+    private void closeAdb() {
+        AdbConnection c = adb;
+        adb = null;
+        if (c != null) c.close();
+    }
+
+    /** "usb:<serial>" / "tcp:<host:port>" of the connection in use; "" in local mode. */
+    String transportId() {
+        Device d = remote;
+        if (mode == Mode.LOCAL || d == null || d.endpoint == null) return "";
+        return d.usbName != null ? "usb:" + d.serial : "tcp:" + d.endpoint;
+    }
+
+    /** After the target rebooted inside a task: wait for it to come back, then continue. */
+    void reconnectAfterReboot() {
+        if (busy != null || remote == null || mode == Mode.LOCAL) return;
+        final Device d = remote;
+        submit("等待目标设备重新连接", false, () -> {
+            closeAdb();
+            d.root = null;
+            append("目标设备正在重启：本应用会自动等它回到 Android 并重新连接（不用手动点重试，可以点“停止”）。");
+            waitReady(d);
+        });
     }
 
     void disconnectLan() {
+        if (busy != null) { switchConnection(this::disconnectLan); return; }
         submit("断开目标设备", false, () -> {
             if (adb != null) adb.close();
             adb = null;
@@ -928,6 +1140,7 @@ final class JobManager {
                 }
                 adb().reboot();
                 if (adb != null) adb.close();
+                reconnectAfter = true;
                 adb = null;
             }
 
@@ -953,6 +1166,8 @@ final class JobManager {
                 changed();
             }
             @Override public boolean cancelled() { return stopRequested; }
+            @Override public String transport() { return transportId(); }
+            @Override public boolean ready() { return mode == Mode.LOCAL ? local.root != null : remote != null && remote.root != null; }
         };
     }
 
@@ -1031,6 +1246,162 @@ final class JobManager {
         } catch (IOException | RuntimeException e) {
             installRc = "1";
             lastJob = "done 1";
+            changed();
+            throw e;
+        } finally {
+            progress = -1;
+        }
+        changed();
+    }
+
+    // ================================================================== uninstall (v1.6.0)
+    Uninstall.Prepared unPrep;          // fresh read-only plan from the check step
+    File unResume;                      // unfinished record for the connected device (continue instead of a new plan)
+    boolean unResetOk;                  // user ticked the factory-reset box on the confirm page
+    String unSummary;                   // plan text for the confirm page
+    UninstallRun.Outcome unOutcome;
+    private String unProfile;
+    File uninstallRoot() { return backupBase("uninstall"); }
+    boolean uninstallPending() { return UninstallRun.pending(uninstallRoot()) != null; }
+    boolean uninstallWipe() { return method == Method.UNINSTALL && unResume == null && unPrep != null && unPrep.wipe; }
+    void setUninstallReset(boolean v) { unResetOk = v; changed(); }
+    static final String UNINSTALL_LOCAL_NO = "本机模式不提供卸载：卸载会让目标设备重启进入离线卸载（恢复出厂时还会清空本应用保存的备份和卸载记录），"
+            + "本机无法全程监督和收尾。请在另一台手机上安装本应用，通过 USB OTG 或局域网连接这台设备后再卸载。";
+
+    /** Package-side inputs for uninstall: Linux boot base, maintenance tools and the pinned worker. */
+    private Uninstall.Pkg uninstallPkg(Mu300Internal.Io io) throws IOException {
+        Uninstall.Pkg up = new Uninstall.Pkg();
+        try (InputStream in = app.getAssets().open("uninstall-worker.sh")) {
+            java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            for (int n; (n = in.read(buf)) > 0; ) bo.write(buf, 0, n);
+            up.worker = bo.toByteArray();
+        }
+        if (!Mu300Boot.sha256(up.worker).equals(UninstallBoot.WORKER_SHA)) throw new IOException("内置卸载脚本校验失败，请重新安装本应用");
+        if (pkg.isMu300()) {
+            up.family = "mu300";
+            if (!muLocalReady()) throw new IOException("本机已没有内置安装文件，请重新选择安装包");
+            java.util.Map<String, String> sums = Mu300Internal.localSums(muLocal());
+            up.base = Mu300Internal.readAll(new File(muLocal(), Mu300Internal.BOOT));
+            if (!Mu300Boot.sha256(up.base).equals(sums.get(Mu300Internal.BOOT))) throw new IOException("本机暂存的 boot-linux.img 已变化，请重新选择安装包");
+            up.repairDir = new File(muLocal(), Mu300Internal.REPAIR);
+            up.repairSums = sums;
+            unProfile = Mu300Internal.identify(io).profile;
+        } else {
+            up.family = "e5";
+            ensureStaged();
+            E5Part.Pkg ep = E5Part.loadPkg(io, pkg.rawBytes);
+            up.base = ep.boot;
+            unProfile = ep.profile;
+            if (ep.hasTools) {
+                final String tar = E5Part.P + "/files/ext4-tools.tar";
+                up.ext4Tar = () -> {
+                    String n = io.sh("stat -c %s " + RootShell.q(tar), true).trim();
+                    if (!n.matches("\\d+") || Long.parseLong(n) > (64L << 20)) throw new IOException("ext4-tools.tar 大小异常");
+                    return Mu300Internal.read(io, "cat " + RootShell.q(tar), Long.parseLong(n));
+                };
+            }
+        }
+        return up;
+    }
+    String uninstallActionText(Uninstall.Prepared p) {
+        switch (p.action) {
+            case "gap": return "OpenWrt 分区不与 userdata 相邻：删除后释放为未分配空间，不改动 Android 数据";
+            case "grow-ext4": case "grow-f2fs": return "保留 Android 数据：离线删除 OpenWrt 分区，把 userdata 扩大并在线下扩容 "
+                    + p.volume.filesystem + " 文件系统";
+            default: return "无法保留 Android 数据，只能格式化 userdata（恢复出厂）后卸载。原因：" + p.reason;
+        }
+    }
+    private void checkUninstall() throws IOException {
+        if (mode == Mode.LOCAL) throw new IOException(UNINSTALL_LOCAL_NO);
+        if (!targetReady()) throw new IOException(notReady(true));
+        String why = problemFor(pkg, target());
+        if (why != null) throw new IOException(why + "；请选择这台设备对应的安装包");
+        Mu300Internal.Io io = muIo();
+        lastLine = "读取安装包中的卸载启动镜像与维护工具";
+        changed();
+        Uninstall.Pkg up = uninstallPkg(io);
+        File pend = UninstallRun.pending(uninstallRoot());
+        if (pend != null) {
+            UninstallRun.Rec rec = UninstallRun.load(pend);
+            Uninstall.Device d = Uninstall.probe(io, up.rootName(), rec.s("profile"));
+            if (d.s.cid.equals(rec.s("cid"))) {
+                if (!up.family.equals(rec.s("family")))
+                    throw new IOException("这台设备有未完成的卸载（" + rec.s("family") + " 系列），请选择与记录相同机型的安装包");
+                unResume = pend;
+                unSummary = "继续未完成的卸载：记录 " + pend.getName() + "，阶段 " + rec.s("stage")
+                        + "\n数据处理：" + uninstallRecordAction(rec);
+                checkedFingerprint = checkKey();
+                append("✓ 找到这台设备未完成的卸载记录 " + pend.getName() + "（阶段 " + rec.s("stage") + "）。不会创建新的卸载计划；点“开始”继续收尾。");
+                return;
+            }
+            append("  本机还有另一台设备（eMMC CID …" + rec.s("cid").substring(24) + "）未完成的卸载记录 " + pend.getName() + "，与当前设备无关");
+        }
+        lastLine = "只读检查：分区表、启动镜像、安装证据与 Android data";
+        changed();
+        Uninstall.Device d = Uninstall.probe(io, up.rootName(), unProfile);
+        Uninstall.Prepared p = Uninstall.prepare(io, d, up);
+        unPrep = p;
+        StringBuilder b = new StringBuilder();
+        b.append("将删除：").append(up.rootName()).append("（/dev/block/").append(d.s.root).append("，").append(Uninstall.human(p.openwrtBytes)).append("，含 OpenWrt 系统与全部设置）");
+        b.append("\nAndroid 容量：").append(Uninstall.human(p.previousAndroidBytes)).append(" → ").append(Uninstall.human(p.androidBytes));
+        b.append("\n归还 Android 的空间：").append(Uninstall.human(Math.max(0, p.reclaimed())));
+        b.append("\n释放为空闲的空间：").append(Uninstall.human(p.released()));
+        b.append("\n数据处理：").append(uninstallActionText(p));
+        unSummary = b.toString();
+        checkedFingerprint = checkKey();
+        append("✓ 检查通过，未修改任何分区。设备 " + d.model + "，Android 槽 " + d.slot);
+        for (String l : unSummary.split("\n")) append("  " + l);
+        if (p.wipe) append("  ⚠ 若继续，需要在确认页勾选“格式化 userdata（恢复出厂）后卸载”，并输入“清空数据”。Android 应用、账号、照片和内部存储都会被清空。");
+    }
+    static String uninstallRecordAction(UninstallRun.Rec rec) {
+        Object a = rec.plan() == null ? null : rec.plan().get("data_action");
+        String s = a == null ? "?" : String.valueOf(a);
+        return "reset".equals(s) ? "格式化 userdata（恢复出厂）" : "gap".equals(s) ? "释放为未分配空间" : "保留 Android 数据（" + s + "）";
+    }
+    private void installUninstall() throws IOException {
+        if (mode == Mode.LOCAL) throw new IOException(UNINSTALL_LOCAL_NO);
+        String block = installBlocker();
+        if (block != null) throw new IOException(block + "；未做任何修改");
+        Mu300Internal.Io io = muIo();
+        installOk = false;
+        installRc = null;
+        hotspot = null;
+        muOutcome = null;
+        unOutcome = null;
+        installedMethod = Method.UNINSTALL;
+        stage1 = false;
+        lastJob = "running";
+        changed();
+        try {
+            Uninstall.Pkg up = uninstallPkg(io);
+            UninstallRun.Outcome o;
+            if (unResume != null) {
+                append("继续卸载：记录 " + unResume.getName());
+                o = UninstallRun.resume(io, unResume, up);
+            } else {
+                append("重新只读核对设备状态（与检查时必须一致）");
+                Uninstall.Prepared fresh = Uninstall.prepare(io, Uninstall.probe(io, up.rootName(), unProfile), up);
+                if (!fresh.action.equals(unPrep.action) || fresh.androidBytes != unPrep.androidBytes || !fresh.nodes.equals(unPrep.nodes))
+                    throw new Uninstall.Refused("设备状态与检查时不同，请重新做只读检查（未做任何修改）");
+                append("数据处理：" + uninstallActionText(fresh));
+                o = UninstallRun.start(io, uninstallRoot(), fresh, up, unPrep.wipe && unResetOk ? unPrep.fingerprint : null, false);
+            }
+            unOutcome = o;
+            installOk = o.complete;
+            installRc = "0";
+            lastJob = "done 0";
+            append((o.complete ? "✓ " : "… ") + o.message);
+            if (o.next != null) append("  " + o.next);
+            File pend = UninstallRun.pending(uninstallRoot());
+            unResume = pend;
+            if (o.complete) { unPrep = null; checkedFingerprint = null; }
+            else if (pend != null) checkedFingerprint = checkKey();
+        } catch (IOException | RuntimeException e) {
+            installRc = "1";
+            lastJob = "done 1";
+            unResume = UninstallRun.pending(uninstallRoot());
+            append("  卸载记录与备份保存在 " + uninstallRoot() + "；不要删除。处理后重新连接，选“卸载并归还空间”重新检查会自动接上记录。");
             changed();
             throw e;
         } finally {
@@ -1202,6 +1573,7 @@ final class JobManager {
             checkedFingerprint = null;
             checkTarget = checkCard = checkSlots = null;
             clearDataCheck();
+            if (m == Method.UNINSTALL) { checkUninstall(); return; }
             if (muInternal(m)) { checkMu300(m); return; }
             ensureStaged();
             if (m == Method.TF) checkTf();
@@ -1375,6 +1747,7 @@ final class JobManager {
         final Method m = method;
         submit("传输及安装系统（" + titleOf(m) + "）", true, () -> {
             if (!checkPassed()) throw new IOException("请先对当前安装包和安装方式完成只读检查");
+            if (m == Method.UNINSTALL) { installUninstall(); return; }
             if (muInternal(m)) { installMu300(m); return; }
             if (m == Method.REPART || m == Method.RESUME || (m == Method.PART && route() == Route.FORMAT)) { installE5(m); return; }
             if (m == Method.PART) {

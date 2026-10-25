@@ -477,6 +477,8 @@ public class MainActivity extends Activity implements JobManager.Listener {
         card.addView(segmented("本机", "其他设备", local, idle,
                 v -> jm.setMode(JobManager.Mode.LOCAL), v -> jm.setMode(JobManager.Mode.LAN)), ui.mw(12));
         JobManager.Device d = jm.target();
+        // While only waiting for the target, the connection may be changed (desktop adb_connect).
+        final boolean canConnect = idle || jm.waiting;
         if (local) {
             describeDevice(card, d);
             if (d.probed && d.root == null)
@@ -489,11 +491,11 @@ public class MainActivity extends Activity implements JobManager.Listener {
             card.addView(ui.text("USB 有线（OTG）", 14, ui.text, true), ui.mw(4));
             card.addView(ui.text("用 OTG 线连接本机和目标设备，目标设备开启 USB 调试。", 12, ui.muted, false), ui.mw(4));
             TextView us = ui.button("检测 USB 设备", 0, v -> jm.scanUsb());
-            us.setEnabled(idle);
+            us.setEnabled(canConnect);
             card.addView(us, ui.mw(8));
             for (UsbAdbTransport.Candidate c : jm.usbHits) {
                 final String n = c.name;
-                card.addView(ui.actionRow("⏚", c.label, "USB ADB · 点击连接", idle, v -> jm.connectUsb(n)), ui.mw(4));
+                card.addView(ui.actionRow("⏚", c.label, "USB ADB · 点击连接", canConnect, v -> jm.connectUsb(n)), ui.mw(4));
             }
             card.addView(ui.text("局域网（无线 ADB）", 14, ui.text, true), ui.mw(16));
             LinearLayout er = ui.row();
@@ -507,11 +509,11 @@ public class MainActivity extends Activity implements JobManager.Listener {
             ep.setTextSize(14);
             ep.setBackground(ui.round(ui.surface, ui.border, 10));
             ep.setPadding(ui.dp(12), ui.dp(8), ui.dp(12), ui.dp(8));
-            ep.setEnabled(idle);
+            ep.setEnabled(canConnect);
             ep.addTextChangedListener(watcher(s -> endpointText = s));
             er.addView(ep, ui.weight(1));
             TextView goBtn = ui.button("连接", 1, v -> jm.connectLan(endpointText));
-            goBtn.setEnabled(idle);
+            goBtn.setEnabled(canConnect);
             LinearLayout.LayoutParams gp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             gp.leftMargin = ui.dp(8);
             er.addView(goBtn, gp);
@@ -522,7 +524,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
             List<LanScanner.Hit> hits = jm.scanHits;
             for (LanScanner.Hit h : hits) {
                 final String e = h.endpoint();
-                card.addView(ui.actionRow("⌁", e, h.gateway ? "网关（多为热点设备）· 点击连接" : "点击连接", idle, v -> {
+                card.addView(ui.actionRow("⌁", e, h.gateway ? "网关（多为热点设备）· 点击连接" : "点击连接", canConnect, v -> {
                     endpointText = e;
                     jm.connectLan(e);
                 }), ui.mw(4));
@@ -530,12 +532,29 @@ public class MainActivity extends Activity implements JobManager.Listener {
             if (d != null && d.endpoint != null) {
                 card.addView(ui.text("已选择 " + d.endpoint, 13, ui.muted, false), ui.mw(10));
                 describeDevice(card, d);
-                if (d.probed && d.root == null)
+                TargetProbe.State ws = d.wait;
+                if (ws != null) {
+                    // adapter.probe ladder: one hint per state; the app retries by itself.
+                    String body = (d.waitHint == null ? "" : d.waitHint)
+                            + (jm.pendingRecord() != null ? "\n\n恢复出厂后的准备清单（✓ 已完成，→ 现在这一步）：\n" + TargetProbe.checklist(ws, d.usbName == null) : "")
+                            + (jm.waiting ? "\n\n本应用每 3 秒自动重试，完成后自动往下走，不用手动点重试；也可以改用别的连接。"
+                                          : "\n\n已停止等待。做完上面的操作后点“重新连接”。");
+                    card.addView(ui.notice(jm.waiting ? "…" : "!", (jm.waiting ? "等待目标设备：" : "未就绪：") + TargetProbe.title(ws), body, 1), ui.mw(8));
+                    if (jm.waiting) {
+                        TextView st = ui.button("停止等待", 3, v -> jm.stopTask());
+                        card.addView(st, ui.mw(4));
+                    } else {
+                        final String un = d.usbName, le = d.endpoint;
+                        TextView again = ui.button("重新连接", 1, v -> { if (un != null) jm.connectUsb(un); else jm.connectLan(le); });
+                        again.setEnabled(idle);
+                        card.addView(again, ui.mw(4));
+                    }
+                } else if (d.probed && d.root == null)
                     card.addView(ui.notice("!", "目标设备没有可用的 root", jm.pendingRecord() != null
                             ? "格式化后目标设备的 Magisk 和 Shell 的 root 授权都已清空。\n" + Mu300Internal.resumePrep()
                             : "在目标设备的 root 管理器中允许 Shell 的超级用户请求后重新连接。", 1), ui.mw(8));
                 TextView dis = ui.button("断开所选设备", 3, v -> jm.disconnectLan());
-                dis.setEnabled(idle);
+                dis.setEnabled(canConnect);
                 card.addView(dis, ui.mw(4));
             }
             card.addView(ui.text("本应用 ADB 密钥指纹：" + jm.adbKeyFingerprint(), 11.5f, ui.muted, false), ui.mw(8));
@@ -543,7 +562,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
             card.addView(pad, new LinearLayout.LayoutParams(1, ui.dp(6)));
         }
         add(card, 12);
-        if (!local && jm.pendingRecord() != null && !(d != null && d.probed && d.root != null))
+        if (!local && jm.pendingRecord() != null && !(d != null && d.probed && d.root != null) && !(d != null && d.wait != null))
             add(ui.notice("!", "继续格式化后的安装：先准备目标设备", Mu300Internal.resumePrep(), 1), 10);
         if (!local) {
             add(ui.notice("i", "USB 有线连接（OTG）",
@@ -656,6 +675,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
      *  continuation of an unfinished record (that entry is never hidden). */
     private void leaveHiddenMethod() {
         if (advancedOn || jm.busy != null || !JobManager.advanced(jm.method)) return;
+        if (jm.method == JobManager.Method.UNINSTALL && jm.uninstallPending()) return;
         for (JobManager.Method m : JobManager.Method.values())
             if (jm.methodAllowed(m) && !JobManager.advanced(m)) { jm.setMethod(m); return; }
     }
@@ -700,12 +720,17 @@ public class MainActivity extends Activity implements JobManager.Listener {
         boolean anyAdvanced = false;
         for (JobManager.Method m : JobManager.Method.values())
             if (jm.methodAllowed(m) && JobManager.advanced(m)) anyAdvanced = true;
+        boolean unPending = jm.uninstallPending();
         for (JobManager.Method m : JobManager.Method.values()) {
-            if (!jm.methodAllowed(m) || JobManager.advanced(m)) continue;
+            if (!jm.methodAllowed(m)) continue;
+            if (JobManager.advanced(m) && !(m == JobManager.Method.UNINSTALL && unPending)) continue;
             methodRow(m, idle);
         }
         String pending = jm.pendingRecord();
-        if (pending != null)
+        if (pending != null && pending.startsWith("未完成的卸载"))
+            add(ui.notice("!", "有未完成的卸载", pending + "。请选上面的“卸载并归还空间”，重新检查会自动接上这份记录；完成之前不要开始新的安装或卸载，"
+                    + "也不要删除本应用的备份。如果卸载时选择了恢复出厂：先完成 Android 设置，重新打开 ADB、重新安装 Magisk（面具）并给 Shell 授予 root，再继续。", 0), 10);
+        else if (pending != null)
             add(ui.notice("!", "有未完成的操作", pending + "。请选上面的“继续格式化后的安装”完成它；在完成之前不要开始新的安装。\n"
                     + Mu300Internal.resumePrep(), 0), 10);
         if (advancedOn && anyAdvanced) {
@@ -721,7 +746,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
             add(ah, 6);
             add(ui.text("与电脑端“高级选项”相同。连点顶部“OpenWrt 安装器”标题 5 下可关闭；有风险，用前请看「使用说明 → 高级功能」。", 12, ui.muted, false), 6);
             for (JobManager.Method m : JobManager.Method.values())
-                if (jm.methodAllowed(m) && JobManager.advanced(m)) methodRow(m, idle);
+                if (jm.methodAllowed(m) && JobManager.advanced(m) && !(m == JobManager.Method.UNINSTALL && unPending)) methodRow(m, idle);
         }
         if (jm.pkg != null && jm.pkg.isMu300())
             add(ui.text("独立内置分区按电脑端的顺序选路径：未分配空间够就直接用（不动 Android 数据）；不够且 userdata 未加密时离线缩小并保留数据；"
@@ -773,7 +798,11 @@ public class MainActivity extends Activity implements JobManager.Listener {
         check.setEnabled(idle && (jm.packageReady() || jm.localCopyAvailable() || (jm.muInternal(jm.method) && jm.muLocalReady())));
         card.addView(check, ui.mw(8));
         if (!jm.checkPassed()) {
-            card.addView(ui.text(jm.muInternal(jm.method)
+            card.addView(ui.text(jm.method == JobManager.Method.UNINSTALL
+                    ? "卸载检查只读取，不写入：安装包中的卸载启动镜像与维护工具、eMMC 与 GPT（主备两份）、已安装的 OpenWrt 分区与启动镜像（安装证据）、"
+                            + "userdata 文件系统与加密状态，算出 Android 容量、归还给 Android 的空间、释放为空闲的空间，以及能否保留 Android 数据。"
+                            + (jm.mode == JobManager.Mode.LOCAL ? "\n本机模式不提供卸载，请用另一台手机通过 USB / 局域网操作。" : "")
+                    : jm.muInternal(jm.method)
                     ? "检查只读取设备信息：型号、槽位、eMMC 与 GPT（主备两份）、userdata 文件系统、加密状态与可用空间"
                             + (jm.method == JobManager.Method.REPART ? "、已有 mu300root 分区。"
                             : jm.method == JobManager.Method.RESUME ? "、第一阶段的续装记录与已准备好的 mu300root。"
@@ -803,7 +832,14 @@ public class MainActivity extends Activity implements JobManager.Listener {
         String linux = slots.contains(",") ? slots.substring(slots.indexOf(',') + 1) : "b";
         LinearLayout kv = ui.col();
         boolean mi = jm.muInternal(m);
-        if (mi) {
+        boolean un = m == JobManager.Method.UNINSTALL;
+        if (un) {
+            ui.addKvs(kv, new String[][]{
+                    {"操作", jm.titleOf(m)},
+                    {"设备", d.model + (d.endpoint != null ? "（" + d.endpoint + "）" : "")},
+                    {"卸载计划", jm.unSummary != null ? jm.unSummary : "-"},
+            });
+        } else if (mi) {
             Mu300Internal.Plan mp = jm.muPlan;
             String target = m == JobManager.Method.REPART || m == JobManager.Method.RESUME
                     ? "/dev/block/" + (mp != null && mp.s.root != null ? mp.s.root : "?") + "（mu300root，" + jm.chosenMib + " MiB）"
@@ -852,14 +888,38 @@ public class MainActivity extends Activity implements JobManager.Listener {
             });
         }
         card.addView(kv, ui.mw(6));
-        if (m != JobManager.Method.TF && m != JobManager.Method.REPART && m != JobManager.Method.RESUME) addSizePicker(card, m, idle);
+        if (un && jm.uninstallWipe()) {
+            CheckBox rst = new CheckBox(this);
+            rst.setText("格式化 userdata（恢复出厂）后卸载");
+            rst.setTextColor(ui.danger);
+            rst.setTextSize(13.5f);
+            rst.setButtonTintList(ColorStateList.valueOf(ui.danger));
+            rst.setChecked(jm.unResetOk);
+            rst.setEnabled(idle);
+            rst.setOnCheckedChangeListener((b, v) -> { confirmed = false; jm.setUninstallReset(v); });
+            card.addView(rst, ui.mw(8));
+            card.addView(ui.text("无法保留 Android 数据卸载，是否格式化？默认不勾选。格式化会清空 Android 应用、账号、照片和内部存储；开始前还要输入“清空数据”确认。"
+                    + "分区归属或布局无法确认这类错误不能靠同意格式化绕过。", 12, ui.muted, false), ui.mw(2));
+        }
+        if (!un && m != JobManager.Method.TF && m != JobManager.Method.REPART && m != JobManager.Method.RESUME) addSizePicker(card, m, idle);
         View pad = new View(this);
         card.addView(pad, new LinearLayout.LayoutParams(1, ui.dp(10)));
         add(card, 12);
 
         String impact;
-        boolean wipe = m == JobManager.Method.PART && jm.route() == JobManager.Route.FORMAT;
-        if (wipe && mi)
+        boolean wipe = (m == JobManager.Method.PART && jm.route() == JobManager.Route.FORMAT) || jm.uninstallWipe();
+        if (un && jm.unResume != null)
+            impact = "继续上次未完成的卸载：先核对是同一台设备（eMMC CID、Android 槽位），再按记录检查离线卸载是否完成，必要时重新写入扩容请求，"
+                    + "最后校验 Android 容量、清除卸载用的启动请求并把 Linux 槽恢复为 Android 启动镜像。不会创建新的卸载计划。";
+        else if (un && wipe)
+            impact = "删除 OpenWrt 分区（含 OpenWrt 系统和全部设置，请先在 OpenWrt 里导出配置），并格式化 userdata：Android 应用、账号、照片和内部存储全部清空，相当于恢复出厂。"
+                    + "开始前先把 GPT、misc 和启动镜像备份到本应用并保存卸载记录；写入离线卸载请求后目标设备重启，离线改分区表，再进入 Recovery 清除数据。"
+                    + "完成 Android 设置后重新打开 ADB、重新安装 Magisk（面具）并给 Shell 授予 root，再回到本应用选“卸载并归还空间”完成收尾。期间保持供电。";
+        else if (un)
+            impact = "删除 OpenWrt 分区（含 OpenWrt 系统和全部设置，请先在 OpenWrt 里导出配置）。与 userdata 相邻时空间还给 Android 并离线扩容 data 文件系统（保留 Android 数据），"
+                    + "不相邻时释放为未分配空间。开始前先把 GPT、misc 和启动镜像备份到本应用并保存卸载记录；写入离线卸载请求后目标设备会重启，离线完成后回到 Android。"
+                    + "期间保持供电；如果设备一直停在 Android，请手动重启一次。之后重新连接，再选“卸载并归还空间”完成收尾检查。";
+        else if (wipe && mi)
             impact = "格式化 userdata：Android 数据全部清空（应用、照片、聊天记录、设置都会丢失，相当于恢复出厂）。先把 GPT、misc 和两槽启动链备份到本应用目录并保存续装记录；"
                     + "随后自动重启，开机时离线缩小 userdata、新建 mu300root 分区，并让 Android 重新初始化。完成 Android 设置后重新打开 ADB、重新安装 Magisk（面具）并给 Shell 授予 root，"
                     + "再在「安装方式」页选“继续格式化后的安装”写入 OpenWrt。期间不要断电。";
@@ -894,7 +954,10 @@ public class MainActivity extends Activity implements JobManager.Listener {
             impact = "在 userdata 中新建 OpenWrt 镜像文件（占用所选大小的空间），不格式化 userdata；已有镜像会被移到 /data/e5linux/previous.* 保留。"
                     + "此方式为实验性。";
         add(ui.notice("!", wipe ? "数据影响 · Android 数据全部清空" : "数据影响", impact, 1), 10);
-        if (mi)
+        if (un)
+            add(ui.notice("i", "步骤顺序（与电脑端相同）", "只读检查 → 备份 GPT / misc / 启动镜像到本应用 → 上传离线卸载启动镜像与维护工具并校验 → 写入 Linux 槽和 misc 启动请求 → "
+                    + "目标设备重启离线卸载 → 回到 Android 后重新连接继续：校验容量、清除启动请求、恢复 Linux 槽为 Android 启动镜像。关闭本应用或断开连接不会撤销已写入的离线卸载请求。", 0), 8);
+        else if (mi)
             add(ui.notice("i", "共同步骤", "从本机提取厂商固件放入 OpenWrt；在本应用内为 boot_" + linux + " 生成启动镜像，写入前备份、写入后回读校验，"
                     + "并设置下次从 Linux 槽启动（失败会回到 Android）；当前 Android 槽、NV 均不写入。"
                     + (m == JobManager.Method.PART ? "需要缩容时会自动重启，否则需手动重启。" : "完成后需手动重启。"), 0), 8);
@@ -911,7 +974,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
         cb.setEnabled(idle);
         cb.setOnCheckedChangeListener((b, v) -> { confirmed = v; refreshStart(); });
         add(cb, 10);
-        startBtn = ui.button("确认并开始安装 →", 2, v -> confirmInstall());
+        startBtn = ui.button(un ? (jm.unResume != null ? "继续卸载 →" : "确认并开始卸载 →") : "确认并开始安装 →", 2, v -> confirmInstall());
         add(startBtn, 8);
         refreshStart();
         if (!match) add(ui.text(why + "，禁止安装。", 13, ui.danger, true), 6);
@@ -1032,9 +1095,9 @@ public class MainActivity extends Activity implements JobManager.Listener {
         JobManager.Device d = jm.target();
         boolean match = jm.modelMatches();
         JobManager.Method m = jm.method;
-        boolean noSize = m == JobManager.Method.TF || m == JobManager.Method.REPART || m == JobManager.Method.RESUME;
+        boolean noSize = m == JobManager.Method.TF || m == JobManager.Method.REPART || m == JobManager.Method.RESUME || m == JobManager.Method.UNINSTALL;
         startBtn.setEnabled(jm.busy == null && jm.checkPassed() && match && confirmed
-                && (noSize || sizeValid) && (m != JobManager.Method.PART || jm.installBlocker() == null));
+                && (noSize || sizeValid) && ((m != JobManager.Method.PART && m != JobManager.Method.UNINSTALL) || jm.installBlocker() == null));
     }
 
     // ------------------------------------------------------------ 5 安装
@@ -1056,7 +1119,14 @@ public class MainActivity extends Activity implements JobManager.Listener {
         bar.setProgressTintList(ColorStateList.valueOf(ui.primary));
         card.addView(bar, ui.mw(6));
         addStepAndStop(card);
-        if ("running".equals(jm.lastJob) && idle)
+        boolean unJob = jm.installedMethod == JobManager.Method.UNINSTALL;
+        if (unJob && idle && jm.unOutcome != null && !jm.unOutcome.complete)
+            card.addView(ui.notice("i", "卸载尚未完成", jm.unOutcome.message + (jm.unOutcome.next != null ? "\n" + jm.unOutcome.next : "")
+                    + "\n卸载记录与备份：" + jm.uninstallRoot() + "（不要删除）", 0), ui.mw(8));
+        else if (unJob && idle && jm.lastJob.startsWith("done") && !"done 0".equals(jm.lastJob))
+            card.addView(ui.notice("!", "卸载已停止", "详细原因见下方日志。卸载记录与备份保存在 " + jm.uninstallRoot() + "，不要删除；"
+                    + "处理后重新连接目标设备，到「安装方式」选“卸载并归还空间”重新检查，会自动接上记录。", 1), ui.mw(8));
+        else if ("running".equals(jm.lastJob) && idle)
             card.addView(ui.notice("i", "有后台安装任务", "安装在目标设备上后台运行，与本界面或网络连接无关。点“继续未完成的安装”查看进度。", 0), ui.mw(8));
         else if (jm.lastJob.startsWith("done") && !"done 0".equals(jm.lastJob) && idle && jm.muInternal(jm.installedMethod))
             card.addView(ui.notice("!", "上次安装失败", "启动镜像写入前失败时不会切换启动槽，Android 照常启动。详细原因见下方日志"
@@ -1091,6 +1161,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
             return;
         }
         if (jm.stage1 && jm.muOutcome != null) { stage1Page(); return; }
+        if (jm.installedMethod == JobManager.Method.UNINSTALL) { uninstallDonePage(); return; }
         boolean mi = jm.muInternal(jm.installedMethod);
         boolean part = mi ? jm.muOutcome != null && jm.muOutcome.pending : jm.installedMethod == JobManager.Method.PART;
         pageTitle("步骤 6 · 完成", part ? (mi ? "设备正在重启并离线完成安装" : "已就绪：重启后离线完成安装") : "安装完成", null);
@@ -1131,6 +1202,24 @@ public class MainActivity extends Activity implements JobManager.Listener {
         add(card, 12);
     }
 
+    private void uninstallDonePage() {
+        pageTitle("步骤 6 · 完成", "卸载完成，空间已归还", null);
+        LinearLayout card = ui.card();
+        LinearLayout r = ui.row();
+        TextView ok = ui.text("✓", 18, ui.onPrimary, true);
+        ok.setGravity(Gravity.CENTER);
+        ok.setBackground(ui.circle(ui.primary, 0));
+        r.addView(ok, new LinearLayout.LayoutParams(ui.dp(34), ui.dp(34)));
+        TextView t = ui.text(jm.unOutcome != null ? jm.unOutcome.message : "卸载已完成", 15, ui.text, true);
+        t.setPadding(ui.dp(12), 0, 0, 0);
+        r.addView(t, ui.weight(1));
+        card.addView(r, ui.mw(14));
+        card.addView(ui.text(jm.unOutcome != null && jm.unOutcome.next != null ? jm.unOutcome.next
+                : "卸载记录与分区备份保留在 " + jm.uninstallRoot() + "，可在「使用说明 → 清理本机占用」导出为 ZIP 后再删除。", 13, ui.muted, false), ui.mw(8));
+        View pad = new View(this);
+        card.addView(pad, new LinearLayout.LayoutParams(1, ui.dp(10)));
+        add(card, 12);
+    }
     /** Done page after the first stage of a "format userdata" install: the target is resetting Android. */
     private void stage1Page() {
         pageTitle("步骤 6 · 完成", "第一阶段完成：目标设备正在重启并清空 Android 数据", null);
@@ -1237,12 +1326,15 @@ public class MainActivity extends Activity implements JobManager.Listener {
         JobManager.Method m = jm.method;
         String what;
         boolean mi = jm.muInternal(m);
-        boolean wipe = m == JobManager.Method.PART && jm.route() == JobManager.Route.FORMAT;
-        if (m == JobManager.Method.PART && jm.installBlocker() != null) {
+        boolean un = m == JobManager.Method.UNINSTALL;
+        boolean wipe = (m == JobManager.Method.PART && jm.route() == JobManager.Route.FORMAT) || jm.uninstallWipe();
+        if ((m == JobManager.Method.PART || un) && jm.installBlocker() != null) {
             Toast.makeText(this, jm.installBlocker(), Toast.LENGTH_LONG).show();
             return;
         }
-        if (wipe) what = "【Android 数据全部清空】备份分区表与启动链并保存续装记录，随后重启：离线缩小 userdata、新建 " + jm.chosenMib
+        if (un && jm.unResume != null) what = "继续未完成的卸载（" + jm.unResume.getName() + "）：核对设备与记录，完成收尾检查";
+        else if (un) what = (wipe ? "【Android 数据全部清空】" : "") + "备份 GPT、misc 与启动镜像，写入离线卸载请求并重启目标设备。\n" + (jm.unSummary != null ? jm.unSummary : "");
+        else if (wipe) what = "【Android 数据全部清空】备份分区表与启动链并保存续装记录，随后重启：离线缩小 userdata、新建 " + jm.chosenMib
                 + " MiB 的 " + (mi ? "mu300root" : "e5root") + " 分区，并格式化 userdata（恢复出厂）。Android 重新设置后，需要重新打开 ADB、重新安装 Magisk（面具）并给 Shell 授予 root，"
                 + "再选“继续格式化后的安装”写入 OpenWrt";
         else if (m == JobManager.Method.RESUME) what = "把 OpenWrt 写入第一阶段准备好的分区（" + (jm.resumeInfo != null ? jm.resumeInfo : "续装记录") + "）";
@@ -1260,17 +1352,17 @@ public class MainActivity extends Activity implements JobManager.Listener {
         final String word = wipe ? "清空数据" : "yes";
         String msg = "目标设备：" + d.model + (d.endpoint != null ? "（" + d.endpoint + "）" : "（本机）")
                 + "\n安装包：" + p.version + "\n安装方式：" + jm.titleOf(m) + "\n\n将要：" + what
-                + (wipe ? "。" : "，写入 boot 并设置下次从 OpenWrt 槽试启动。") + "\n\n期间保持供电，不要关机" + (m == JobManager.Method.TF ? "或拔卡" : "")
+                + (un ? "。" : wipe ? "。" : "，写入 boot 并设置下次从 OpenWrt 槽试启动。") + "\n\n期间保持供电，不要关机" + (m == JobManager.Method.TF ? "或拔卡" : "")
                 + (jm.mode == JobManager.Mode.LAN ? (mi ? "；安装期间保持 USB 或网络连接" : "；网络或 USB 断开不影响目标设备上的后台任务") : "") + "。\n\n输入 " + word + " 确认：";
         final EditText input = new EditText(this);
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         input.setHint(word);
         AlertDialog dlg = new AlertDialog.Builder(this)
-                .setTitle((wipe ? "确认清空 Android 数据并安装 · " : "确认安装 · ") + jm.titleOf(m))
+                .setTitle(un ? (wipe ? "确认清空 Android 数据并卸载" : "确认卸载 OpenWrt") : (wipe ? "确认清空 Android 数据并安装 · " : "确认安装 · ") + jm.titleOf(m))
                 .setMessage(msg)
                 .setView(input)
                 .setNegativeButton("取消", null)
-                .setPositiveButton("开始安装", (x, w) -> {
+                .setPositiveButton(un ? "开始卸载" : "开始安装", (x, w) -> {
                     if (word.equals(input.getText().toString().trim())) jm.runInstall();
                 })
                 .create();

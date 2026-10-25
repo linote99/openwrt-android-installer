@@ -404,7 +404,7 @@ final class E5Part {
         p.hasTools = sizes.containsKey("files/ext4-tools.tar");
         p.hasPartWrite = sizes.containsKey("files/part-write.sh");
         Long bootSize = sizes.get("files/boot.img");
-        if (bootSize == null || bootSize < 4096 || bootSize > PERSIST) throw new IOException("staged package has no usable files/boot.img");
+        if (bootSize == null || bootSize < 4096 || bootSize > (64L << 20)) throw new IOException("staged package has no usable files/boot.img");
         if (p.imageSha == null || !sizes.containsKey("files/openwrt.ext4.gz")) throw new IOException("staged package has no listed files/openwrt.ext4.gz");
         p.boot = Mu300Internal.read(io, "cat " + q(files + "boot.img"), bootSize);
         p.bootSha = sha(p.boot);
@@ -606,7 +606,7 @@ final class E5Part {
         String token = Mu300Internal.token(16);
         LinkedHashMap<String, Object> state = new LinkedHashMap<>();
         state.put("version", 2L); state.put("phase", "prepared"); state.put("token", token);
-        state.put("serial", serial(io)); state.put("model", model(io)); state.put("data", data.json());
+        state.put("serial", serial(io)); state.put("model", model(io)); state.put("transport", io.transport()); state.put("data", data.json());
         state.put("android_slot", sl[0]); state.put("linux_slot", sl[1]);
         state.put("target", dataMib * 2048); state.put("need", partMib * 2048); state.put("grow", (long) grow);
         state.put("boot_sha", pkg.bootSha); state.put("image_sha", pkg.imageSha); state.put("raw_size", pkg.rawSize);
@@ -670,8 +670,11 @@ final class E5Part {
         Map<String, Object> state = load(path);
         try { validateState(state); } catch (IllegalArgumentException e) { throw new IOException(e.getMessage()); }
         String[] sl = slots(io);
-        if (!sl[0].equals(state.getOrDefault("android_slot", "a")) || !sl[1].equals(state.getOrDefault("linux_slot", "b")))
+        if (!sl[0].equals(state.getOrDefault("android_slot", "a")) || !sl[1].equals(state.getOrDefault("linux_slot", "b"))) {
+            if (Rebind.switching(state, io.transport()))
+                throw new Uninstall.Refused(Rebind.MISMATCH + "（Android 槽位 记录 _" + state.getOrDefault("android_slot", "a") + " / 现在 _" + sl[0] + "）；未做任何修改");
             throw new IOException("Android/Linux slots changed since preparation; installation not resumed");
+        }
         if (!model(io).equals(str(state, "model"))) throw new IOException("wrong device");
         if (!pkg.bootSha.equals(str(state, "boot_sha")) || !pkg.imageSha.equals(str(state, "image_sha")))
             throw new IOException("different installation package: 请载入第一阶段时用的同一个安装包");
@@ -795,7 +798,7 @@ final class E5Part {
         String token = Mu300Internal.token(16);
         LinkedHashMap<String, Object> state = new LinkedHashMap<>();
         state.put("version", 2L); state.put("phase", "writing"); state.put("token", token);
-        state.put("serial", serial(io)); state.put("model", model(io));
+        state.put("serial", serial(io)); state.put("model", model(io)); state.put("transport", io.transport());
         state.put("android_slot", sl[0]); state.put("linux_slot", sl[1]);
         state.put("data", r.data.json()); state.put("target", r.data.size); state.put("need", r.root.size); state.put("grow", (long) grow);
         state.put("boot_sha", pkg.bootSha); state.put("image_sha", pkg.imageSha); state.put("raw_size", pkg.rawSize);
@@ -817,9 +820,18 @@ final class E5Part {
             return outcome(false, "这个事务已经完成，不需要重跑：" + path, "");
         try { validateState(state); } catch (IllegalArgumentException e) { throw new IOException(e.getMessage()); }
         String[] sl = slots(io);
-        if (!sl[0].equals(state.getOrDefault("android_slot", "a")) || !sl[1].equals(state.getOrDefault("linux_slot", "b")))
+        if (!sl[0].equals(state.getOrDefault("android_slot", "a")) || !sl[1].equals(state.getOrDefault("linux_slot", "b"))) {
+            if (Rebind.switching(state, io.transport()))
+                throw new Uninstall.Refused(Rebind.MISMATCH + "（Android 槽位 记录 _" + state.getOrDefault("android_slot", "a") + " / 现在 _" + sl[0] + "）；未做任何修改");
             throw new IOException("Android/Linux slots changed since preparation; installation not resumed");
-        if (!serial(io).equals(str(state, "serial")) || !model(io).equals(str(state, "model"))
+        }
+        String mismatch = Rebind.diff("序列号", str(state, "serial"), serial(io), "型号", str(state, "model"), model(io));
+        // adb_connect / rebind: continuing over another connection needs the same device and slots.
+        if (Rebind.apply(state, io.transport(), io.ready(), mismatch, System.currentTimeMillis() / 1000)) {
+            save(path, state);
+            if (state.get("transport_history") != null) io.log("已改用新的连接继续：" + io.transport() + "（设备身份核对一致，已记入连接历史）");
+        }
+        if (mismatch != null
                 || !pkg.bootSha.equals(str(state, "boot_sha")) || !pkg.imageSha.equals(str(state, "image_sha")))
             throw new IOException("wrong device or different installation package / 设备或安装包与事务记录不符");
         Map<String, Row> rows = probe(io);

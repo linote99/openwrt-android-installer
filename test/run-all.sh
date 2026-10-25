@@ -11,7 +11,8 @@ summary=()
 note() { summary+=("$1"); echo "== $1"; }
 
 MUJ="$J/Mu300Internal.java $J/Mu300Gpt.java $J/Mu300Boot.java $J/Lz4.java $J/RootfsFilter.java"
-javac -encoding UTF-8 -nowarn -d "$B/cls" $J/MiniJson.java $J/PackageInspector.java $MUJ test/DesktopInspect.java test/RuleTest.java test/Mu300FlowTest.java 2>&1 | grep -v '^Note'
+AJ=$(ls -d "${ANDROID_HOME:-/workspace/.android-sdk}"/platforms/android-35/android.jar 2>/dev/null)
+javac -encoding UTF-8 -nowarn -cp "$AJ" -sourcepath app/src/main/java:build/gen -d "$B/cls" $J/MiniJson.java $J/PackageInspector.java $MUJ test/DesktopInspect.java test/RuleTest.java test/Mu300FlowTest.java 2>&1 | grep -v '^Note'
 java -cp "$B/cls" top.linote.owrtinstaller.RuleTest > "$B/rule.txt" 2>&1; note "RuleTest rc=$? $(tail -1 "$B/rule.txt")"
 bash test/version-check.sh > "$B/version.txt" 2>&1; note "version-check rc=$? $(tail -1 "$B/version.txt")"
 bash test/ui-check.sh > "$B/ui.txt" 2>&1; note "ui-check rc=$? $(tail -1 "$B/ui.txt")"
@@ -91,6 +92,39 @@ else
   note "UsbBackupTest rc=1 FAIL: run ./build.sh first (needs build/gen and android.jar)"
 fi
 
+if [ -n "$AJ" ] && [ -f build/gen/top/linote/owrtinstaller/BuildInfo.java ]; then
+  rm -rf "$B/unt" "$B/unt-work"; mkdir -p "$B/unt"
+  javac -encoding UTF-8 -nowarn -cp "$AJ" -sourcepath app/src/main/java:build/gen -d "$B/unt" test/UninstallTest.java 2>&1 | grep -v '^Note'
+  E5Z=$(ls "$Z"/e5-openwrt-*.zip 2>/dev/null | head -1); MUZ=$(ls "$Z"/mu300-openwrt-*.zip 2>/dev/null | head -1)
+  timeout 600 java -Xmx2g -cp "$B/unt:$AJ" top.linote.owrtinstaller.UninstallTest "$B/unt-work" "$E5Z" "$MUZ" > "$B/uninstall.txt" 2>&1
+  note "UninstallTest rc=$? $(tail -1 "$B/uninstall.txt")"
+else
+  note "UninstallTest rc=1 FAIL: run ./build.sh first (needs build/gen and android.jar)"
+fi
+# command-level uninstall lifecycle against a mock target (both families)
+if [ -n "$AJ" ] && [ -f build/gen/top/linote/owrtinstaller/BuildInfo.java ]; then
+  rm -rf "$B/unf" "$B/unf-work"; mkdir -p "$B/unf"
+  javac -encoding UTF-8 -nowarn -cp "$AJ" -sourcepath app/src/main/java:build/gen -d "$B/unf" test/UninstallFlowTest.java 2>&1 | grep -v '^Note'
+  timeout 600 java -Xmx2g -cp "$B/unf:$AJ" top.linote.owrtinstaller.UninstallFlowTest "$B/unf-work" "$E5Z" "$MUZ" > "$B/uninstallflow.txt" 2>&1
+  note "UninstallFlowTest rc=$? $(tail -1 "$B/uninstallflow.txt")"
+else
+  note "UninstallFlowTest rc=1 FAIL: run ./build.sh first (needs build/gen and android.jar)"
+fi
+# readiness ladder + rebind (pure logic) and the debugging-authorisation wait (mock adbd)
+if [ -d build/gen ] && [ -f "$AJ" ]; then
+  javac -encoding UTF-8 -nowarn -cp "$AJ" -sourcepath app/src/main/java:build/gen -d "$B/tp" test/TargetProbeTest.java 2>&1 | grep -v '^Note'
+  java -cp "$B/tp:$AJ" top.linote.owrtinstaller.TargetProbeTest > "$B/targetprobe.txt" 2>&1; note "TargetProbeTest rc=$? $(tail -1 "$B/targetprobe.txt")"
+else
+  note "TargetProbeTest rc=1 FAIL: run ./build.sh first (needs build/gen and android.jar)"
+fi
+javac -encoding UTF-8 -nowarn -d "$B/aw" $J/AdbConnection.java $J/AdbKey.java test/AuthWaitTest.java 2>&1 | grep -v '^Note'
+mkdir -p "$B/aw-r1" "$B/aw-r2" "$B/aw-work"
+MOCK_MODE=auth-slow python3 test/mock-adbd.py 15571 "$B/aw-r1" > "$B/adbd-aw1.log" 2>&1 & W1=$!
+MOCK_MODE=auth-wait python3 test/mock-adbd.py 15572 "$B/aw-r2" > "$B/adbd-aw2.log" 2>&1 & W2=$!
+sleep 1.5
+timeout 60 java -cp "$B/aw" top.linote.owrtinstaller.AuthWaitTest slow 15571 "$B/aw-work" > "$B/aw1.txt" 2>&1; note "AuthWaitTest(allow later) rc=$? $(tail -1 "$B/aw1.txt")"
+timeout 60 java -cp "$B/aw" top.linote.owrtinstaller.AuthWaitTest wait 15572 "$B/aw-work" > "$B/aw2.txt" 2>&1; note "AuthWaitTest(stop) rc=$? $(tail -1 "$B/aw2.txt")"
+kill $W1 $W2 2>/dev/null; wait $W1 $W2 2>/dev/null
 for t in mock-helper-test.sh mock-userdata-test.sh mock-mu300-test.sh; do
   sudo bash "test/$t" > "$B/$t.txt" 2>&1; note "$t rc=$? $(tail -1 "$B/$t.txt")"
 done

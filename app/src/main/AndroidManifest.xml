@@ -32,6 +32,10 @@
             android:name=".AboutActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
             android:exported="false" />
+        <activity
+            android:name=".CleanupActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
+            android:exported="false" />
         <service
             android:name=".InstallService"
             android:exported="false"

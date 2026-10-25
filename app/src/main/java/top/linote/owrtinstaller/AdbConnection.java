@@ -165,6 +165,15 @@ final class AdbConnection implements AutoCloseable {
         }
     }
 
+    /** The device has our key but the user has not (yet) allowed debugging: keep waiting. */
+    static final class AuthPending extends IOException { AuthPending(String m) { super(m); } }
+    /** Retrying cannot help (e.g. a TLS-only wireless debugging port). */
+    static final class Permanent extends IOException { Permanent(String m) { super(m); } }
+
+    /** Asked between polls while waiting for the user's authorisation; true = give up now. */
+    static volatile java.util.function.BooleanSupplier abort;
+    private long authDeadline;
+
     private void handshake(AdbKey key, String keyName, AuthListener l) throws IOException {
         // Over USB the device may still hold packets of an earlier session (one that was force-stopped or
         // whose cable was pulled) in its IN queue: read them away before saying hello.
@@ -186,6 +195,13 @@ final class AdbConnection implements AutoCloseable {
                 send(A_CNXN, VERSION, MY_MAX, "host::\0".getBytes(StandardCharsets.UTF_8));
                 continue;
             } catch (SocketTimeoutException e) {
+                // Waiting for the user to allow debugging: poll the stop request every 2 s for up to 120 s.
+                if (sentKey && System.currentTimeMillis() < authDeadline) {
+                    java.util.function.BooleanSupplier a = abort;
+                    if (a == null || !a.getAsBoolean()) continue;
+                    throw new AuthPending("已停止等待调试授权");
+                }
+                if (sentKey) throw new AuthPending("等待设备授权超时：请在目标设备屏幕上点“允许”");
                 throw new IOException(sentKey ? "等待设备授权超时：请在目标设备屏幕上点“允许”后重试"
                         : (port > 0 ? "设备没有响应 ADB 握手（端口可能不是无线 ADB）" : "设备没有响应 USB ADB 握手（请确认目标设备已开启 USB 调试）"));
             }
@@ -195,7 +211,7 @@ final class AdbConnection implements AutoCloseable {
                 setTimeout(0);
                 return;
             } else if (p.cmd == A_STLS) {
-                throw new IOException("该端口要求 Android 11+ 无线调试配对（TLS），本应用暂不支持；"
+                throw new Permanent("该端口要求 Android 11+ 无线调试配对（TLS），本应用暂不支持；"
                         + "请改用经典无线 ADB（5555 端口，例如目标设备 root 后执行 setprop service.adb.tcp.port 5555 并重启 adbd）");
             } else if (p.cmd == A_AUTH && p.arg0 == AUTH_TOKEN) {
                 if (!signed) {
@@ -205,9 +221,10 @@ final class AdbConnection implements AutoCloseable {
                     sentKey = true;
                     send(A_AUTH, AUTH_RSAPUBLICKEY, 0, key.publicKeyPayload(keyName));
                     if (l != null) l.waitingForUser(key.fingerprint());
-                    setTimeout(120000);
+                    authDeadline = System.currentTimeMillis() + 120000;
+                    setTimeout(2000);
                 } else {
-                    throw new IOException("设备拒绝了授权");
+                    throw new AuthPending("设备拒绝了授权");
                 }
             } else if (p.cmd == A_CLSE || p.cmd == A_OKAY || p.cmd == A_WRTE || p.cmd == A_OPEN || p.cmd == A_SYNC) {
                 // Stream traffic of an earlier session (e.g. CLSE of a stream it never closed): not for us.

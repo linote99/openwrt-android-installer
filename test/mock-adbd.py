@@ -12,7 +12,7 @@ AOSP system/core/adb/protocol.txt and SYNC.TXT:
   * sync:        -> SEND path,mode / DATA / DONE -> OKAY, QUIT.  Files land under ROOT.
 Usage: mock-adbd.py PORT ROOT [maxdata]
 """
-import base64, hashlib, os, socket, struct, subprocess, sys, threading
+import base64, hashlib, os, socket, struct, subprocess, sys, threading, time
 from cryptography.hazmat.primitives.asymmetric import rsa, padding, utils
 from cryptography.hazmat.primitives import hashes
 
@@ -94,6 +94,11 @@ class Conn:
         key = parse_android_pubkey(b64)
         key.verify(sig, token, padding.PKCS1v15(), utils.Prehashed(hashes.SHA1()))
         L("public key OK, name=%s, signature verifies" % name)
+        if MODE == "auth-slow":                  # the user taps "allow" after 5 s
+            time.sleep(5)
+        if MODE == "auth-wait":                  # the user never answers
+            while True:
+                time.sleep(1)
         self.send(A_CNXN, 0x01000001, MAXDATA,
                   b"device::ro.product.name=mock;ro.product.model=E5;ro.product.device=e5;features=shell_v2,cmd\0")
         while True:

@@ -480,7 +480,7 @@ public class Mu300FlowTest {
         ok(joinedC.contains("安装路径：格式化 userdata") && joinedC.contains("userdata 已加密"), "C log names the route and the reason");
         ok(o.next.contains("重新打开 ADB") && o.next.contains("重新安装 Magisk（面具）") && o.next.contains("给 Shell 授予 root")
                 && o.next.contains("“继续格式化后的安装”") && !o.next.contains("【高级】") && !o.next.contains("高级功能") && o.next.contains("5555")
-                && joinedC.contains("  1. 完成 Android 首次设置") && joinedC.contains("  5. 用本应用重新连接目标设备")
+                && joinedC.contains("  1. 完成 Android 首次设置") && joinedC.contains("  3. 在目标设备上允许本应用的调试授权") && joinedC.contains("  5. 在超级用户请求里允许“Shell”")
                 && joinedC.contains("允许“Shell”"), "C (v1.5.2) stage one tells to reopen ADB, reinstall Magisk and grant Shell root: " + o.next);
         File txDir = null;
         for (File f : backups.listFiles()) if (new File(f, "transaction.json").isFile() && (txDir == null || f.lastModified() >= txDir.lastModified())) txDir = f;

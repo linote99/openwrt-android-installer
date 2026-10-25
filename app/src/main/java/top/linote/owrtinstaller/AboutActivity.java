@@ -121,6 +121,11 @@ public final class AboutActivity extends Activity {
         para("1. 设备：选择“本机”（本机需 root），或“其他设备”——用 OTG 线有线连接（USB 调试），"
                 + "或同一局域网的无线 ADB（5555 端口）。连接其他设备时本机无需 root，但目标设备需要已 root；"
                 + "首次连接请在目标设备上允许调试，并在其 root 管理器中允许 Shell 的超级用户请求。");
+        para("  连接后按电脑端的顺序逐项检测：是否已开机、是否允许了 USB 调试、开机向导是否走完、是否有 root"
+                + "（adbd 本身是 root，或 su / /debug_ramdisk/su / /sbin/su 授权给 Shell）。没就绪时设备页会说明缺哪一步"
+                + "（面具没装 / 已有 su 但 Shell 未授权 / 未允许调试 / 开机向导未完成 / 正在开机），每 3 秒自动重试，"
+                + "在目标设备上操作完会自动往下走，不想等可以点“停止”。本机模式只检查本机 root。");
+        para("  续装或卸载等待目标设备时可以换连接方式（USB ↔ 局域网、换 IP）：会核对 eMMC CID 和槽位，确认是同一台设备才接着做。");
         para("2. 安装包：选择与目标设备匹配的完整 ZIP，不用解压。应用会逐个校验 ZIP 内所有文件的 SHA-256。");
         para("3. 安装方式：TF 卡或独立内置分区，以机型支持为准；重装已有内置分区、userdata 镜像（实验性）在“高级功能”里，见本页底部。");
         para("4. 检查与计划：先做只读检查，不写入任何分区；核对“数据影响”，勾选确认并输入 yes 后才开始安装"
@@ -168,6 +173,21 @@ public final class AboutActivity extends Activity {
         para("• userdata 镜像安装【实验性】：在 userdata 里创建 OpenWrt 镜像，不格式化 userdata，仅限未加密的 userdata。"
                 + "userdata 镜像是实验性功能，可能损坏 Android F2FS 文件系统，建议优先选择 TF 卡或独立内置分区。");
 
+        para("• 卸载并归还空间【高级】：删除内置 OpenWrt 分区（e5root / mu300root），与 userdata 相邻时把空间还给 Android 并离线扩容，"
+                + "不相邻时释放为未分配空间。只能通过 USB / 局域网操作另一台设备，本机模式不提供。卸载前先在 OpenWrt 里导出配置，"
+                + "切回 Android，开启 USB 调试或无线 ADB 并给 Shell 授予 root。");
+        para("  只读检查会核对分区表、已安装的启动镜像和设备上的安装标记，并显示 Android 容量、归还 Android 的空间、释放为空闲的空间。"
+                + "只有 userdata 未加密、data 直接在 userdata 上且工具支持时才保留 Android 数据；否则说明原因，"
+                + "需要勾选“格式化 userdata（恢复出厂）后卸载”并输入“清空数据”才会继续——格式化会清空 Android 应用、账号、照片和内部存储。"
+                + "分区归属或布局无法确认这类错误不能靠同意格式化绕过。TF 卡、userdata 镜像安装不使用这个入口。");
+        para("  顺序与电脑端相同：备份 GPT / misc / 启动镜像到本应用 → 上传并校验离线卸载启动镜像 → 写入启动请求 → 目标设备重启离线卸载。"
+                + "设备若一直停在 Android，请手动重启一次；恢复出厂后先完成 Android 设置，重新打开 ADB、重新安装 Magisk（面具）并给 Shell 授予 root。"
+                + "然后重新连接，选“卸载并归还空间”重新检查，会自动接上记录完成收尾。关闭本应用不会撤销已写入的卸载请求；记录和备份保留在本应用。");
+        section("清理本机占用");
+        para("只清理这台手机上本应用占用的空间（分区备份、卸载记录、解出的安装文件、生成的启动镜像、日志），不连接目标设备。"
+                + "分区备份与卸载记录须先导出为 ZIP 并回读校验通过才能删除；未完成的续装 / 卸载记录和 ADB 授权密钥不会删除。");
+        TextView clean = ui.button("打开「清理本机占用」", 0, v -> startActivity(new android.content.Intent(this, CleanupActivity.class)));
+        body.addView(clean, ui.mw(8));
         section("友情链接");
         link(R.drawable.linote_logo, "Lino 笔记", "https://www.linote.top/", false);
         link(R.drawable.github_invertocat, "GitHub 主页", "https://github.com/linote99", true);
