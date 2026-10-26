@@ -42,7 +42,8 @@ final class InstallEvidence {
             if (sb[56] != 'S' || (sb[57] & 0xff) != 0xef) throw new IllegalArgumentException("OpenWrt partition is not ext4 / OpenWrt 分区不是 ext4");
             long log = u32(sb, 24); incompat = u32(sb, 96); int state = u16(sb, 58);
             if (log > 2 || (incompat & ~0x22C2L) != 0 || state != 1)
-                throw new IllegalArgumentException("OpenWrt filesystem is unclean or unsupported; boot and shut it down cleanly first / OpenWrt 文件系统未正常卸载或布局不受支持，请先启动 OpenWrt 并正常切回 Android");
+                throw new IllegalArgumentException("OpenWrt filesystem is unclean or unsupported; boot and shut it down cleanly first / OpenWrt 文件系统未正常卸载或布局不受支持，请先启动 OpenWrt 并正常切回 Android"
+                        + "\n" + diagnose(sb));
             bs = 1024L << log;
             blocks = u32(sb, 4) | ((incompat & 0x80) != 0 ? u32(sb, 336) << 32 : 0);
             inodes = u32(sb, 0); perGroup = u32(sb, 40); isz = u16(sb, 88);
@@ -52,6 +53,60 @@ final class InstallEvidence {
             if (blocks <= 0 || blocks * bs > capacity || inodes <= 0 || perGroup <= 0 || isz < 128 || isz > bs
                     || Integer.bitCount(isz) != 1 || !(desc == 32 || desc == 64) || zero)
                 throw new IllegalArgumentException("Invalid OpenWrt filesystem geometry or identity / OpenWrt 文件系统几何参数或身份无效");
+        }
+
+        /** Incompat bits ext4 defines (names as e2fsprogs prints them). Allowed by the evidence reader: 0x22C2. */
+        static final long[] INCOMPAT_BITS = {0x1, 0x2, 0x4, 0x8, 0x10, 0x40, 0x80, 0x100, 0x200, 0x400, 0x1000, 0x2000, 0x4000, 0x8000, 0x10000, 0x20000};
+        static final String[] INCOMPAT_NAMES = {"compression", "filetype", "needs_recovery", "journal_dev", "meta_bg", "extent", "64bit",
+                "mmp", "flex_bg", "ea_inode", "dirdata", "metadata_csum_seed", "large_dir", "inline_data", "encrypt", "casefold"};
+
+        static String names(long bits) {
+            StringBuilder s = new StringBuilder();
+            long left = bits;
+            for (int i = 0; i < INCOMPAT_BITS.length; i++) {
+                if ((bits & INCOMPAT_BITS[i]) != 0) { s.append(s.length() == 0 ? "" : ",").append(INCOMPAT_NAMES[i]); left &= ~INCOMPAT_BITS[i]; }
+            }
+            if (left != 0) s.append(s.length() == 0 ? "" : ",").append(String.format("0x%x", left));
+            return s.length() == 0 ? "-" : s.toString();
+        }
+
+        private static String time(long t) {
+            if (t == 0) return "0";
+            java.text.SimpleDateFormat f = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss 'UTC'", java.util.Locale.ROOT);
+            f.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+            return f.format(new java.util.Date(t * 1000));
+        }
+
+        /**
+         * Which of the three conditions failed, with the raw superblock numbers, so an exported log is enough to
+         * tell an unclean shutdown (needs_recovery / state) from a layout this reader does not implement.
+         * Diagnostic only: the decision above is unchanged.
+         */
+        static String diagnose(byte[] sb) {
+            long log = u32(sb, 24), incompat = u32(sb, 96), compat = u32(sb, 92), ro = u32(sb, 100);
+            int state = u16(sb, 58), errors = u16(sb, 60);
+            long bad = incompat & ~0x22C2L;
+            String st = String.format("%04x", state);
+            StringBuilder why = new StringBuilder();
+            if ((state & 2) != 0) why.append("\n  ✗ state=0x").append(st).append("：文件系统带错误标记（ERROR_FS），需要 e2fsck 修复");
+            else if ((state & 1) == 0) why.append("\n  ✗ state=0x").append(st).append("：未标记为干净卸载（VALID_FS 未置位）");
+            else if (state != 1) why.append("\n  ✗ state=0x").append(st).append("：含未知状态位");
+            if ((bad & 0x4) != 0) why.append("\n  ✗ incompat 含 needs_recovery(0x4)：日志未回放，上次关机时 OpenWrt 根分区没有卸载或改为只读");
+            if ((bad & ~0x4L) != 0) why.append("\n  ✗ incompat 含不支持的特性 0x").append(String.format("%x", bad & ~0x4L))
+                    .append("（").append(names(bad & ~0x4L)).append("）：布局不受支持，不是关机问题");
+            if (log > 2) why.append("\n  ✗ log_block_size=").append(log).append("：块大小超过 4096 字节");
+            int n = 0; while (n < 64 && sb[136 + n] != 0) n++;
+            return "超级块（分区内偏移 1024）：state=0x" + st
+                    + " incompat=0x" + String.format("%08x", incompat) + "（" + names(incompat) + "）"
+                    + " 不允许的位=0x" + String.format("%x", bad)
+                    + " log_block_size=" + log
+                    + " compat=0x" + String.format("%08x", compat) + " ro_compat=0x" + String.format("%08x", ro)
+                    + " errors_behavior=" + errors
+                    + " mount_count=" + u16(sb, 52) + "/" + (short) u16(sb, 54)
+                    + " last_mount=" + time(u32(sb, 44)) + " last_write=" + time(u32(sb, 48))
+                    + " last_mounted_on=" + (n == 0 ? "-" : new String(sb, 136, n, StandardCharsets.UTF_8))
+                    + " error_count=" + u32(sb, 0x194)
+                    + why;
         }
 
         byte[] rd(long off, int size) throws IOException {

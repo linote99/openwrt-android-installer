@@ -1,8 +1,12 @@
-# OpenWrt 安装器（安卓版）v1.6.1
+# OpenWrt 安装器（安卓版）v1.6.2
 
 这个 APK 是从各机型「OpenWrt 一键刷入包」移植来的手机版安装器。在手机上选择完整安装包 ZIP，APK 会先校验、再提取安装文件，然后调用安装包自带的设备端脚本完成安装，全程不需要电脑。
 
-- APK：`dist/OpenWrt-Installer-Android-1.6.1.apk`（包名 `top.linote.owrtinstaller`，Android 8.0+，versionCode 13，签名与之前各版相同，可以直接覆盖升级）
+- APK：`dist/OpenWrt-Installer-Android-1.6.2.apk`（包名 `top.linote.owrtinstaller`，Android 8.0+，versionCode 14，签名与之前各版相同，可以直接覆盖升级）
+
+## 1.6.2：卸载检查写清 ext4 未通过的原因
+
+「卸载并归还空间」核实已安装的 OpenWrt 分区时，如果 ext4 文件系统未正常卸载或布局不受支持，日志会写明哪一条没通过（日志未回放 needs_recovery / 错误标记 / 不支持的特性 / 块大小），并附上 state、incompat、log_block_size 等超级块数值，导出日志即可判断原因。判断条件不变。
 
 ## 1.6.1：配合 Lino-UFI 工具授权、备份和重新打开 ADB
 - 需要 Magisk（面具）给 Shell 授权 root 时，设备页显示对应提示和“打开 Lino-UFI 工具”按钮；没有安装 Lino-UFI 工具时显示“点此安装”，用浏览器打开[下载文章](https://www.linote.top/posts/lino-ufi-tools-android/)。MU300 系列（MU300 / F50 / U30 Air / V50）用它的「ADB 投屏」在目标设备上允许 Shell；E5 系（E5、远航41S、T551M、T512N、M8、K1）有屏幕，直接在设备上点允许，投屏只是可选方式。

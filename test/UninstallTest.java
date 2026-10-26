@@ -72,6 +72,20 @@ public class UninstallTest {
         byte[] d = dirty;
         final byte[] dirtyRaw = dirty;
         rejects(() -> InstallEvidence.inspect(family, "mmcblk0", "b", installedBoot.length, header, tail, pages, (o,l) -> Arrays.copyOfRange(dirtyRaw,(int)o,(int)o+l), dirtyRaw.length), family + " rejects unclean ext4");
+        // needs_recovery (journal not replayed) must be refused, and the message must name the failed condition with numbers.
+        for (long[] c : new long[][]{{0x4, 0}, {0x8000, 1}}) {
+            byte[] rec = raw.clone(); int inc = 1024 + 96;
+            long v = (rec[inc] & 0xffL) | (rec[inc+1] & 0xffL) << 8 | (rec[inc+2] & 0xffL) << 16 | (rec[inc+3] & 0xffL) << 24;
+            v |= c[0]; for (int b = 0; b < 4; b++) rec[inc + b] = (byte) (v >>> (8 * b));
+            final byte[] recRaw = rec; String m = null;
+            try { InstallEvidence.inspect(family, "mmcblk0", "b", installedBoot.length, header, tail, pages, (o,l) -> Arrays.copyOfRange(recRaw,(int)o,(int)o+l), recRaw.length); }
+            catch (Throwable t) { m = msg(t); }
+            String hex = String.format("incompat=0x%08x", v);
+            boolean good = m != null && m.contains(hex) && m.contains("state=0x0001") && m.contains("log_block_size=")
+                    && (c[1] == 0 ? m.contains("needs_recovery(0x4)") && !m.contains("布局不受支持，不是关机问题")
+                                  : m.contains("inline_data") && m.contains("布局不受支持，不是关机问题") && !m.contains("needs_recovery(0x4)"));
+            ok(good, family + (c[1] == 0 ? " refuses needs_recovery and logs state/incompat/log_block_size" : " refuses unsupported incompat and names the feature") + " [" + m + "]");
+        }
         byte[] noMark = raw.clone();
         // Corrupt the superblock magic: this exercises the bounded raw-reader refusal without mounting.
         noMark[1024 + 56] = 0; byte[] nm = noMark;
