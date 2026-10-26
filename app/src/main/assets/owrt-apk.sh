@@ -14,6 +14,13 @@
 #   owrt-apk.sh follow          重新跟踪正在进行/上次的安装日志
 #   owrt-apk.sh status          显示暂存与任务状态
 #   owrt-apk.sh clean           删除暂存的安装文件（不动安装器日志与启动链备份）
+#
+# umask：本脚本自己的暂存包、任务目录、日志和助手副本一律 077（只有 root 能读）。
+# 安装包自己的脚本（解系统、拷厂商配置、写启动链）一律在 ( umask "$PKG_UMASK"; ... ) 子 shell 里以 022 运行，
+# 与原程序一致：Magisk 刷入 ZIP 时 customize.sh 及其子脚本、电脑端经 su 运行的步骤都是 022，
+# 包内需要保密的文件（热点密码、日志/备份目录）由包脚本自己临时 077 / chmod 600。
+# 不能让包脚本继承这里的 077：否则解出的 /、/lib、/opt、vendor 等目录会变成 0700，
+# 降权运行的 modem_control 读不到厂商配置，基带起不来、WAN 一直连不上。
 umask 077
 BASE=/data/adb/owrt-apk
 P=$BASE/pkg
@@ -24,6 +31,8 @@ HELPERS='owrt-apk.sh check-lib.sh userdata-lib.sh mu300-lib.sh'
 
 say() { echo "OWRT-APK: $*"; }
 die() { echo "OWRT-APK-ERROR: $*"; exit 1; }
+# 安装包脚本的 umask（只在调用它们的子 shell 里生效，本脚本其余部分仍是 077）。
+PKG_UMASK=022
 
 [ "$(id -u)" = 0 ] || die 'root required / 需要 root'
 
@@ -174,15 +183,15 @@ cmd_check() {
     ! job_running || die '有安装任务正在进行 / an install job is running'
     validate_bb
     if [ "$(layout_of "$P")" = mu300 ]; then
-        "$BB" timeout -k 10 900 "$BB" env OWRT_PACKAGE="$P" ASH_STANDALONE=1 "$BB" sh "$BASE/mu300-lib.sh" check
+        ( umask "$PKG_UMASK"; "$BB" timeout -k 10 900 "$BB" env OWRT_PACKAGE="$P" ASH_STANDALONE=1 "$BB" sh "$BASE/mu300-lib.sh" check )
         rc=$?
         echo "OWRT-APK-CHECK-RC=$rc"
         return 0
     fi
     [ -f "$BASE/check-lib.sh" ] || die '没有暂存的安装包 / no staged package'
     chmod 755 "$P/files/"*.sh "$P/files/e5-bootctl"
-    "$BB" timeout -k 10 900 "$BB" nsenter -t 1 -m "$BB" env E5_PACKAGE="$P" ASH_STANDALONE=1 \
-        "$BB" sh "$BASE/check-lib.sh"
+    ( umask "$PKG_UMASK"; "$BB" timeout -k 10 900 "$BB" nsenter -t 1 -m "$BB" env E5_PACKAGE="$P" ASH_STANDALONE=1 \
+        "$BB" sh "$BASE/check-lib.sh" )
     rc=$?
     echo "OWRT-APK-CHECK-RC=$rc"
     return 0
@@ -195,8 +204,8 @@ cmd_check_data() {
     ! job_running || die '有安装任务正在进行 / an install job is running'
     validate_bb
     chmod 755 "$P/files/"*.sh "$P/files/e5-bootctl"
-    "$BB" timeout -k 10 900 "$BB" nsenter -t 1 -m "$BB" env E5_PACKAGE="$P" ASH_STANDALONE=1 \
-        "$BB" sh "$BASE/userdata-lib.sh" check "$1"
+    ( umask "$PKG_UMASK"; "$BB" timeout -k 10 900 "$BB" nsenter -t 1 -m "$BB" env E5_PACKAGE="$P" ASH_STANDALONE=1 \
+        "$BB" sh "$BASE/userdata-lib.sh" check "$1" )
     rc=$?
     echo "OWRT-APK-CHECK-RC=$rc"
     return 0
@@ -209,8 +218,8 @@ cmd_e5_tool() {
     ! job_running || die '有安装任务正在进行 / an install job is running'
     validate_bb
     chmod 755 "$P/files/"*.sh "$P/files/e5-bootctl"
-    "$BB" timeout -k 10 2400 "$BB" nsenter -t 1 -m "$BB" env E5_PACKAGE="$P" ASH_STANDALONE=1 \
-        "$BB" sh "$BASE/userdata-lib.sh" tool "$@"
+    ( umask "$PKG_UMASK"; "$BB" timeout -k 10 2400 "$BB" nsenter -t 1 -m "$BB" env E5_PACKAGE="$P" ASH_STANDALONE=1 \
+        "$BB" sh "$BASE/userdata-lib.sh" tool "$@" )
     rc=$?
     echo "OWRT-APK-TOOL-RC=$rc"
     return 0
@@ -271,7 +280,8 @@ cmd_run_install() {
         [ "$method" = tf ] && [ -f "$BASE/mu300-lib.sh" ] || die 'MU300 安装包只支持 TF 卡安装'
         # Same as Magisk running payload/customize.sh (no extra outer limit; every
         # worker stage has its own timeout).
-        OWRT_PACKAGE="$P" ASH_STANDALONE=1 "$BB" sh "$BASE/mu300-lib.sh" install
+        # 解系统、拷厂商配置都在这里面：与 Magisk 刷入时一样用 022（见文件开头）。
+        ( umask "$PKG_UMASK"; OWRT_PACKAGE="$P" ASH_STANDALONE=1 "$BB" sh "$BASE/mu300-lib.sh" install )
         rc=$?
         if [ "$rc" = 0 ]; then
             rm -f "$P/payload/mu300-openwrt.tar.gz" "$P/payload/boot-linux.img"
@@ -283,14 +293,14 @@ cmd_run_install() {
     fi
     chmod 755 "$P/files/"*.sh "$P/files/e5-bootctl"
     if [ "$method" = tf ]; then
-        "$BB" timeout -k 10 1800 "$BB" nsenter -t 1 -m "$BB" env E5_PACKAGE="$P" ASH_STANDALONE=1 \
-            "$BB" sh "$P/files/magisk-tf-install.sh"
+        ( umask "$PKG_UMASK"; "$BB" timeout -k 10 1800 "$BB" nsenter -t 1 -m "$BB" env E5_PACKAGE="$P" ASH_STANDALONE=1 \
+            "$BB" sh "$P/files/magisk-tf-install.sh" )
         rc=$?
     else
         [ -f "$BASE/userdata-lib.sh" ] || die 'userdata helper missing'
         shift
-        "$BB" timeout -k 10 3600 "$BB" nsenter -t 1 -m "$BB" env E5_PACKAGE="$P" ASH_STANDALONE=1 \
-            "$BB" sh "$BASE/userdata-lib.sh" install "$method" "$@"
+        ( umask "$PKG_UMASK"; "$BB" timeout -k 10 3600 "$BB" nsenter -t 1 -m "$BB" env E5_PACKAGE="$P" ASH_STANDALONE=1 \
+            "$BB" sh "$BASE/userdata-lib.sh" install "$method" "$@" )
         rc=$?
     fi
     if [ "$rc" = 0 ]; then

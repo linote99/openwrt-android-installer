@@ -59,7 +59,12 @@ df() { for p; do :; done; echo 'Filesystem 1024-blocks Used Available Capacity M
 prepare_firmware() {
     echo "prepare_firmware" >> $LOG
     echo "[TF] Hotspot / 热点：E5-OpenWrt-77; key / 密码：k3y"
-    printf 'devfiles' > "\$STATE/device-files.tar"; printf 'E5_WIFI_SSID=E5-OpenWrt-77\n' > "\$STATE/install.conf"
+    echo "umask-prepare \$(umask)" >> $LOG
+    # like magisk-firmware.py (pathlib mkdir/write, no chmod) + collect-device-files.sh's tar -c
+    fw=\$STATE/fw; mkdir -p "\$fw/lib/firmware/sprd" "\$fw/etc/e5"
+    echo pskey > "\$fw/lib/firmware/sprd/marlin3lite_pskey.bin"; echo ucm > "\$fw/etc/e5/audio.conf"
+    (cd "\$fw" && tar -cf "\$STATE/device-files.tar" lib etc); rm -rf "\$fw"
+    printf 'E5_WIFI_SSID=E5-OpenWrt-77\n' > "\$STATE/install.conf"
     BOOT_SHA256=abc
     [ "\${MOCK_FAIL:-}" != firmware ] || fail 'simulated firmware failure'
 }
@@ -68,11 +73,12 @@ if [ "\${E5_TF_LIB:-0}" = 1 ]; then return 0; fi
 echo 'tf main must not run in these tests'; exit 99
 EOF
     printf '#!/bin/sh\necho "bootctl $*" >> %s\n[ "$1" != arm ] || : > "$2"\n' "$LOG" > "$S/files/e5-bootctl"
-    printf '#!/bin/sh\necho "bootchain $1" >> %s\n' "$LOG" > "$S/files/android-bootchain.sh"
+    printf '#!/bin/sh\necho "bootchain $1" >> %s\necho "umask-bootchain $(umask)" >> %s\n' "$LOG" "$LOG" > "$S/files/android-bootchain.sh"
     printf '# fake android-loop\n' > "$S/files/android-loop.sh"
     cat > "$S/files/part-write.sh" <<EOF
 #!/bin/sh
 echo "part-write \$*" >> $LOG
+echo "tmp-modes \$(cd $T/data/local/tmp && stat -c %a openwrt.ext4.gz e5-ext4-tools.tar e5-part-write.sh | tr '\\n' ' ')" >> $LOG
 for f in openwrt.ext4.gz e5-ext4-tools.tar e5-part-write.sh e5-install.conf e5-device-files.tar; do
     [ -s $T/data/local/tmp/\$f ] || { echo "missing \$f" >&2; exit 7; }
 done
@@ -82,6 +88,8 @@ EOF
     cat > "$S/files/userdata-image.sh" <<EOF
 #!/bin/sh
 echo "userdata-image \$*" >> $LOG
+echo "tmp-modes \$(cd $T/data/local/tmp && stat -c %a openwrt.ext4.gz e5-ext4-tools.tar e5-android-loop.sh | tr '\\n' ' ')" >> $LOG
+echo "umask-image \$(umask)" >> $LOG
 [ -f $T/data/local/tmp/openwrt.ext4.gz ] && [ -f $T/data/local/tmp/e5-ext4-tools.tar ] && [ -f $T/data/local/tmp/e5-android-loop.sh ] || exit 7
 [ "\${MOCK_FAIL:-}" != image ] || { echo 'resize2fs failed' >&2; exit 5; }
 echo image > $T/data/e5linux/openwrt.ext4.part
@@ -101,6 +109,15 @@ pass=0; fail=0
 ok() { echo "PASS: $1"; pass=$((pass+1)); }
 bad() { echo "FAIL: $1"; fail=$((fail+1)); }
 expect() { if echo "$2" | grep -q -- "$3"; then ok "$1"; else bad "$1 (wanted '$3')"; echo "$2" | tail -12; fi; }
+# v1.6.3: the device-files archive the package builds must carry 0755 directories / 0644 files
+# (it is unpacked over the new system's /lib and /etc); v1.6.2's inherited umask 077 made them 0700.
+tar_modes_ok() {  # $1 = label, $2 = archive
+    l=$(tar -tvf "$2" 2>/dev/null)
+    if [ -n "$l" ] && echo "$l" | grep -q '^drwxr-xr-x .* lib/firmware/sprd/$' && echo "$l" | grep -q '^drwxr-xr-x .* etc/$' \
+       && [ -z "$(echo "$l" | grep '^d' | grep -v '^drwxr-xr-x')" ] \
+       && [ -z "$(echo "$l" | grep '^-' | grep -v '^-rw-r--r--')" ]; then ok "$1: lib/, etc/ 0755, files 0644"
+    else bad "$1: archive modes"; echo "$l"; fi
+}
 reboot_sim() { rm -rf "$T/adb/e5-tf-install"/install-*.lock; }
 restage() { make_pkg; $H stage "$T/app/files/stage/pkg" >/dev/null 2>&1 || { bad 'stage'; }; }
 
@@ -156,7 +173,10 @@ expect 'hotspot line streamed' "$out" 'Hotspot / 热点：E5-OpenWrt-77'
 C=$(cat "$T/data/e5linux/part-install.conf" 2>/dev/null)
 [ "$C" = "$(printf 'PART_MIB=8192\nDATA_MIB=57344\nGROW_FS=1\nFORMAT_DATA=0')" ] && ok 'part-install.conf content' || { bad 'part-install.conf content'; echo "$C"; }
 cmp -s "$T/data/e5linux/part-install.img.gz" "$T/base/pkg/files/openwrt.ext4.gz" 2>/dev/null; [ ! -e "$T/base/pkg/files/openwrt.ext4.gz" ] && [ -s "$T/data/e5linux/part-install.img.gz" ] && ok 'image staged (and APK copy removed after success)' || bad 'image staging'
-[ "$(cat "$T/data/e5linux/device-files.tar")" = devfiles ] && ok 'device-files staged' || bad 'device-files'
+tar_modes_ok 'part: staged device-files.tar' "$T/data/e5linux/device-files.tar"
+[ "$(stat -c %a "$T/data/e5linux/device-files.tar")" = 600 ] && [ "$(stat -c %a "$T/data/e5linux/part-install.img.gz")" = 600 ] && [ "$(stat -c %a "$T/data/e5linux/part-install.settings")" = 600 ] && ok 'part: staged payload stays 600' || bad 'part: staged payload modes'
+grep -qx 'umask-prepare 0022' "$LOG" && ok 'part: package prepare_firmware runs with umask 022' || { bad 'part: prepare umask'; grep umask "$LOG"; }
+grep -qx 'umask-bootchain 0022' "$LOG" && ok 'part: umask back to 022 after staging the payload' || { bad 'part: umask after staging'; grep umask "$LOG"; }
 grep -q E5_WIFI_SSID "$T/data/e5linux/part-install.settings" && ok 'settings staged' || bad 'settings'
 [ "$(cat "$T/data/e5linux/boot-os")" = part ] && ok 'boot-os=part' || bad 'boot-os'
 [ "$(stat -c %a "$T/data/e5linux/part-install.conf")" = 600 ] && ok 'conf mode 600' || bad 'conf mode'
@@ -191,6 +211,10 @@ expect 'image marker' "$out" 'E5-DATA-INSTALL-OK'
 grep -q "userdata-image 2147483648 4294967296 2048 4096" "$LOG" && ok 'userdata-image.sh args (raw, selected, raw_mib, sel_mib)' || { bad 'userdata-image args'; grep userdata-image "$LOG"; }
 [ "$(cat "$T/data/e5linux/openwrt.ext4")" = image ] && ok 'image committed' || bad 'image commit'
 ls "$T/data/e5linux"/previous.*/openwrt.ext4 >/dev/null 2>&1 && ok 'previous image kept' || bad 'previous image'
+[ "$(stat -c %a "$T/data/e5linux"/previous.*)" = 700 ] && ok 'image: previous-image backup dir 700' || bad 'image: backup dir mode'
+grep -qx 'tmp-modes 600 600 700 ' "$LOG" && ok 'image: /data/local/tmp transfer copies root-only (600, script 700)' || { bad 'image: tmp copy modes'; grep tmp-modes "$LOG"; }
+grep -qx 'umask-image 0022' "$LOG" && grep -qx 'umask-prepare 0022' "$LOG" && ok 'image: package scripts run with umask 022' || { bad 'image: umask'; grep umask "$LOG"; }
+tar_modes_ok 'image: committed device-files.tar' "$T/data/e5linux/device-files.tar"
 grep -q E5_WIFI_SSID "$T/data/e5linux/openwrt-install.conf" && ok 'openwrt-install.conf written' || bad 'install conf'
 [ "$(cat "$T/data/e5linux/boot-os")" = openwrt ] && ok 'boot-os=openwrt' || bad 'boot-os image'
 [ -z "$(ls "$T/data/local/tmp")" ] && ok 'tmp copies cleaned' || { bad 'tmp leftovers'; ls "$T/data/local/tmp"; }
@@ -213,7 +237,7 @@ ls "$T/adb/e5-tf-install" | grep -q '^tool\.' && bad 'tool state dir left' || ok
 out=$($H e5-tool firmware 2>&1)
 expect 'e5-tool firmware ok' "$out" 'OWRT-APK-TOOL-OK firmware'
 expect 'e5-tool firmware path' "$out" "OWRT-APK-DEVICE-FILES=$T/data/local/tmp/e5-device-files.tar"
-[ "$(cat "$T/data/local/tmp/e5-device-files.tar" 2>/dev/null)" = devfiles ] && ok 'device files copied' || bad 'device files'
+tar_modes_ok 'e5-tool firmware: device files' "$T/data/local/tmp/e5-device-files.tar"
 [ "$(stat -c %a "$T/data/local/tmp/e5-device-files.tar" 2>/dev/null)" = 600 ] && ok 'device files mode 600' || bad 'device files mode'
 expect 'e5-tool firmware streams hotspot' "$out" 'Hotspot / 热点：E5-OpenWrt-77'
 out=$(MOCK_FAIL=firmware $H e5-tool firmware 2>&1)
@@ -250,6 +274,7 @@ out=$($H e5-tool part-write /dev/block/mmcblk0p71 4096 2048 1 $TOK 2>&1)
 expect 'part-write ok' "$out" 'OWRT-APK-TOOL-OK part-write'
 expect 'part-write marker' "$out" 'E5-PART-WRITE-OK'
 grep -qx "part-write /dev/block/mmcblk0p71 4096 2048 1 $TOK" "$LOG" && ok 'part-write.sh args (DEV NEED RAW GROW TOKEN)' || { bad 'part-write args'; cat "$LOG"; }
+grep -qx 'tmp-modes 600 600 700 ' "$LOG" && ok 'part-write: /data/local/tmp transfer copies root-only (600, script 700)' || { bad 'part-write: tmp copy modes'; grep tmp-modes "$LOG"; }
 [ -z "$(ls "$T/data/local/tmp")" ] && ok 'part-write: tmp cleaned' || { bad 'part-write tmp leftovers'; ls "$T/data/local/tmp"; }
 printf 'devfiles' > "$T/data/local/tmp/e5-device-files.tar"; printf 'E5_WIFI_SSID=x\n' > "$T/data/local/tmp/e5-install.conf"
 out=$(MOCK_FAIL=partwrite $H e5-tool part-write /dev/block/mmcblk0p71 4096 2048 1 $TOK 2>&1)

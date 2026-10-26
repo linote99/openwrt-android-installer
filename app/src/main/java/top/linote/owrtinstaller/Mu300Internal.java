@@ -94,6 +94,15 @@ final class Mu300Internal {
     /** payload/ files prepare_payload() uploads for the internal methods (rootfs is filtered separately). */
     static final String[] PAYLOAD = {"busybox", "switch.sh", "mu300-vendor-from-device.sh", "rootfs-critical.sha256",
             "rootfs.requirements"};
+    /**
+     * The run.sh body that builds the OpenWrt image: android-image.sh unpacks the rootfs and copies this
+     * device's vendor files (mu300-vendor-from-device.sh) into it. It runs with umask 022 like the original
+     * (Magisk / the desktop installer's su), never with the app's or the root manager's inherited 077:
+     * under 077 the new system's /, /lib, /opt and /opt/mu300/android/vendor become 0700, the unprivileged
+     * modem_control cannot read the vendor configuration and the modem never comes up (WAN stays down).
+     * Other steps (backups, temporary files) keep the inherited umask.
+     */
+    static final String IMAGE_STEP = "umask 022\n\"$BB\" sh \"$P/android-image.sh\"";
     static final String[] DESKTOP_SH = {"android-image.sh", "android-write-part.sh", "android-write-free.sh", "android-loop.sh"};
     static final String REPAIR = "desktop/files/boot/repair/";
     static final String LOCAL_SUMS = "LOCAL-SUMS";
@@ -985,7 +994,7 @@ final class Mu300Internal {
             x.preparePayload();
             x.put(x.settings(size, "data-image"), "desktop-settings.env");
             io.progress(60);
-            x.run("\"$BB\" sh \"$P/android-image.sh\"", "生成 OpenWrt 系统镜像（只写临时文件，不改分区）", true);
+            x.run(IMAGE_STEP, "生成 OpenWrt 系统镜像（只写临时文件，不改分区）", true);
             io.progress(85);
             byte[] live = x.live();
             x.flash(x.boot("data-image", live, null, null), Mu300Boot.bootControl(live, p.slot));
@@ -1065,7 +1074,7 @@ final class Mu300Internal {
         x.preparePayload();
         x.put(x.settings(2048, "part-stage"), "desktop-settings.env");
         io.progress(60);
-        x.run("\"$BB\" sh \"$P/android-image.sh\"", "生成 OpenWrt 系统镜像（只写临时文件，不改分区）", true);
+        x.run(IMAGE_STEP, "生成 OpenWrt 系统镜像（只写临时文件，不改分区）", true);
         x.run("printf \"PART_MIB=" + size + "\\nDATA_MIB=" + target / 2048 + "\\nGROW_FS=1\\nFORMAT_DATA=0\\n\" > /data/mu300linux/part-install.conf\nsync", "写入离线安装参数", true);
         io.progress(85);
         String identity = s.cid + ":" + s.node + ":" + s.start + ":" + s.size + ":" + target;
@@ -1087,7 +1096,7 @@ final class Mu300Internal {
     static Outcome directWrite(Session x, Storage s, long sectors, Resume rec) throws IOException {
         x.put(x.settings(2048, "part"), "desktop-settings.env");
         x.io.progress(60);
-        x.run("\"$BB\" sh \"$P/android-image.sh\"", "生成 OpenWrt 系统镜像（只写临时文件，不改分区）", true);
+        x.run(IMAGE_STEP, "生成 OpenWrt 系统镜像（只写临时文件，不改分区）", true);
         String checksum = x.imageChecksum();
         x.io.progress(75);
         x.run("\"$BB\" sh \"$P/android-write-part.sh\" /dev/block/" + s.root + " " + s.cid + " " + sectors + " " + checksum,
@@ -1110,7 +1119,7 @@ final class Mu300Internal {
         x.put(copies[1], "gpt-new-last.bin");
         x.put(x.settings(2048, "part"), "desktop-settings.env");
         x.io.progress(60);
-        x.run("\"$BB\" sh \"$P/android-image.sh\"", "生成 OpenWrt 系统镜像（只写临时文件，不改分区）", true);
+        x.run(IMAGE_STEP, "生成 OpenWrt 系统镜像（只写临时文件，不改分区）", true);
         String checksum = x.imageChecksum();
         x.io.progress(75);
         String disk = s.disk();

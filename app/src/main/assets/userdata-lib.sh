@@ -15,7 +15,14 @@
 # prepare_firmware / write_boot；启动链用 files/android-bootchain.sh；试启动用 files/e5-bootctl。
 # 加密 userdata（或用户选择格式化）时的两阶段安装由 E5Part 驱动，这里只提供 tool 单步。
 # 由 owrt-apk.sh 在全局挂载命名空间、随包 BusyBox（ASH_STANDALONE=1）下运行。
+#
+# umask：安装包自己的函数和脚本（prepare_firmware 在 chroot 里转换本机固件、打包
+# firmware.tar / device-files.tar，userdata-image.sh / part-write.sh 把它们解进新系统）
+# 与 Magisk 刷入 ZIP 时一样在 022 下运行；077 下这些包里的 lib、etc、lib/firmware 等
+# 目录会是 0700，解进新系统后 /lib、/etc 只有 root 能读。
+# APK 自己落到 /data/local/tmp 的中转文件、缩容载荷、旧镜像备份仍只给 root（077 / chmod 600）。
 set -eu
+umask 022
 P=${E5_PACKAGE:?}
 BB=$P/files/busybox
 ACTION=${1:-}
@@ -241,7 +248,7 @@ if [ "$ACTION" = tool ]; then
             preflight_common
             prepare_firmware
             [ ! -L "$TMPD/e5-device-files.tar" ] || fail 'unsafe device files path'
-            cp "$STATE/device-files.tar" "$TMPD/e5-device-files.tar"
+            (umask 077; cp "$STATE/device-files.tar" "$TMPD/e5-device-files.tar")
             chmod 600 "$TMPD/e5-device-files.tar"
             echo "OWRT-APK-DEVICE-FILES=$TMPD/e5-device-files.tar"
             ;;
@@ -273,10 +280,10 @@ if [ "$ACTION" = tool ]; then
             want=$(gz_listed)
             [ -n "$want" ] || fail 'image checksum missing'
             for f in openwrt.ext4.gz e5-ext4-tools.tar e5-part-write.sh; do [ ! -L "$TMPD/$f" ] || fail 'unsafe temporary path'; done
-            cp "$P/files/openwrt.ext4.gz" "$TMPD/openwrt.ext4.gz"
+            (umask 077; cp "$P/files/openwrt.ext4.gz" "$TMPD/openwrt.ext4.gz")
             [ "$(sha "$TMPD/openwrt.ext4.gz")" = "$want" ] || fail 'image copy mismatch'
-            cp "$P/files/ext4-tools.tar" "$TMPD/e5-ext4-tools.tar"
-            cp "$P/files/part-write.sh" "$TMPD/e5-part-write.sh"
+            (umask 077; cp "$P/files/ext4-tools.tar" "$TMPD/e5-ext4-tools.tar"
+             cp "$P/files/part-write.sh" "$TMPD/e5-part-write.sh")
             ASH_STANDALONE=1 "$BB" sh "$TMPD/e5-part-write.sh" "$3" "$4" "$5" "$6" "$7"
             ;;
     esac
@@ -386,6 +393,7 @@ stage_part() {
     printf 'PART_MIB=%s\nDATA_MIB=%s\nGROW_FS=%s\nFORMAT_DATA=0\n' "$SIZE" "$DATA_MIB" "$GROW" > "$D/part-install.conf.tmp"
     mv -f "$D/part-install.conf.tmp" "$D/part-install.conf"
     chmod 600 "$D/part-install.conf" "$D/part-install.settings" "$D/device-files.tar" "$D/part-install.img.gz"
+    umask 022
     sync
     # 落位后再检查空间：缩容目标必须仍高于已用空间 + 2 GiB。
     used_kb=$(df -Pk /data | awk 'END {print $3}')
@@ -393,9 +401,10 @@ stage_part() {
 }
 
 write_image() {
-    cp "$P/files/android-loop.sh" "$TMPD/e5-android-loop.sh"
-    cp "$P/files/ext4-tools.tar" "$TMPD/e5-ext4-tools.tar"
-    cp "$P/files/openwrt.ext4.gz" "$TMPD/openwrt.ext4.gz"
+    (umask 077
+     cp "$P/files/android-loop.sh" "$TMPD/e5-android-loop.sh"
+     cp "$P/files/ext4-tools.tar" "$TMPD/e5-ext4-tools.tar"
+     cp "$P/files/openwrt.ext4.gz" "$TMPD/openwrt.ext4.gz")
     [ "$(sha "$TMPD/openwrt.ext4.gz")" = "$(gz_listed)" ] || fail 'image copy mismatch'
     # 电脑端 ensure_userdata_space：上传和固件收集后按字节复查（上传量记为 0）
     free_kb=$(df -Pk /data | awk 'END {print $4}')
@@ -409,7 +418,7 @@ write_image() {
 commit_image() {
     backup=$D/previous.$(date +%Y%m%d-%H%M%S).$$
     if [ -e "$D/openwrt.ext4" ]; then
-        mkdir "$backup"
+        (umask 077; mkdir "$backup")
         mv "$D/openwrt.ext4" "$backup/openwrt.ext4"
         for n in device-files.tar openwrt-install.conf; do
             [ ! -e "$D/$n" ] || cp -p "$D/$n" "$backup/$n"

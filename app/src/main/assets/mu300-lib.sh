@@ -4,6 +4,13 @@
 #   mu300-lib.sh check     只运行 worker 的 --preflight（校验载荷、TF/boot/misc、启动链 check、空间）
 #   mu300-lib.sh install   运行 worker 完整流程（与 Magisk 刷入 ZIP 时相同的分阶段安装）
 # 由 owrt-apk.sh 以 root 调用；APK 已核对 customize.sh 的部署参数与这里写入的完全一致。
+#
+# umask：worker 及其子脚本（暂存本机厂商配置 mu300-vendor-from-device.sh、解系统
+# android-install.sh）一律在 022 下运行，与 Magisk 刷入 ZIP 时相同。worker 先在临时
+# 目录里暂存厂商文件，再 cp -a 合并进新系统的根目录，暂存目录的权限会原样带进
+# /、/lib、/opt、/opt/mu300/android/vendor；077 下它们全是 0700，降权运行的
+# modem_control 读不到厂商配置（基带状态 255，WAN 连不上）。
+# 本脚本自己写的东西（参数文件、临时目录）仍然只给 root：077 / chmod 600。
 set -eu
 PK=${OWRT_PACKAGE:?}
 P=$PK/payload
@@ -30,6 +37,7 @@ R=/dev/block/mmcblk1p1
 KERNEL=$("$BB" sed -n 's/^KERNEL=\([0-9][0-9.]*\)$/\1/p' "$P/customize.sh")
 case $KERNEL in ''|*[!0-9.]*) fail 'payload/customize.sh 中没有 KERNEL' ;; esac
 
+umask 077
 cat > "$P/mu300-install.env" <<EOF
 SD_MODE=1
 SD_DEV=$R
@@ -48,12 +56,13 @@ EOF
 chmod 600 "$P/mu300-install.env"
 mkdir -p "$T"
 
-run_worker() {
+run_worker() (
+    umask 022
     MU300_PAYLOAD_DIR="$P" MU300_INSTALL_TMP="$T" \
     MU300_VENDOR_FROM_DEVICE=1 MU300_KEEP_PAYLOAD=1 MU300_BUSYBOX="$BB" \
     MU300_TF_BOOTDEV="$bootdev" MAGISKTMP=${MAGISKTMP:-/data/adb/magisk} ASH_STANDALONE=1 \
         "$BB" nsenter -t 1 -m "$BB" sh "$P/tf-install-worker.sh" "$@"
-}
+)
 
 case ${1:-} in
     check)

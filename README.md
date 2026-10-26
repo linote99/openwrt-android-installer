@@ -1,8 +1,19 @@
-# OpenWrt 安装器（安卓版）v1.6.2
+# OpenWrt 安装器（安卓版）v1.6.3
 
 这个 APK 是从各机型「OpenWrt 一键刷入包」移植来的手机版安装器。在手机上选择完整安装包 ZIP，APK 会先校验、再提取安装文件，然后调用安装包自带的设备端脚本完成安装，全程不需要电脑。
 
-- APK：`dist/OpenWrt-Installer-Android-1.6.2.apk`（包名 `top.linote.owrtinstaller`，Android 8.0+，versionCode 14，签名与之前各版相同，可以直接覆盖升级）
+- APK：`dist/OpenWrt-Installer-Android-1.6.3.apk`（包名 `top.linote.owrtinstaller`，Android 8.0+，versionCode 15，签名与之前各版相同，可以直接覆盖升级）
+
+## 1.6.3：修复 TF 卡安装后基带起不来、WAN 连不上
+用安卓版往 TF 卡装 MU300 系列（MU300 / F50 / U30 Air / V50）时，装好的系统里根目录 `/`、`/lib`、`/opt` 和 `/opt/mu300/android/vendor` 等目录变成只有 root 能读（0700）。基带服务 `modem_control` 是降权运行的，读不到这些厂商配置，基带状态停在 255，WAN 一直连不上。
+
+原因是安卓版自己的辅助脚本开头统一设了 `umask 077`，安装包里的 TF 安装脚本在它底下运行时也跟着用了 077：先暂存的本机厂商文件目录是 0700，合并进新系统时连根目录的权限一起带了过去。原程序（Magisk 刷入或电脑端安装）运行这些脚本时是 `umask 022`。
+
+现在解系统、拷厂商配置这一段恢复成跟原程序一样的 `umask 022`，装出来的这些目录都是 0755、厂商文件 0644。安卓版自己的临时目录、上传中转文件、备份和保存热点密码的文件仍然只给 root（077 / 600），和原程序一样只在写热点密码时单独收紧。
+
+其他安装方式也按同样的规则改了：MU300 系列的独立内置分区、重装已有内置分区、格式化后继续安装和 userdata 镜像（生成系统镜像那一步），E5 系（E5、远航41S、T551M、T512N、M8、K1）的 TF 卡、缩容 userdata、userdata 镜像、格式化后安装和重装 e5root（提取并打包本机固件那一步，之前 `/lib`、`/etc` 也会是 0700）。
+
+已经用 1.6.2 装好、出现这个问题的设备，用 1.6.3 重新安装一次即可。
 
 ## 1.6.2：卸载检查写清 ext4 未通过的原因
 
@@ -223,6 +234,7 @@ java -cp build-test/stall top.linote.owrtinstaller.AdbStallTest 15561 15562 1556
 sudo bash test/mock-helper-test.sh     # TF 流程 + 局域网暂存（26 项）
 sudo bash test/mock-userdata-test.sh   # 分区 / 镜像方式（56 项）
 sudo bash test/mock-mu300-test.sh      # MU300 TF：暂存、预检参数、安装成功/失败、篡改拒绝（12 项）
+sudo bash test/mock-perm-test.sh       # 装出的系统目录权限：MU300 / E5 TF 的 /、/lib、/opt、vendor 等目录 0755，私有文件仍 600/700
 # 4. MU300 内置存储：模拟设备（带真实 GPT 的稀疏 eMMC、by-name 分区、假 shell），包内脚本只模拟效果、不执行
 java -Xmx3g -cp build-test/cls top.linote.owrtinstaller.Mu300FlowTest <MU300安装包.zip> build-test/muflow   # 50 项
 # 一次运行全部：

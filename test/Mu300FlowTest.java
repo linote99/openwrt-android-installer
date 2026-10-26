@@ -202,6 +202,45 @@ public class Mu300FlowTest {
             throw new AssertionError("unexpected command: " + script);
         }
 
+        boolean imageModesChecked;
+        /**
+         * v1.6.3: runs the app's real image step text (Mu300Internal.IMAGE_STEP) in /bin/sh under an inherited
+         * umask 077 (what su gives the app), with a FAKE android-image.sh written here that, like the package
+         * script, stages this device's vendor files by mkdir -p / tar -x of implicit parents (no umask of its
+         * own), unpacks the rootfs and merges the staging with cp -a. The new system's /, /lib, /opt and
+         * vendor directories must come out 0755 (v1.6.2: 0700, modem_control could not read them).
+         */
+        void imageStepModes(String step) throws IOException {
+            File w = new File(cache.getParentFile(), "image-umask");
+            Mu300Internal.deleteTree(w);
+            if (!new File(w, "p").mkdirs()) throw new IOException("mkdir " + w);
+            String fake = "set -eu\nP=$MU300_PAYLOAD_DIR; T=$MU300_INSTALL_TMP\n"
+                    + "src=$P/android; mkdir -p $src/vendor/etc $src/vendor/bin; echo x > $src/vendor/etc/modem_cp_info.xml; echo m > $src/vendor/bin/modem_control\n"
+                    + "chmod -R u=rwX,go=rX $src; chmod 755 $src/vendor/bin/modem_control\n"
+                    + "r=$P/rootsrc; mkdir -p $r/lib $r/opt $r/etc; chmod -R 755 $r; tar -cf $P/rootfs.tar -C $r .\n"
+                    + "V=$T/vendor; mkdir -p $V/lib/firmware; echo fw > $V/lib/firmware/wcnmodem.bin\n"
+                    + "A=$V/opt/mu300/android; mkdir -p $A; tar -cf - -C $src vendor/etc/modem_cp_info.xml vendor/bin/modem_control | tar -xf - -C $A\n"
+                    + "N=$T/root; mkdir -p $N; tar -xpf $P/rootfs.tar -C $N; cp -a $V/. $N/\n"
+                    + "echo umask=$(umask)\n";
+            Mu300Internal.writeAll(new File(w, "p/android-image.sh"), fake.getBytes(StandardCharsets.UTF_8));
+            String abs = new File(w, "p").getAbsolutePath();
+            ProcessBuilder pb = new ProcessBuilder("/bin/sh", "-c", "umask 077\nset -eu\nP=" + abs + "\nT=" + abs + "/work\nBB=busybox\n"
+                    + "export MU300_PAYLOAD_DIR=$P MU300_INSTALL_TMP=$T MU300_BUSYBOX=$BB MU300_KEEP_PAYLOAD=1\nmkdir -p \"$T\"\n" + step);
+            pb.redirectErrorStream(true);
+            Process pr = pb.start();
+            String out = new String(pr.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            int rc;
+            try { rc = pr.waitFor(); } catch (InterruptedException e) { throw new IOException(e); }
+            ok(rc == 0 && out.contains("umask=0022"), "image step runs android-image.sh with umask 022 under an inherited 077 (" + out.trim() + ")");
+            String root = abs + "/work/root";
+            for (String d : new String[]{"", "/lib", "/lib/firmware", "/opt", "/opt/mu300", "/opt/mu300/android",
+                    "/opt/mu300/android/vendor", "/opt/mu300/android/vendor/etc", "/opt/mu300/android/vendor/bin"}) {
+                String m = Integer.toOctalString(java.nio.file.Files.getPosixFilePermissions(new File(root + d).toPath()).stream()
+                        .mapToInt(x -> 1 << (8 - x.ordinal())).sum());
+                ok("755".equals(m), "image step: new system " + (d.isEmpty() ? "/" : d) + " is " + m + " (want 755)");
+            }
+            Mu300Internal.deleteTree(w);
+        }
         /** The detached run.sh launcher: simulate the package script's effect from the arguments; never execute it. */
         String launch(String script) throws IOException {
             Matcher m = Pattern.compile(" sh (/data/local/tmp/mu300-desktop-[0-9a-f]{12})/run\\.sh[ ']").matcher(script);
@@ -222,7 +261,8 @@ public class Mu300FlowTest {
                 return "";
             }
             if (step.contains("android-bootchain.sh\" check")) log.append("bootchain: both slots consistent\n");
-            else if (step.equals("\"$BB\" sh \"$P/android-image.sh\"\n")) {
+            else if (step.equals(Mu300Internal.IMAGE_STEP + "\n")) {
+                if (!imageModesChecked) { imageModesChecked = true; imageStepModes(step); }
                 byte[] env = files.get(p + "/desktop-settings.env");
                 if (env == null) throw new AssertionError("android-image.sh without desktop-settings.env");
                 if (!files.containsKey(p + "/mu300-openwrt.tar.gz")) throw new AssertionError("android-image.sh without rootfs");

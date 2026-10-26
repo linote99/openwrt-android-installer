@@ -127,7 +127,7 @@ sleep 1.5
 timeout 60 java -cp "$B/aw" top.linote.owrtinstaller.AuthWaitTest slow 15571 "$B/aw-work" > "$B/aw1.txt" 2>&1; note "AuthWaitTest(allow later) rc=$? $(tail -1 "$B/aw1.txt")"
 timeout 60 java -cp "$B/aw" top.linote.owrtinstaller.AuthWaitTest wait 15572 "$B/aw-work" > "$B/aw2.txt" 2>&1; note "AuthWaitTest(stop) rc=$? $(tail -1 "$B/aw2.txt")"
 kill $W1 $W2 2>/dev/null; wait $W1 $W2 2>/dev/null
-for t in mock-helper-test.sh mock-userdata-test.sh mock-mu300-test.sh; do
+for t in mock-helper-test.sh mock-userdata-test.sh mock-mu300-test.sh mock-perm-test.sh; do
   sudo bash "test/$t" > "$B/$t.txt" 2>&1; note "$t rc=$? $(tail -1 "$B/$t.txt")"
 done
 grep -h '^FAIL' "$B"/*.txt | head -20
