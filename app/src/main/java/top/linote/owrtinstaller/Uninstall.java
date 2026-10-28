@@ -22,7 +22,7 @@ final class Uninstall {
 
     static final Pattern NUM = Pattern.compile("^[0-9]+$");
     static final Pattern CID = Pattern.compile("^[0-9a-f]{32}$");
-    static final Pattern NODE = Pattern.compile("^mmcblk[0-9]p[0-9]+$");
+    static final Pattern NODE = Pattern.compile("^(?:mmcblk[0-9]+p[1-9][0-9]*|sd[a-z]+[1-9][0-9]*)$");
     static final Pattern HEX64 = Pattern.compile("^[0-9a-f]{64}$");
     static final long MIB4 = 4194304L;
     static final byte[] LINUX_FS_GUID = {(byte) 0xaf, 0x3d, (byte) 0xc6, 0x0f, (byte) 0x83, (byte) 0x84, 0x72, 0x47,
@@ -38,6 +38,7 @@ final class Uninstall {
         String family;                    // "e5" or "mu300"
         byte[] base;                      // e5: files/boot.img ; mu300: payload/boot-linux.img (64 MiB v4)
         byte[] worker;                    // assets/uninstall-worker.sh (pinned hash)
+        byte[] storageLibrary;            // MU300's package-pinned storage-lib.sh, injected for UFS identity checks
         File repairDir;                   // mu300: app-side desktop/files/boot/repair/
         Map<String, String> repairSums;   // mu300: LOCAL-SUMS entries for repair files (rel -> sha)
         Source ext4Tar;                   // e5: files/ext4-tools.tar from the staged package (read only when needed)
@@ -51,34 +52,27 @@ final class Uninstall {
         String slot, other, bootId, serial, profile, model;
         long rootStart, rootSize;          // ROOT_START / ROOT_SIZE from the running kernel
         boolean booted;
-        String partitionNode() { return s.node.substring(0, s.node.indexOf('p')); }   // mmcblk0
+        String partitionNode() { return s.diskNode; }
     }
 
     static Device probe(Mu300Internal.Io io, String rootName, String profile) throws IOException {
-        String out = io.sh("set -e; d=$(readlink -f /dev/block/by-name/userdata); n=${d##*/}; b=${n%p*}; "
-                + "echo NODE=$n; echo CID=$(cat /sys/class/block/$b/device/cid); echo START=$(cat /sys/class/block/$n/start); "
-                + "echo SIZE=$(cat /sys/class/block/$n/size); echo DISK_SIZE=$(cat /sys/class/block/$b/size); "
-                + "echo FREE=$(df -Pk /data | tail -n1 | awk '{print $4}'); "
-                + "echo STATE=$(getprop ro.crypto.state); echo TYPE=$(getprop ro.crypto.type); "
-                + "echo SOURCE=$(awk '$2==\"/data\" {print $1;exit}' /proc/mounts); "
-                + "for u in /sys/class/block/${b}p*/uevent; do if grep -qx PARTNAME=" + rootName + " \"$u\"; then r=${u%/uevent}; r=${r##*/}; "
-                + "echo ROOT=$r; echo ROOT_START=$(cat /sys/class/block/$r/start); echo ROOT_SIZE=$(cat /sys/class/block/$r/size); fi; done; "
-                + "echo SLOT=$(getprop ro.boot.slot_suffix); echo BOOTED=$(getprop sys.boot_completed); echo SETUP=$(settings get secure user_setup_complete 2>/dev/null); "
+        Mu300Internal.Storage storage = Mu300Internal.storage(io);
+        if (!"e5root".equals(rootName) && !"mu300root".equals(rootName))
+            throw new IOException("Unsupported internal root label / 内置分区标签不受支持");
+        String root = storage.root == null ? "" : storage.root;
+        String rootProbe = root.isEmpty() ? "" : "echo ROOT_START=$(cat /sys/class/block/" + root + "/start); "
+                + "echo ROOT_SIZE=$(cat /sys/class/block/" + root + "/size); ";
+        String out = io.sh("set -e; " + rootProbe
+                + "echo SLOT=$(getprop ro.boot.slot_suffix); echo BOOTED=$(getprop sys.boot_completed); "
+                + "echo SETUP=$(settings get secure user_setup_complete 2>/dev/null); "
                 + "echo MODEL=$(getprop ro.product.model); echo BOOT_ID=$(cat /proc/sys/kernel/random/boot_id)", true);
         Map<String, String> r = Mu300Internal.kv(out);
         Device d = new Device();
-        Mu300Internal.Storage s = new Mu300Internal.Storage();
-        s.node = r.getOrDefault("NODE", "");
-        s.cid = r.getOrDefault("CID", "").toLowerCase(java.util.Locale.ROOT);
-        if (!NODE.matcher(s.node).matches() || !CID.matcher(s.cid).matches()) throw new IOException("无法识别 eMMC（Invalid eMMC identity）");
-        s.start = num(r, "START"); s.size = num(r, "SIZE"); s.diskSize = num(r, "DISK_SIZE"); s.free = num(r, "FREE");
-        s.state = r.getOrDefault("STATE", ""); s.type = r.getOrDefault("TYPE", ""); s.source = r.getOrDefault("SOURCE", "");
-        String root = r.get("ROOT");
-        if (root != null && NODE.matcher(root).matches()) {
-            s.root = root;
+        d.s = storage;
+        if (!root.isEmpty()) {
+            if (!NODE.matcher(root).matches()) throw new IOException("Invalid OpenWrt partition node");
             d.rootStart = num(r, "ROOT_START"); d.rootSize = num(r, "ROOT_SIZE");
         }
-        d.s = s;
         String slot = r.getOrDefault("SLOT", "");
         if (slot.startsWith("_")) slot = slot.substring(1);
         if (!"a".equals(slot) && !"b".equals(slot)) throw new IOException("无法识别 Android 槽位");
@@ -94,6 +88,19 @@ final class Uninstall {
         String v = r.get(k);
         if (v == null || !NUM.matcher(v).matches()) throw new IOException("无法读取存储信息：" + k);
         return Long.parseLong(v);
+    }
+    static String partNode(String disk, int number) {
+        if (disk == null || number < 1 || !(disk.matches("mmcblk[0-9]+") || disk.matches("sd[a-z]+")))
+            throw new IllegalArgumentException("Invalid internal disk/partition number");
+        return disk + (disk.startsWith("mmcblk") ? "p" : "") + number;
+    }
+    static long bytes512(long sectors) throws Refused {
+        if (sectors < 0 || sectors > Long.MAX_VALUE / 512) throw new Refused("512-byte sector count overflows byte range");
+        return sectors * 512;
+    }
+    static long sectorsBetween(long start, long end) throws Refused {
+        if (start < 0 || end < start || end - start == Long.MAX_VALUE) throw new Refused("Invalid GPT partition range");
+        return end - start + 1;
     }
 
     // ================================================================== GPT helpers (uninstall.py)
@@ -114,16 +121,29 @@ final class Uninstall {
 
     /** table(first): the primary entry array. */
     static byte[] table(byte[] first) {
-        long at = u64(first, 584), count = u32(first, 592);
-        return Arrays.copyOfRange(first, (int) (at * 512), (int) (at * 512 + count * 128));
+        int block = Mu300Gpt.sectorSize(first);
+        long tableLba = u64(first, block + 72), count = u32(first, block + 80), entry = u32(first, block + 84);
+        long offset = tableLba * block, length = count * entry;
+        if (tableLba < 0 || tableLba > first.length / block || count < 1 || count > 1024 || entry != 128
+                || length <= 0 || offset > first.length - length)
+            throw new IllegalArgumentException("GPT primary table range is invalid");
+        return Arrays.copyOfRange(first, (int) offset, (int) (offset + length));
     }
     /** with_table(): both GPT copies with the updated entry array and fresh CRCs, validated by gpt_space. */
     static byte[][] withTable(byte[] first, byte[] last, byte[] updated, long sectors) throws Refused {
+        int block = Mu300Gpt.sectorSize(first);
         byte[][] out = new byte[2][];
         for (int k = 0; k < 2; k++) {
             byte[] raw = (k == 0 ? first : last).clone();
-            int header = k == 0 ? 512 : raw.length - 512;
-            int offset = k == 0 ? (int) (u64(first, 584) * 512) : 0;
+            int header = k == 0 ? block : raw.length - block;
+            long tableLba = u64(first, block + 72), count = u32(first, block + 80), entry = u32(first, block + 84);
+            if (count < 1 || count > 1024 || entry != 128 || updated.length != count * entry)
+                throw new Refused("Unsupported GPT entry table geometry");
+            long tableOffset = k == 0 ? tableLba * block : 0;
+            if (tableLba < 0 || tableLba > raw.length / block || tableOffset < 0 || updated.length > raw.length
+                    || tableOffset > raw.length - updated.length)
+                throw new Refused("GPT entry table range is invalid");
+            int offset = (int) tableOffset;
             System.arraycopy(updated, 0, raw, offset, updated.length);
             Mu300Boot.put32le(raw, header + 88, Mu300Boot.crc32(updated, 0, updated.length));
             Mu300Boot.put32le(raw, header + 16, 0);
@@ -161,8 +181,10 @@ final class Uninstall {
         Layout l = new Layout();
         l.expands = root.start == data.end + 1;
         l.target = l.expands ? new Mu300Gpt.Part(data.n, data.start, root.end, data.name) : data;
+        if (l.target.end % info.factor != info.factor - 1)
+            throw new Refused("Android userdata end is not aligned to GPT logical blocks / userdata 终点未按 GPT 逻辑块对齐");
         Arrays.fill(updated, at, at + 128, (byte) 0);
-        put64(updated, (data.n - 1) * 128 + 40, l.target.end);
+        put64(updated, (data.n - 1) * 128 + 40, l.target.end / info.factor);
         l.after = withTable(first, last, updated, sectors);
         l.data = data; l.root = root; l.info = info;
         return l;
@@ -191,13 +213,20 @@ final class Uninstall {
 
     static Volume androidVolume(Mu300Internal.Io io, Device d, boolean allowSmall) throws IOException {
         String source = io.sh("readlink -f " + Mu300Internal.q(d.s.source), true).trim();
-        if (!source.matches("/dev/(?:block/)?(?:mmcblk\\d+p\\d+|dm-\\d+)"))
+        if (!source.matches("/dev/(?:block/)?(?:mmcblk\\d+p[1-9]\\d*|sd[a-z]+[1-9]\\d*|dm-\\d+)"))
             throw new Refused("Cannot identify Android data mapping / 无法确认 Android data 映射设备");
         String base = source.substring(source.lastIndexOf('/') + 1);
         String sz = io.sh("cat /sys/class/block/" + base + "/size", true).trim();
         if (!NUM.matcher(sz).matches()) throw new Refused("Cannot identify Android data mapping / 无法确认 Android data 映射设备");
-        long mapped = Long.parseLong(sz) * 512;
-        byte[] raw = Mu300Internal.read(io, "dd if=" + source + " bs=1024 skip=1 count=1 2>/dev/null", 1024);
+        long mapped = bytes512(Long.parseLong(sz));
+        int block = d.s.sectorSize;
+        if (block != 512 && block != 4096) throw new Refused("Unsupported Android data logical block size");
+        long skip = 1024 / block;
+        int offset = 1024 % block;
+        long count = (offset + 1024L + block - 1) / block;
+        byte[] aligned = Mu300Internal.read(io, "dd if=" + source + " bs=" + block + " skip=" + skip + " count=" + count + " 2>/dev/null", count * block);
+        if (aligned.length != count * block || aligned.length < offset + 1024) throw new Refused("Incomplete Android filesystem superblock / Android 文件系统超级块读取不完整");
+        byte[] raw = Arrays.copyOfRange(aligned, offset, offset + 1024);
         if (raw.length != 1024) throw new Refused("Incomplete Android filesystem superblock / Android 文件系统超级块读取不完整");
         String kind; long size; int uuidAt;
         if ((raw[56] & 0xff) == 0x53 && (raw[57] & 0xff) == 0xef) {
@@ -206,11 +235,13 @@ final class Uninstall {
         } else if ((u32(raw, 0)) == 0xf2f52010L) {
             kind = "f2fs"; uuidAt = 108;
             if (u32(raw, 16) != 12) throw new Refused("Unsupported Android F2FS block size");
-            size = u64(raw, 36) << 12;
+            long blocks = u64(raw, 36);
+            if (blocks <= 0 || blocks > Long.MAX_VALUE / 4096) throw new Refused("Invalid Android F2FS capacity");
+            size = blocks * 4096;
         } else {
             throw new Refused("Android data is not a readable ext4/F2FS filesystem / 无法读取 Android data 的 ext4/F2FS 文件系统");
         }
-        long userdata = d.s.size * 512;
+        long userdata = bytes512(d.s.size);
         if (!(0 < size && size <= mapped && mapped <= userdata && (allowSmall || mapped - size <= MIB4)))
             throw new Refused("Android filesystem/mapping capacity differs / Android 文件系统或映射容量不符: filesystem="
                     + size + ", mapped=" + mapped + ", userdata=" + userdata + " bytes");
@@ -225,7 +256,9 @@ final class Uninstall {
         long blocks = u32(raw, 4) | (u32(raw, 336) << 32);
         long shift = u32(raw, 24);
         if (shift > 6) throw new Refused("Invalid Android ext4 block size");
-        long cap = blocks * (1024L << shift);
+        long blockBytes = 1024L << shift;
+        if (blocks <= 0 || blocks > Long.MAX_VALUE / blockBytes) throw new Refused("Invalid Android ext4 capacity");
+        long cap = blocks * blockBytes;
         if (cap <= 0) throw new Refused("Invalid Android ext4 capacity");
         return cap;
     }
@@ -351,9 +384,9 @@ final class Uninstall {
 
     static Map<String, Object> evidence(Mu300Internal.Io io, Device d, Pkg pkg, Mu300Gpt.Part root, byte[] bootBackup) throws IOException {
         String disk = d.partitionNode();
-        String node = disk + "p" + root.n;
-        long capacity = (root.end - root.start + 1) * 512;
-        if (!NODE.matcher(node).matches() || !node.equals(d.s.root) || d.rootStart != root.start || d.rootSize * 512 != capacity)
+        String node = partNode(disk, root.n);
+        long capacity = bytes512(sectorsBetween(root.start, root.end));
+        if (!NODE.matcher(node).matches() || !node.equals(d.s.root) || d.rootStart != root.start || bytes512(d.rootSize) != capacity)
             throw new Refused("Kernel OpenWrt node differs from verified GPT; reboot Android / 内核分区节点与 GPT 不符，请重启 Android");
         String idle = io.sh("set -e; n=" + node + "; h=$(ls -A /sys/class/block/$n/holders); d=$(cat /sys/class/block/$n/dev); "
                 + "m=$(awk -v n=\"$d\" '$3==n {print \"BUSY\"}' /proc/self/mountinfo); if [ -z \"$h$m\" ]; then echo IDLE; else echo BUSY; fi", true).trim();
@@ -368,8 +401,11 @@ final class Uninstall {
             String v = io.sh("blockdev --getsize64 " + dev, true).trim();
             if (!NUM.matcher(v).matches()) throw new Refused("Invalid boot partition size / 启动分区大小无效");
             size = Long.parseLong(v);
-            header = Mu300Internal.read(io, "dd if=" + dev + " bs=512 count=8 2>/dev/null", 4096);
-            tail = Mu300Internal.read(io, "dd if=" + dev + " bs=512 skip=" + (size / 512 - 1) + " count=1 2>/dev/null", 512);
+            int block = d.s.sectorSize;
+            if ((block != 512 && block != 4096) || size < 4096 || size % block != 0) throw new Refused("Unsupported boot logical block geometry / 启动分区逻辑块几何不受支持");
+            header = Mu300Internal.read(io, "dd if=" + dev + " bs=" + block + " count=" + (4096 / block) + " 2>/dev/null", 4096);
+            byte[] lastBlock = Mu300Internal.read(io, "dd if=" + dev + " bs=" + block + " skip=" + (size / block - 1) + " count=1 2>/dev/null", block);
+            tail = Arrays.copyOfRange(lastBlock, block - 512, block);
         }
         UninstallBoot.LinuxBoot lb;
         try { lb = UninstallBoot.inspectLinuxBoot(header, tail, size, pkg.family, d.other); }
@@ -384,10 +420,15 @@ final class Uninstall {
         }
         final String part = "/dev/block/" + node;
         InstallEvidence.Reader reader = (offset, length) -> {
-            if (offset < 0 || length <= 0 || offset + length > capacity) throw new IOException("Incomplete OpenWrt partition read");
-            long a = offset / 512, b = (offset + length + 511) / 512;
-            byte[] raw = Mu300Internal.read(io, "dd if=" + part + " bs=512 skip=" + a + " count=" + (b - a) + " 2>/dev/null", (b - a) * 512);
-            int from = (int) (offset - a * 512);
+            if (offset < 0 || length <= 0 || offset > capacity || length > capacity - offset) throw new IOException("Incomplete OpenWrt partition read");
+            long end = offset + length;
+            int ioBlock = d.s.sectorSize;
+            if (ioBlock != 512 && ioBlock != 4096) throw new IOException("Unsupported OpenWrt logical block size");
+            long a = offset / ioBlock, remainder = offset % ioBlock;
+            long ioCount = (remainder + length + ioBlock - 1) / ioBlock;
+            if (ioCount <= 0 || ioCount > Long.MAX_VALUE / ioBlock) throw new IOException("OpenWrt read length overflows");
+            byte[] raw = Mu300Internal.read(io, "dd if=" + part + " bs=" + ioBlock + " skip=" + a + " count=" + ioCount + " 2>/dev/null", ioCount * ioBlock);
+            int from = (int) remainder;
             if (raw.length < from + length) throw new IOException("Incomplete OpenWrt partition read");
             return Arrays.copyOfRange(raw, from, from + length);
         };
@@ -420,19 +461,28 @@ final class Uninstall {
     static Prepared prepare(Mu300Internal.Io io, Device d, Pkg pkg) throws IOException {
         if (!d.booted || d.s.root == null)
             throw new Refused("Boot rooted Android with an installed internal partition / 请先启动有 root 的 Android，并确认存在内置 OpenWrt 分区");
+        if (!("emmc".equals(d.s.kind) || "ufs".equals(d.s.kind))
+                || ("ufs".equals(d.s.kind) && (!"mu300".equals(pkg.family) || pkg.storageLibrary == null
+                || !Mu300Boot.sha256(pkg.storageLibrary).equals("7dc62136b7f95a3d18e8218b13649c04729fe3c7d29814acb68b82ceb1f44233"))))
+            throw new Refused("UFS identity library or package is unsupported / UFS 存储身份库或安装包不受支持");
         String disk = "/dev/block/" + d.partitionNode();
         long sectors = d.s.diskSize;
+        int block = d.s.sectorSize, factor = block / 512;
+        if ((block != 512 && block != 4096) || sectors % factor != 0)
+            throw new Refused("Unsupported internal GPT logical block size / 内置 GPT 逻辑块大小不受支持");
         io.step("读取分区表（只读）", false);
-        byte[] primary = Mu300Internal.read(io, "dd if=" + disk + " bs=512 skip=1 count=1 2>/dev/null", 512);
-        byte[] backup = Mu300Internal.read(io, "dd if=" + disk + " bs=512 skip=" + (sectors - 1) + " count=1 2>/dev/null", 512);
+        long logicalSectors = sectors / factor;
+        byte[] primary = Mu300Internal.read(io, "dd if=" + disk + " bs=" + block + " skip=1 count=1 2>/dev/null", block);
+        byte[] backup = Mu300Internal.read(io, "dd if=" + disk + " bs=" + block + " skip=" + (logicalSectors - 1) + " count=1 2>/dev/null", block);
         long[] ft;
         try { ft = Mu300Gpt.backupLayout(primary, backup, sectors); }
         catch (IllegalArgumentException e) { throw new Refused(e.getMessage()); }
-        byte[] first = Mu300Internal.read(io, "dd if=" + disk + " bs=512 count=" + ft[0] + " 2>/dev/null", ft[0] * 512);
-        byte[] last = Mu300Internal.read(io, "dd if=" + disk + " bs=512 skip=" + ft[1] + " count=" + (sectors - ft[1]) + " 2>/dev/null", (sectors - ft[1]) * 512);
+        byte[] first = Mu300Internal.read(io, "dd if=" + disk + " bs=" + block + " count=" + (ft[0] / factor) + " 2>/dev/null", bytes512(ft[0]));
+        byte[] last = Mu300Internal.read(io, "dd if=" + disk + " bs=" + block + " skip=" + (ft[1] / factor) + " count=" + ((sectors - ft[1]) / factor) + " 2>/dev/null", bytes512(sectors - ft[1]));
         Layout l = deviceLayout(first, last, sectors, pkg.rootName());
-        long userdataBytes = d.s.size * 512;
-        if (!(d.partitionNode() + "p" + l.root.n).equals(d.s.root) || d.s.start != l.data.start || userdataBytes != (l.data.end - l.data.start + 1) * 512)
+        long userdataBytes = bytes512(d.s.size);
+        if (!partNode(d.partitionNode(), l.root.n).equals(d.s.root) || d.s.start != l.data.start
+                || userdataBytes != bytes512(sectorsBetween(l.data.start, l.data.end)))
             throw new Refused("Kernel partition nodes differ from GPT; reboot Android / 内核分区节点与 GPT 不符，请重启 Android");
         Mu300Gpt.Part misc = partition(l.info, "misc"), ba = partition(l.info, "boot_a"), bb = partition(l.info, "boot_b");
         io.step("核对设备上的 OpenWrt 安装证据（只读）", false);
@@ -443,11 +493,11 @@ final class Uninstall {
         p.before = new byte[][]{first, last};
         p.after = l.after;
         p.front = ft[0]; p.tail = ft[1]; p.total = sectors;
-        p.rootStart = l.root.start; p.rootSize = l.root.end - l.root.start + 1;
-        p.openwrtBytes = p.rootSize * 512;
-        p.androidBytes = (l.target.end - l.target.start + 1) * 512;
+        p.rootStart = l.root.start; p.rootSize = sectorsBetween(l.root.start, l.root.end);
+        p.openwrtBytes = bytes512(p.rootSize);
+        p.androidBytes = bytes512(sectorsBetween(l.target.start, l.target.end));
         p.previousAndroidBytes = userdataBytes;
-        String pfx = d.partitionNode() + "p";
+        String pfx = d.partitionNode() + (d.partitionNode().startsWith("mmcblk") ? "p" : "");
         p.nodes.put("userdata", pfx + l.data.n);
         p.nodes.put(pkg.rootName(), pfx + l.root.n);
         p.nodes.put("misc", pfx + misc.n);
@@ -467,8 +517,7 @@ final class Uninstall {
                 if (reason != null) throw new Refused(reason);
                 eligible(d, p.volume);
                 LinkedHashMap<String, byte[]> tools = growthTools(pkg, p.volume.filesystem);
-                UninstallBoot.build(pkg.base, pkg.family, tools, pkg.worker);     // dry build: the request must fit
-                p.tools = tools;
+                p.tools.putAll(tools);
                 p.action = "grow-" + p.volume.filesystem;
             } catch (IOException | IllegalArgumentException error) {
                 reason = error.getMessage();
@@ -477,6 +526,9 @@ final class Uninstall {
                 p.fingerprint = fingerprint(d, p, reason);
             }
         }
+        if ("ufs".equals(d.s.kind)) p.tools.put("openwrt-uninstall/storage-lib.sh", pkg.storageLibrary.clone());
+        try { UninstallBoot.build(pkg.base, pkg.family, p.tools, pkg.worker); }
+        catch (IllegalArgumentException e) { throw new Refused(e.getMessage()); }
         p.reason = reason;
         p.wipe = "reset".equals(p.action);
         for (Map.Entry<String, byte[]> e : p.tools.entrySet()) p.toolHashes.put(e.getKey(), Mu300Boot.sha256(e.getValue()));
@@ -486,6 +538,9 @@ final class Uninstall {
     static String fingerprint(Device d, Prepared p, String reason) {
         TreeMap<String, Object> ev = new TreeMap<>();
         ev.put("cid", d.s.cid);
+        ev.put("storage_kind", d.s.kind);
+        ev.put("disk_node", d.s.diskNode);
+        ev.put("sector_size", d.s.sectorSize);
         ev.put("slot", "_" + d.slot);
         ev.put("profile", d.profile);
         ev.put("layout", Arrays.asList(Mu300Boot.sha256(p.before[0]), Mu300Boot.sha256(p.before[1])));

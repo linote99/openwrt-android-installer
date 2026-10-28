@@ -301,9 +301,9 @@ public class MainActivity extends Activity implements JobManager.Listener {
         ht.addView(title);
         ht.addView(ui.text("安装、更新与恢复 · 安卓版 v" + BuildInfo.VERSION_NAME, 12, ui.muted, false));
         head.addView(ht, ui.weight(1));
-        TextView about = ui.text("使用说明", 13, ui.text, true);
+        TextView about = ui.text("设置", 13, ui.text, true);
         about.setGravity(Gravity.CENTER);
-        about.setContentDescription("使用说明");
+        about.setContentDescription("设置");
         about.setPadding(ui.dp(12), 0, ui.dp(12), 0);
         about.setBackground(ui.ripple(ui.round(ui.surface, ui.border, 16)));
         about.setOnClickListener(v -> startActivity(new android.content.Intent(this, AboutActivity.class)));
@@ -712,7 +712,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
         if (prefs.getInt("intro_dismissed_code", -1) == BuildInfo.VERSION_CODE) return;
         LinearLayout box = ui.col();
         box.setPadding(ui.dp(20), ui.dp(8), ui.dp(20), 0);
-        box.addView(ui.text("开始之前，请先仔细阅读「使用说明」：\n\n"
+        box.addView(ui.text("开始之前，请先仔细阅读「设置 → 使用说明」：\n\n"
                 + "• 刷机有风险：写入分区、启动镜像出错可能导致设备无法开机，请按说明备份并保持供电。\n"
                 + "• 确认机型与安装包匹配：只用与目标设备型号对应的 OpenWrt 安装包。\n"
                 + "• 内置安装可能需要格式化 Android 数据：userdata 加密或空间不足时，只能清空 Android 全部数据后安装。",
@@ -721,10 +721,10 @@ public class MainActivity extends Activity implements JobManager.Listener {
         never.setText("不再提示");
         box.addView(never, ui.mw(8));
         new AlertDialog.Builder(this)
-                .setTitle("请先阅读使用说明")
+                .setTitle("请先阅读设置中的使用说明")
                 .setView(box)
                 .setCancelable(false)
-                .setPositiveButton("查看使用说明", (d, w) -> {
+                .setPositiveButton("打开设置", (d, w) -> {
                     introDone(never.isChecked());
                     startActivity(new android.content.Intent(this, AboutActivity.class));
                 })
@@ -828,7 +828,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
         card.addView(check, ui.mw(8));
         if (!jm.checkPassed()) {
             card.addView(ui.text(jm.method == JobManager.Method.UNINSTALL
-                    ? "卸载检查只读取，不写入：安装包中的卸载启动镜像与维护工具、eMMC 与 GPT（主备两份）、已安装的 OpenWrt 分区与启动镜像（安装证据）、"
+                    ? "卸载检查只读取，不写入：安装包中的卸载启动镜像与维护工具、内部存储身份与 GPT（主备两份）、已安装的 OpenWrt 分区与启动镜像（安装证据）、"
                             + "userdata 文件系统与加密状态，算出 Android 容量、归还给 Android 的空间、释放为空闲的空间，以及能否保留 Android 数据。"
                             + (jm.mode == JobManager.Mode.LOCAL ? "\n本机模式不提供卸载，请用另一台手机通过 USB / 局域网操作。" : "")
                     : jm.muInternal(jm.method)
@@ -938,7 +938,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
         String impact;
         boolean wipe = (m == JobManager.Method.PART && jm.route() == JobManager.Route.FORMAT) || jm.uninstallWipe();
         if (un && jm.unResume != null)
-            impact = "继续上次未完成的卸载：先核对是同一台设备（eMMC CID、Android 槽位），再按记录检查离线卸载是否完成，必要时重新写入扩容请求，"
+            impact = "继续上次未完成的卸载：先核对是同一台设备（内部存储身份、Android 槽位），再按记录检查离线卸载是否完成，必要时重新写入扩容请求，"
                     + "最后校验 Android 容量、清除卸载用的启动请求并把 Linux 槽恢复为 Android 启动镜像。不会创建新的卸载计划。";
         else if (un && wipe)
             impact = "删除 OpenWrt 分区（含 OpenWrt 系统和全部设置，请先在 OpenWrt 里导出配置），并格式化 userdata：Android 应用、账号、照片和内部存储全部清空，相当于恢复出厂。"

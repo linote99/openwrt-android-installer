@@ -12,8 +12,13 @@ note() { summary+=("$1"); echo "== $1"; }
 
 MUJ="$J/Mu300Internal.java $J/Mu300Gpt.java $J/Mu300Boot.java $J/Lz4.java $J/RootfsFilter.java"
 AJ=$(ls -d "${ANDROID_HOME:-/workspace/.android-sdk}"/platforms/android-35/android.jar 2>/dev/null)
-javac -encoding UTF-8 -nowarn -cp "$AJ" -sourcepath app/src/main/java:build/gen -d "$B/cls" $J/MiniJson.java $J/PackageInspector.java $MUJ test/DesktopInspect.java test/RuleTest.java test/Mu300FlowTest.java 2>&1 | grep -v '^Note'
+javac -encoding UTF-8 -nowarn -cp "$AJ" -sourcepath app/src/main/java:build/gen -d "$B/cls" $J/MiniJson.java $J/PackageInspector.java $MUJ test/DesktopInspect.java test/RuleTest.java test/Mu300FlowTest.java test/UfsGptTest.java 2>&1 | grep -v '^Note'
 java -cp "$B/cls" top.linote.owrtinstaller.RuleTest > "$B/rule.txt" 2>&1; note "RuleTest rc=$? $(tail -1 "$B/rule.txt")"
+mkdir -p "$B/mismatch"
+javac -encoding UTF-8 -nowarn -cp "build/classes:$AJ" -d "$B/mismatch" test/ReadOnlyMismatchTest.java
+java -cp "$B/mismatch:build/classes:$AJ" top.linote.owrtinstaller.ReadOnlyMismatchTest > "$B/mismatch.txt" 2>&1
+note "ReadOnlyMismatchTest rc=$? $(tail -1 "$B/mismatch.txt")"
+java -cp "$B/cls" top.linote.owrtinstaller.UfsGptTest > "$B/ufs-gpt.txt" 2>&1; note "UfsGptTest rc=$? $(tail -1 "$B/ufs-gpt.txt")"
 bash test/version-check.sh > "$B/version.txt" 2>&1; note "version-check rc=$? $(tail -1 "$B/version.txt")"
 bash test/ui-check.sh > "$B/ui.txt" 2>&1; note "ui-check rc=$? $(tail -1 "$B/ui.txt")"
 # Android compatibility of the APK's own classes (build.sh output): APIs must exist at minSdk 26 and

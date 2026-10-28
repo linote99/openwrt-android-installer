@@ -64,9 +64,9 @@ final class JobManager {
                         + "把 OpenWrt 写入已准备好的 e5root（需要第一阶段在本机保存的记录）",
                 "继续格式化后的安装", "“格式化 userdata”安装的第二阶段：Android 重置后先重新打开 ADB、重新安装 Magisk（面具）并给 Shell 授予 root，再"
                         + "把 OpenWrt 写入已准备好的 mu300root（需要第一阶段在本机保存的记录）"),
-        UNINSTALL("卸载并归还空间【高级】", "删除内置 e5root 分区，空间还给 Android（相邻时）或释放为未分配空间；能保留时保留 Android 数据，"
+        UNINSTALL("卸载并归还空间【高级】", "删除内置 e5root / mu300root 分区，空间还给 Android（相邻时）或释放为未分配空间；能保留时保留 Android 数据，"
                         + "不能保留时说明原因并需额外确认恢复出厂。只能通过 USB / 局域网操作另一台设备",
-                "卸载并归还空间【高级】", "删除内置 mu300root 分区，空间还给 Android（相邻时）或释放为未分配空间；能保留时保留 Android 数据，"
+                "卸载并归还空间【高级】", "删除内置 mu300root 分区（MU300 UFS 仅支持指定安装包），空间还给 Android（相邻时）或释放为未分配空间；能保留时保留 Android 数据，"
                         + "不能保留时说明原因并需额外确认恢复出厂。只能通过 USB / 局域网操作另一台设备");
         final String title, summary, muTitle, muSummary;
         Method(String t, String s, String mt, String ms) { title = t; summary = s; muTitle = mt; muSummary = ms; }
@@ -473,6 +473,15 @@ final class JobManager {
     static String problemFor(PackageInspector.Result p, Device d) {
         if (p == null || d == null || !d.probed) return null;
         return p.targetProblem(d.model, d.device, d.vbstate, d.platform);
+    }
+
+    /** Fail closed before any step-4 preflight when the target identity is unknown or incompatible. */
+    static String readOnlyCheckBlocker(PackageInspector.Result p, Device d) {
+        if (p == null) return "请先选择并校验安装包；只读检查已停止，未写入任何分区";
+        if (d == null || !d.probed)
+            return "尚未完成目标设备信息检查，无法确认机型；请先在“设备”页完成检查。只读检查已停止，未写入任何分区";
+        String why = problemFor(p, d);
+        return why == null ? null : "安装包与目标设备机型不匹配：" + why + "。只读检查已安全停止，未写入任何分区";
     }
 
     private void resetTargetState() {
@@ -1120,6 +1129,16 @@ final class JobManager {
     /** Target access for the ported MU300 computer-side flow. */
     private Mu300Internal.Io muIo() {
         return new Mu300Internal.Io() {
+            @Override public String storageLibrary() throws IOException {
+                File lib = new File(muLocal(), "desktop/storage-lib.sh");
+                if (!lib.isFile()) return null;
+                String expected = Mu300Internal.localSums(muLocal()).get("desktop/storage-lib.sh");
+                byte[] bytes = Mu300Internal.readAll(lib);
+                if (expected == null || !expected.equals(Mu300Internal.hex(Mu300Internal.sha().digest(bytes)))
+                        || !expected.equals("7dc62136b7f95a3d18e8218b13649c04729fe3c7d29814acb68b82ceb1f44233"))
+                    throw new IOException("UFS storage library checksum mismatch; refuse device probing");
+                return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+            }
             @Override public String sh(String script, boolean root) throws IOException { return sh(script, root, 600); }
             @Override public String sh(String script, boolean root, int silenceSec) throws IOException {
                 return sh(script, root, silenceSec, null);
@@ -1237,7 +1256,7 @@ final class JobManager {
         if (!muLocalReady()) throw new IOException("本机已没有内置安装文件，请重新选择安装包");
         String why = problemFor(pkg, target());
         if (why != null) throw new IOException(why + "；不要跨机型刷入");
-        lastLine = "只读检查 eMMC、GPT 与 userdata";
+        lastLine = "只读检查内部存储、GPT 与 userdata";
         changed();
         Mu300Internal.Plan p = Mu300Internal.check(muIo(), kind(m));
         muPlan = p;
@@ -1340,6 +1359,11 @@ final class JobManager {
             java.util.Map<String, String> sums = Mu300Internal.localSums(muLocal());
             up.base = Mu300Internal.readAll(new File(muLocal(), Mu300Internal.BOOT));
             if (!Mu300Boot.sha256(up.base).equals(sums.get(Mu300Internal.BOOT))) throw new IOException("本机暂存的 boot-linux.img 已变化，请重新选择安装包");
+            String storageLibrary = io.storageLibrary();
+            if (storageLibrary == null || !Mu300Boot.sha256(storageLibrary.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+                    .equals("7dc62136b7f95a3d18e8218b13649c04729fe3c7d29814acb68b82ceb1f44233"))
+                throw new IOException("本机暂存的 UFS storage library 缺失或校验不符");
+            up.storageLibrary = storageLibrary.getBytes(java.nio.charset.StandardCharsets.UTF_8);
             up.repairDir = new File(muLocal(), Mu300Internal.REPAIR);
             up.repairSums = sums;
             unProfile = Mu300Internal.identify(io).profile;
@@ -1381,7 +1405,8 @@ final class JobManager {
         if (pend != null) {
             UninstallRun.Rec rec = UninstallRun.load(pend);
             Uninstall.Device d = Uninstall.probe(io, up.rootName(), rec.s("profile"));
-            if (d.s.cid.equals(rec.s("cid"))) {
+            String recordedKind = rec.s("storage_kind").isEmpty() ? "emmc" : rec.s("storage_kind");
+            if (d.s.cid.equals(rec.s("cid")) && d.s.kind.equals(recordedKind)) {
                 if (!up.family.equals(rec.s("family")))
                     throw new IOException("这台设备有未完成的卸载（" + rec.s("family") + " 系列），请选择与记录相同机型的安装包");
                 unResume = pend;
@@ -1391,7 +1416,8 @@ final class JobManager {
                 append("✓ 找到这台设备未完成的卸载记录 " + pend.getName() + "（阶段 " + rec.s("stage") + "）。不会创建新的卸载计划；点“开始”继续收尾。");
                 return;
             }
-            append("  本机还有另一台设备（eMMC CID …" + rec.s("cid").substring(24) + "）未完成的卸载记录 " + pend.getName() + "，与当前设备无关");
+            append("  本机还有另一台设备（" + ("ufs".equals(rec.s("storage_kind")) ? "UFS 身份" : "eMMC CID") + " …" + rec.s("cid").substring(24)
+                    + "）未完成的卸载记录 " + pend.getName() + "，与当前设备无关");
         }
         lastLine = "只读检查：分区表、启动镜像、安装证据与 Android data";
         changed();
@@ -1400,6 +1426,8 @@ final class JobManager {
         unPrep = p;
         StringBuilder b = new StringBuilder();
         b.append("将删除：").append(up.rootName()).append("（/dev/block/").append(d.s.root).append("，").append(Uninstall.human(p.openwrtBytes)).append("，含 OpenWrt 系统与全部设置）");
+        b.append("\n内部存储：").append("ufs".equals(d.s.kind) ? "UFS" : "eMMC").append(" · /dev/block/").append(d.s.diskNode)
+                .append(" · GPT 逻辑块 ").append(d.s.sectorSize).append(" B");
         b.append("\nAndroid 容量：").append(Uninstall.human(p.previousAndroidBytes)).append(" → ").append(Uninstall.human(p.androidBytes));
         b.append("\n归还 Android 的空间：").append(Uninstall.human(Math.max(0, p.reclaimed())));
         b.append("\n释放为空闲的空间：").append(Uninstall.human(p.released()));
@@ -1629,6 +1657,8 @@ final class JobManager {
             checkedFingerprint = null;
             checkTarget = checkCard = checkSlots = null;
             clearDataCheck();
+            String blocker = readOnlyCheckBlocker(pkg, target());
+            if (blocker != null) throw new IOException(blocker);
             if (m == Method.UNINSTALL) { checkUninstall(); return; }
             if (muInternal(m)) { checkMu300(m); return; }
             ensureStaged();

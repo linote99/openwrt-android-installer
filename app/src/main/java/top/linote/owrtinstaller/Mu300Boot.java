@@ -28,7 +28,7 @@ final class Mu300Boot {
     static final int S_IFREG = 0100000, S_IFDIR = 0040000, S_IFLNK = 0120000, S_IFCHR = 0020000;
 
     /** Files of desktop/files/boot the builder reads (all checked against the package manifest). */
-    static final String[] ASSETS = {"original-init", "storage.sh", "internal-ext4.sh", "part-prepare.sh",
+    static final String[] ASSETS = {"original-init", "storage.sh", "storage-lib.sh", "internal-ext4.sh", "part-prepare.sh",
             "part-progress.sh", "install-part.sh", "ext4-geometry.sh", "mu300-gpt", "repair/manifest.json"};
 
     interface Assets { byte[] get(String rel) throws java.io.IOException; }
@@ -182,6 +182,7 @@ final class Mu300Boot {
         files.put("init", new Entry(desktopInit(new String(assets.get("original-init"), StandardCharsets.UTF_8)), S_IFREG | 0755));
         files.put("etc/mu300-desktop-root-mode", new Entry((mode + "\n").getBytes(StandardCharsets.UTF_8), S_IFREG | 0644));
         files.put("etc/mu300-desktop-storage.sh", new Entry(assets.get("storage.sh"), S_IFREG | 0644));
+        files.put("etc/mu300-storage.sh", new Entry(assets.get("storage-lib.sh"), S_IFREG | 0644));
         files.put("etc/mu300-internal-ext4.sh", new Entry(assets.get("internal-ext4.sh"), S_IFREG | 0644));
         for (String n : new String[]{"part-prepare.sh", "part-progress.sh", "install-part.sh", "ext4-geometry.sh"})
             files.put("etc/" + n, new Entry(assets.get(n), S_IFREG | 0644));

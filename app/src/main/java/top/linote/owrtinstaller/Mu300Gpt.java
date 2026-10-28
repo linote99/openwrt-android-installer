@@ -31,6 +31,7 @@ final class Mu300Gpt {
 
     static final class Space {
         long front, tail;
+        int blockSize = 512, factor = 1;              // GPT LBA size; sysfs/API geometry remains 512-byte sectors
         final List<Part> parts = new ArrayList<>();
         final List<Integer> empty = new ArrayList<>();
         final List<long[]> gaps = new ArrayList<>();       // {start, sectors}
@@ -47,13 +48,23 @@ final class Mu300Gpt {
 
     private static int crc(byte[] b, int off, int len) { return Mu300Boot.crc32(b, off, len); }
 
-    /** header(): returns {alternate, table, tableSectors} after validation; ids filled with guid+fields. */
-    private static long[] header(byte[] raw, long at, byte[][] idOut) {
-        if (raw.length != 512 || !new String(raw, 0, 8, StandardCharsets.US_ASCII).equals("EFI PART"))
-            throw new IllegalArgumentException("Invalid GPT header");
+    private static boolean signature(byte[] b, int p) {
+        return p >= 0 && p + 8 <= b.length && new String(b, p, 8, StandardCharsets.US_ASCII).equals("EFI PART");
+    }
+
+    /** Detect the GPT logical block size from the primary header's byte offset. */
+    static int sectorSize(byte[] first) {
+        boolean b512 = signature(first, 512), b4096 = signature(first, 4096);
+        if (b512 == b4096) throw new IllegalArgumentException("Missing or ambiguous GPT logical sector size");
+        return b512 ? 512 : 4096;
+    }
+
+    /** header(): returns {alternate, table, tableSectors} in GPT logical blocks; ids filled with guid+fields. */
+    private static long[] header(byte[] raw, long at, int block, byte[][] idOut) {
+        if (raw.length != block || !signature(raw, 0)) throw new IllegalArgumentException("Invalid GPT header");
         ByteBuffer b = le(raw);
         long size = u32(b, 12);
-        if (size < 92 || size > 512) throw new IllegalArgumentException("Invalid GPT header size");
+        if (size < 92 || size > block) throw new IllegalArgumentException("Invalid GPT header size");
         byte[] check = Arrays.copyOf(raw, (int) size);
         long expected = u32(b, 16);
         check[16] = check[17] = check[18] = check[19] = 0;
@@ -64,51 +75,62 @@ final class Mu300Gpt {
         if (current != at || count < 1 || count > 1024 || entrySize != 128) throw new IllegalArgumentException("Unsupported GPT geometry");
         idOut[0] = Arrays.copyOfRange(raw, 56, 72);
         idOut[1] = Arrays.copyOfRange(raw, 80, 92);
-        return new long[]{alternate, table, (count * entrySize + 511) / 512};
+        return new long[]{alternate, table, (count * entrySize + block - 1) / block};
     }
 
-    /** gpt_backup_layout(): {front, tail}. */
+    /** gpt_backup_layout(): {front, tail}, expressed in sysfs 512-byte sectors. */
     static long[] backupLayout(byte[] primary, byte[] backup, long sectors) {
+        return backupLayout(primary, backup, sectors, primary.length);
+    }
+
+    static long[] backupLayout(byte[] primary, byte[] backup, long sectors, int block) {
+        if ((block != 512 && block != 4096) || primary.length != block || backup.length != block
+                || sectors % (block / 512) != 0) throw new IllegalArgumentException("Unsupported GPT logical sector size");
+        int factor = block / 512;
+        long logicalSectors = sectors / factor;
         byte[][] ia = new byte[2][], ib = new byte[2][];
-        long[] a = header(primary, 1, ia);
-        long[] b = header(backup, sectors - 1, ib);
-        if (a[0] != sectors - 1 || b[0] != 1 || !Arrays.equals(ia[0], ib[0]) || !Arrays.equals(ia[1], ib[1]))
+        long[] a = header(primary, 1, block, ia);
+        long[] b = header(backup, logicalSectors - 1, block, ib);
+        if (a[0] != logicalSectors - 1 || b[0] != 1 || !Arrays.equals(ia[0], ib[0]) || !Arrays.equals(ia[1], ib[1]))
             throw new IllegalArgumentException("GPT copies disagree");
-        long front = a[1] + a[2], tail = b[1];
-        if (!(2 <= a[1] && a[1] < front && front <= 4096 && sectors - 4096 <= tail && tail + b[2] == sectors - 1))
+        long front = (a[1] + a[2]) * factor, tail = b[1] * factor;
+        if (!(2L * factor <= a[1] * factor && a[1] * factor < front && front <= 4096
+                && sectors - 4096 <= tail && tail + b[2] * factor == sectors - factor))
             throw new IllegalArgumentException("GPT backup range is invalid");
         return new long[]{front, tail};
     }
 
     /** gpt_space(): validate both on-disk copies and return aligned, genuinely unallocated ranges. */
     static Space space(byte[] first, byte[] last, long sectors) {
-        if (first.length < 1024 || last.length < 512) throw new IllegalArgumentException("Incomplete GPT snapshot");
-        byte[] primary = Arrays.copyOfRange(first, 512, 1024);
-        byte[] backup = Arrays.copyOfRange(last, last.length - 512, last.length);
-        long[] ft = backupLayout(primary, backup, sectors);
+        int block = sectorSize(first), factor = block / 512;
+        if (first.length < block * 2 || last.length < block) throw new IllegalArgumentException("Incomplete GPT snapshot");
+        byte[] primary = Arrays.copyOfRange(first, block, block * 2);
+        byte[] backup = Arrays.copyOfRange(last, last.length - block, last.length);
+        long[] ft = backupLayout(primary, backup, sectors, block);
         long front = ft[0], tail = ft[1];
         if (first.length != front * 512 || last.length != (sectors - tail) * 512) throw new IllegalArgumentException("Incomplete GPT snapshot");
         ByteBuffer p = le(primary), q = le(backup);
-        long start = p.getLong(40), end = p.getLong(48);
-        if (start != q.getLong(40) || end != q.getLong(48) || !(front <= start && start <= end && end < tail))
+        long startLba = p.getLong(40), endLba = p.getLong(48);
+        long start = startLba * factor, end = (endLba + 1) * factor - 1;
+        if (startLba != q.getLong(40) || endLba != q.getLong(48) || !(front <= start && start <= end && end < tail))
             throw new IllegalArgumentException("GPT usable bounds disagree or overlap metadata");
         long table = p.getLong(72);
         int count = (int) u32(p, 80), entry = (int) u32(p, 84);
         int len = count * entry;
-        if (table * 512 + len > first.length || len > last.length) throw new IllegalArgumentException("GPT table checksum/copy mismatch");
-        byte[] data = Arrays.copyOfRange(first, (int) (table * 512), (int) (table * 512) + len);
+        if (table * block + len > first.length || len > last.length) throw new IllegalArgumentException("GPT table checksum/copy mismatch");
+        byte[] data = Arrays.copyOfRange(first, (int) (table * block), (int) (table * block) + len);
         byte[] lastTable = Arrays.copyOfRange(last, 0, len);
         if (!Arrays.equals(data, lastTable) || (crc(data, 0, len) & 0xffffffffL) != u32(p, 88))
             throw new IllegalArgumentException("GPT table checksum/copy mismatch");
         Space s = new Space();
-        s.front = front; s.tail = tail;
+        s.front = front; s.tail = tail; s.blockSize = block; s.factor = factor;
         for (int i = 0; i < count; i++) {
             int o = i * entry;
             boolean zero = true;
             for (int k = 0; k < 16; k++) if (data[o + k] != 0) { zero = false; break; }
             if (zero) { s.empty.add(i); continue; }
             ByteBuffer e = le(data);
-            long a = e.getLong(o + 32), b = e.getLong(o + 40);
+            long a = e.getLong(o + 32) * factor, b = (e.getLong(o + 40) + 1) * factor - 1;
             String name = new String(data, o + 56, 72, StandardCharsets.UTF_16LE);
             int nul = name.indexOf('\0');
             if (nul >= 0) name = name.substring(0, nul);
@@ -135,6 +157,13 @@ final class Mu300Gpt {
     /** gpt_add_root(): both GPT copies with one new Linux partition named mu300root. */
     static byte[][] addRoot(byte[] first, byte[] last, long sectors, long offset, long need, UUID unique) {
         Space info = space(first, last, sectors);
+        return addRoot(first, last, sectors, offset, need, unique, info.blockSize);
+    }
+
+    static byte[][] addRoot(byte[] first, byte[] last, long sectors, long offset, long need, UUID unique, int block) {
+        Space info = space(first, last, sectors);
+        if (info.blockSize != block || offset % info.factor != 0 || need % info.factor != 0)
+            throw new IllegalArgumentException("GPT geometry does not match logical sector size");
         if (info.find(ROOT_NAME) != null) throw new IllegalArgumentException("mu300root already exists");
         boolean inGap = false;
         for (long[] g : info.gaps) if (offset >= g[0] && offset + need <= g[0] + g[1]) inGap = true;
@@ -145,12 +174,12 @@ final class Mu300Gpt {
         System.arraycopy(guidLe(UUID.fromString("0fc63daf-8483-4772-8e79-3d69d8477de4")), 0, entry, 0, 16);
         System.arraycopy(guidLe(unique), 0, entry, 16, 16);
         ByteBuffer eb = le(entry);
-        eb.putLong(32, offset); eb.putLong(40, offset + need - 1);
+        eb.putLong(32, offset / info.factor); eb.putLong(40, (offset + need) / info.factor - 1);
         byte[] nm = ROOT_NAME.getBytes(StandardCharsets.UTF_16LE);
         System.arraycopy(nm, 0, entry, 56, nm.length);
         byte[][] copies = new byte[2][];
-        long primaryTable = le(first).getLong(584) * 512;
-        Object[][] targets = {{first, 512, primaryTable}, {last, last.length - 512, 0L}};
+        long primaryTable = le(first).getLong(block + 72) * block;
+        Object[][] targets = {{first, block, primaryTable}, {last, last.length - block, 0L}};
         for (int c = 0; c < 2; c++) {
             byte[] raw = (byte[]) targets[c][0];
             int ho = (Integer) targets[c][1];

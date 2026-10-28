@@ -1,8 +1,37 @@
-# OpenWrt 安装器（安卓版）v1.6.3
+# OpenWrt 安装器（安卓版）v1.6.9
 
-这个 APK 是从各机型「OpenWrt 一键刷入包」移植来的手机版安装器。在手机上选择完整安装包 ZIP，APK 会先校验、再提取安装文件，然后调用安装包自带的设备端脚本完成安装，全程不需要电脑。
+这是 OpenWrt 一键刷入包的 Android 安装器正式版。它保留原有机型、TF 卡、eMMC 内置安装和 MU300 UFS 安装/重装流程，并为指定 MU300 安装包增加 UFS 卸载与空间回收。APK 会校验完整安装包、读取目标设备存储信息，再调用安装包内对应脚本完成操作。
 
-- APK：`dist/OpenWrt-Installer-Android-1.6.3.apk`（包名 `top.linote.owrtinstaller`，Android 8.0+，versionCode 15，签名与之前各版相同，可以直接覆盖升级）
+- APK：`dist/OpenWrt-Installer-Android-1.6.9.apk`（package `top.linote.owrtinstaller`；Android 8.0+，versionCode 21；沿用正式签名证书）
+
+## 1.6.9 正式版
+
+- 修复第四步只读检查遇到安装包与目标机型不匹配时的崩溃风险：检查开始前先要求目标型号信息已确认，并对不匹配情况给出安全拒绝提示；不会继续设备预检或写入分区。
+- 将首页“使用说明”入口和说明页改名为“设置”。说明、MU300 UFS 适配、更新、支持机型、注意事项、高级功能等栏目均改为默认折叠，点击栏目标题展开或收起。
+- 新增离线机型不匹配回归测试；保留 `top.linote.owrtinstaller`、应用显示名 `OpenWrt 安装器`、正式签名，以及既有 eMMC/TF/UFS 安装和 UFS 卸载行为。
+- 仅使用本地模拟与合成测试验证；未连接或写入真实设备，未发布到 GitHub 或博客。
+
+## 1.6.8 正式版
+
+- 采用正式版本号 `1.6.8`（versionCode 20），保留正式包名 `top.linote.owrtinstaller`、安装显示名称 `OpenWrt 安装器` 和既有签名谱系。
+- 从作者提供的 MU300 完整包移植卸载与空间回收，只适用于 `mu300-openwrt-25.12.5-r20261027.135818-g0043a5d8-s5351d2bc-k.zip`。应用先核验包内固定哈希的 storage library，再确认 MU300 UFS 身份、磁盘/LUN、安装证据和 GPT 主备表。
+- GPT 支持 512/4096-byte logical block，分区几何保持 512-byte sysfs sectors；读写偏移、GPT LBA 换算及回收边界均做对齐和范围检查。相邻的 `mu300root` 才并入 `userdata`；不相邻时只释放 OpenWrt 分区，不越过中间分区。身份、布局、安装证据或范围无法确认时拒绝继续，格式化确认不能绕过。
+- MU300 UFS 原有安装/重装流程、eMMC 和 TF 卡流程保持不变。验证为本地构建、静态检查和合成/模拟离线测试；没有连接或写入真实设备，也没有真实 UFS 安装/卸载验证。
+
+## 1.6.7 正式版
+
+- 采用正式版本号 `1.6.7`（versionCode 19），保留正式包名 `top.linote.owrtinstaller` 和既有签名。
+- 应用内「使用说明」新增 MU300 UFS 适配范围和所需固件包；当时明确 UFS 安装/重装可用，但尚未开放从 UFS 移除 OpenWrt 的操作。
+- 应用安装后的显示名称为 `OpenWrt 安装器`；UFS 适配保持启用，既有 eMMC 内置和 TF 卡流程不变。
+
+## 1.6.6 正式版
+
+- 采用正式版本号 `1.6.6`（versionCode 18），保留正式包名 `top.linote.owrtinstaller` 和既有签名。
+- 在应用内「使用说明」增加更新途径：查看[博客对应文章（含下载链接）](https://www.linote.top/posts/openwrt-android-installer/)，或[GitHub 开源仓库](https://github.com/linote99/openwrt-android-installer)。
+- 针对 `mu300-openwrt-25.12.5-r20261027.135818-g0043a5d8-s5351d2bc-k.zip` 适配 UFS 存储库与 Android 安装脚本；识别 `sdXn` userdata、对应 UFS LUN、UFS 身份摘要和 512/4096 字节逻辑块大小。
+- GPT 算法仍以 Android sysfs 使用的 512 字节扇区计几何，按 GPT 逻辑块读写/校验主表与备份表；Boot ramdisk 会携带新包要求的共享存储库。
+- 覆盖目标为独立内置分区（空闲空间、重装已有分区，以及包脚本支持的两阶段准备/续装）。TF 卡安装路径不变。
+- 不支持 UFS 卸载/归还空间；不适用于其他 MU300 包版本。验证边界与测试记录见 `VERIFICATION.md`；UFS 适配不应被解读为真实设备写入测试。
 
 ## 1.6.3：修复 TF 卡安装后基带起不来、WAN 连不上
 用安卓版往 TF 卡装 MU300 系列（MU300 / F50 / U30 Air / V50）时，装好的系统里根目录 `/`、`/lib`、`/opt` 和 `/opt/mu300/android/vendor` 等目录变成只有 root 能读（0700）。基带服务 `modem_control` 是降权运行的，读不到这些厂商配置，基带状态停在 255，WAN 一直连不上。
@@ -165,7 +194,7 @@ MU300 现在除了 TF 卡，还可以装到内置存储，三种方式都按原�
 5. 连接的 ADB 密钥是本应用自己生成的 RSA-2048 密钥，保存在应用私有目录里，和任何其他项目的密钥都无关。
 6. 暂不支持 Android 11 以后的「无线调试」配对码方式，只支持经典的 5555 端口。
 
-在局域网模式下，安装文件会先推送到目标设备的 `/data/local/tmp/owrt-apk-stage`，再由目标设备上的 root 移到 `/data/adb/owrt-apk/pkg`、改归 root 所有，并再做一次 SHA-256 校验。安装任务在目标设备后台运行，**Wi-Fi 断开不影响安装**，重新连接后点「继续未完成的安装 / 查看日志」就能接上进度。
+在局域网或 USB 模式下，安装文件会先推送到目标设备 `/data/local/tmp/owrt-apk-stage`，再由 root 移到 `/data/adb/owrt-apk/pkg`、改归 root 所有，并再做一次 SHA-256 校验。安装任务在目标设备后台运行，**Wi-Fi 断开不影响安装**，重新连接后点「继续未完成的安装 / 查看日志」就能接上进度。
 
 ## 三种安装方式
 
@@ -192,7 +221,7 @@ MU300 现在除了 TF 卡，还可以装到内置存储，三种方式都按原�
 5. 核对检查结果和「数据影响」。如果是分区或镜像方式，还要选择大小。勾选确认后点「确认并开始」，再输入 `yes`。
 6. 完成后，界面会显示热点名称和密码，以及 LuCI 地址（E5 系列 `http://192.168.9.1`，MU300 `http://192.168.77.1`）（用户名和密码都是 root，请尽快修改）。可以选择现在重启目标设备，也可以稍后手动重启。如果用的是分区方式，重启后屏幕会显示离线缩容的进度，完成后会自动再重启一次，进入 OpenWrt。
 
-E5 系列的安装器日志和备份在 `/data/adb/e5-tf-install/`，启动链备份在 `/data/adb/e5-bootchain/`；MU300 TF 方式的日志在 `/data/local/tmp/mu300-tf-install/`，内置存储方式的备份在手机的 `Android/data/top.linote.owrtinstaller/files/mu300-backup/`。APK 的「清理暂存文件」只删除它自己暂存的内容。
+E5 系列的安装器日志和备份在 `/data/adb/e5-tf-install/`，启动链备份在 `/data/adb/e5-bootchain/`；MU300 TF 方式的日志在 `/data/local/tmp/mu300-tf-install/`，内置存储方式的备份在手机的 `Android/data/top.linote.owrtinstaller/files/mu300-backup/`。APK 的「清理暂存文件」只删除安装器暂存内容。
 
 ## 安全措施
 

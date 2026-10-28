@@ -19,11 +19,12 @@ import android.widget.Toast;
 public final class AboutActivity extends Activity {
     private Ui ui;
     private LinearLayout body;
+    private LinearLayout sectionContent;
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         ui = new Ui(this);
-        setTitle("使用说明");
+        setTitle("设置");
         if (Build.VERSION.SDK_INT >= 21) getWindow().setStatusBarColor(ui.bg);
         LinearLayout root = ui.col();
         root.setBackgroundColor(ui.bg);
@@ -37,7 +38,7 @@ public final class AboutActivity extends Activity {
         back.setBackground(ui.ripple(ui.circle(ui.bg, 0)));
         back.setOnClickListener(v -> finish());
         head.addView(back, new LinearLayout.LayoutParams(ui.dp(40), ui.dp(40)));
-        TextView t = ui.text("使用说明", 17, ui.text, true);
+        TextView t = ui.text("设置", 17, ui.text, true);
         t.setPadding(ui.dp(6), 0, 0, 0);
         head.addView(t, ui.weight(1));
         root.addView(head, ui.mw(0));
@@ -60,10 +61,42 @@ public final class AboutActivity extends Activity {
         v.setLineSpacing(ui.dp(3), 1.05f);
         LinearLayout.LayoutParams p = ui.mw(top);
         p.bottomMargin = ui.dp(bottom);
-        body.addView(v, p);
+        destination().addView(v, p);
     }
 
-    private void section(String title) { copy(title, 18, ui.text, true, 18, 8); }
+    private LinearLayout destination() { return sectionContent == null ? body : sectionContent; }
+
+    private void section(String title) {
+        LinearLayout card = ui.card();
+        card.setPadding(0, 0, 0, 0);
+        LinearLayout header = ui.row();
+        header.setPadding(ui.dp(14), ui.dp(12), ui.dp(14), ui.dp(12));
+        header.setMinimumHeight(ui.dp(48));
+        header.setClickable(true);
+        header.setFocusable(true);
+        header.setBackground(ui.ripple(ui.round(0x00000000, 0, 12)));
+        TextView label = ui.text(title, 15, ui.text, true);
+        header.addView(label, ui.weight(1));
+        TextView arrow = ui.text("⌄", 18, ui.primary, true);
+        arrow.setGravity(Gravity.CENTER);
+        header.addView(arrow, new LinearLayout.LayoutParams(ui.dp(28), ui.dp(28)));
+
+        LinearLayout details = ui.col();
+        details.setVisibility(View.GONE);
+        details.setPadding(ui.dp(14), 0, ui.dp(14), ui.dp(14));
+        details.addView(ui.divider());
+        header.setContentDescription(title + "，已折叠，点击展开");
+        header.setOnClickListener(v -> {
+            boolean expanded = details.getVisibility() != View.VISIBLE;
+            details.setVisibility(expanded ? View.VISIBLE : View.GONE);
+            arrow.setText(expanded ? "⌃" : "⌄");
+            header.setContentDescription(title + (expanded ? "，已展开，点击折叠" : "，已折叠，点击展开"));
+        });
+        card.addView(header);
+        card.addView(details);
+        body.addView(card, ui.mw(9));
+        sectionContent = details;
+    }
     private void para(String s) { copy(s, 14, ui.muted, false, 0, 6); }
 
     private void model(String name, String req, String methods, String addr) {
@@ -73,7 +106,7 @@ public final class AboutActivity extends Activity {
         TextView d = ui.text("机型：" + req + "\n安装方式：" + methods + "\n管理地址：" + addr, 12.5f, ui.muted, false);
         d.setLineSpacing(ui.dp(2), 1.05f);
         c.addView(d, ui.mw(4));
-        body.addView(c, ui.mw(6));
+        destination().addView(c, ui.mw(6));
     }
 
     private void link(int icon, String title, String url, boolean tint) {
@@ -98,7 +131,7 @@ public final class AboutActivity extends Activity {
         row.addView(ui.text(title, 14, ui.text, true));
         LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ui.dp(32));
         rp.bottomMargin = ui.dp(2);
-        body.addView(row, rp);
+        destination().addView(row, rp);
     }
 
     private void build() {
@@ -116,6 +149,7 @@ public final class AboutActivity extends Activity {
         body.addView(top, ui.mw(0));
         copy("把“OpenWrt 一键刷入包”的安装流程移植到手机上：选择完整安装包 ZIP，校验后只提取需要的安装文件，"
                 + "再调用安装包自带的设备端脚本安装 OpenWrt，不需要电脑。", 14, ui.muted, false, 14, 0);
+        copy("点击下方栏目标题展开或折叠内容。", 12.5f, ui.muted, false, 8, 0);
 
         section("使用说明");
         para("1. 设备：选择“本机”（本机需 root），或“其他设备”——用 OTG 线有线连接（USB 调试），"
@@ -125,13 +159,29 @@ public final class AboutActivity extends Activity {
                 + "（adbd 本身是 root，或 su / /debug_ramdisk/su / /sbin/su 授权给 Shell）。没就绪时设备页会说明缺哪一步"
                 + "（面具没装 / 已有 su 但 Shell 未授权 / 未允许调试 / 开机向导未完成 / 正在开机），每 3 秒自动重试，"
                 + "在目标设备上操作完会自动往下走，不想等可以点“停止”。本机模式只检查本机 root。");
-        para("  续装或卸载等待目标设备时可以换连接方式（USB ↔ 局域网、换 IP）：会核对 eMMC CID 和槽位，确认是同一台设备才接着做。");
+        para("  续装或卸载等待目标设备时可以换连接方式（USB ↔ 局域网、换 IP）：会核对 eMMC/UFS 存储身份和槽位，确认是同一台设备才接着做。");
         para("2. 安装包：选择与目标设备匹配的完整 ZIP，不用解压。应用会逐个校验 ZIP 内所有文件的 SHA-256。");
         para("3. 安装方式：TF 卡或独立内置分区，以机型支持为准；重装已有内置分区、userdata 镜像（实验性）在“高级功能”里，见本页底部。");
         para("4. 检查与计划：先做只读检查，不写入任何分区；核对“数据影响”，勾选确认并输入 yes 后才开始安装"
                 + "（需要格式化 userdata 时还要另外勾选，并输入“清空数据”）。");
         para("5. 安装与完成：安装在目标设备后台运行，USB 拔线或网络断开不影响；重新连接即可继续查看进度。"
                 + "完成后按提示重启目标设备进入 OpenWrt，默认用户名和密码均为 root，请尽快修改。");
+
+        section("MU300 UFS 适配");
+        para("UFS 独立内置安装仅适配此完整安装包：mu300-openwrt-25.12.5-r20261027.135818-g0043a5d8-s5351d2bc-k.zip。"
+                + "其他 MU300 安装包版本未针对 UFS 适配，请勿用于 UFS 内置安装。");
+        para("支持 MU300 的 UFS 独立内置分区安装与重装；该安装包脚本支持的两阶段路径是先准备、按提示重启后再续装。");
+        para("现在可用“卸载并归还空间”从 UFS 删除 OpenWrt 并把空间归还给 Android；只适用于上方列出的完整安装包。"
+                + "UFS 安装与重装流程保持不变，原有 eMMC 内置安装和 TF 卡流程也保留。");
+        para("UFS 卸载只接受已识别的 MU300 UFS 身份、512 或 4096 字节 GPT 逻辑块，以及边界完整且唯一的 mu300root/userdata 布局和安装证据。"
+                + "无法唯一确认设备、分区归属、GPT 范围、扇区单位或布局时会拒绝；同意恢复出厂也不能绕过这些拒绝。");
+        para("UFS 卸载目前只通过离线静态检查、固定哈希校验、512/4096-byte 合成 GPT 测试和模拟流程验证；"
+                + "没有在真实 UFS 设备上验证安装或卸载，不能据此认定实际设备操作成功。开始前请先备份重要数据。");
+
+        section("获取更新");
+        para("新版安装包可从以下两个渠道获取：打开 Lino 笔记中本应用的对应文章，查看文章内的下载链接；或查看 GitHub 开源仓库。下载 APK 后直接安装更新。");
+        link(R.drawable.linote_logo, "博客文章（含下载链接）", "https://www.linote.top/posts/openwrt-android-installer/", false);
+        link(R.drawable.github_invertocat, "GitHub 开源仓库", "https://github.com/linote99/openwrt-android-installer", true);
 
         section("支持机型");
         para("每个安装包只能装到对应机型，型号或主板不符时会拒绝安装。");
@@ -173,10 +223,12 @@ public final class AboutActivity extends Activity {
         para("• userdata 镜像安装【实验性】：在 userdata 里创建 OpenWrt 镜像，不格式化 userdata，仅限未加密的 userdata。"
                 + "userdata 镜像是实验性功能，可能损坏 Android F2FS 文件系统，建议优先选择 TF 卡或独立内置分区。");
 
-        para("• 卸载并归还空间【高级】：删除内置 OpenWrt 分区（e5root / mu300root），与 userdata 相邻时把空间还给 Android 并离线扩容，"
+        para("• 卸载并归还空间【高级】：删除内置 OpenWrt 分区（e5root / mu300root），适用于受支持的 eMMC；MU300 UFS 仅适用于上方指定的完整安装包。"
+                + "与 userdata 相邻时把空间还给 Android 并离线扩容，"
                 + "不相邻时释放为未分配空间。只能通过 USB / 局域网操作另一台设备，本机模式不提供。卸载前先在 OpenWrt 里导出配置，"
                 + "切回 Android，开启 USB 调试或无线 ADB 并给 Shell 授予 root。");
-        para("  只读检查会核对分区表、已安装的启动镜像和设备上的安装标记，并显示 Android 容量、归还 Android 的空间、释放为空闲的空间。"
+        para("  只读检查会核对 eMMC CID 或 UFS 身份、盘符/LUN、GPT 逻辑块大小、分区表、已安装的启动镜像和设备上的安装标记，"
+                + "并显示存储类型、Android 容量、归还 Android 的空间、释放为空闲的空间。"
                 + "只有 userdata 未加密、data 直接在 userdata 上且工具支持时才保留 Android 数据；否则说明原因，"
                 + "需要勾选“格式化 userdata（恢复出厂）后卸载”并输入“清空数据”才会继续——格式化会清空 Android 应用、账号、照片和内部存储。"
                 + "分区归属或布局无法确认这类错误不能靠同意格式化绕过。TF 卡、userdata 镜像安装不使用这个入口。");
@@ -187,7 +239,7 @@ public final class AboutActivity extends Activity {
         para("只清理这台手机上本应用占用的空间（分区备份、卸载记录、解出的安装文件、生成的启动镜像、日志），不连接目标设备。"
                 + "分区备份与卸载记录须先导出为 ZIP 并回读校验通过才能删除；未完成的续装 / 卸载记录和 ADB 授权密钥不会删除。");
         TextView clean = ui.button("打开「清理本机占用」", 0, v -> startActivity(new android.content.Intent(this, CleanupActivity.class)));
-        body.addView(clean, ui.mw(8));
+        destination().addView(clean, ui.mw(8));
         section("配合 " + UfiTool.NAME);
         para(UfiTool.NAME + "（安卓版）提供 ADB 投屏、安装包备份 / 恢复和一键安装 UFI-TOOLS。需要 root 授权、格式化前备份或格式化后重新打开 ADB 时，"
                 + "本应用会显示“打开 " + UfiTool.NAME + "”；没有安装时显示“点此安装”，用浏览器打开下载文章。");
@@ -200,7 +252,7 @@ public final class AboutActivity extends Activity {
         TextView ufi = ui.button(UfiTool.buttonLabel(UfiTool.installed(this)), 0, v -> {
             if (UfiTool.installed(this)) UfiTool.open(this); else UfiTool.openBlog(this);
         });
-        body.addView(ufi, ui.mw(8));
+        destination().addView(ufi, ui.mw(8));
         section("友情链接");
         link(R.drawable.linote_logo, "Lino 笔记", "https://www.linote.top/", false);
         link(R.drawable.github_invertocat, "GitHub 主页", "https://github.com/linote99", true);

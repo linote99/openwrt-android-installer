@@ -24,12 +24,12 @@ import java.util.regex.Pattern;
 /**
  * The MU300 package's computer-side internal-storage installs, ported from desktop/installer.py
  * (class Android, install(), direct_write(), free_write()):
- *  - PART:   independent partition "mu300root" in unallocated eMMC space (Android untouched), or, when no
+ *  - PART:   independent partition "mu300root" in unallocated eMMC/UFS space (Android untouched), or, when no
  *            gap is large enough, an offline userdata shrink that preserves Android data (unencrypted only;
  *            the first boot resizes offline and reboots once into OpenWrt);
  *  - REPART: reinstall into an existing mu300root (erases only that partition);
+ *  - FORMAT: explicitly confirmed two-stage userdata format/reinstall, with a storage-identity-bound resume.
  *  - IMAGE:  experimental userdata image (/data/mu300linux), unencrypted userdata only.
- * The destructive "format userdata" variant and its resume transaction are not ported.
  * The device-side scripts are the package's own desktop/*.sh and desktop/files/boot/*, run with the
  * same environment and arguments; only the transport (this app instead of adb on a computer) differs.
  */
@@ -58,6 +58,8 @@ final class Mu300Internal {
         default String transport() { return ""; }
         /** The target passed the readiness ladder (Android set up, debugging authorised, root). */
         default boolean ready() { return true; }
+        /** The package's verified desktop/storage-lib.sh; null only in legacy eMMC-only desktop tests. */
+        default String storageLibrary() throws IOException { return null; }
         /** Copies a remote file that the shell user can read into dest, byte for byte. */
         void pull(String remote, File dest) throws IOException;
         /** pull() reporting the bytes received so far. */
@@ -77,18 +79,20 @@ final class Mu300Internal {
             {"desktop/android-bootchain.sh", "3a7fd552462f8e972787e0dc4b20b70c58246f62f42830b2628198ab97a8e600"},
             {"desktop/android-image.sh", "5434f27cf1e9552d807bcf61a8206408b64f2a6314282e9c6a60f9a0f4fb5191"},
             {"desktop/android-loop.sh", "4b886f574bfcbc48558dee23d37c1fbce4ddcac2e3d6b328527d9c0dfee71cf6"},
-            {"desktop/android-write-free.sh", "66f84af49644b212916f50aaba332804bd107868d75b39eb83ac69e2dde7c4d8"},
-            {"desktop/android-write-part.sh", "289d607f359a95b1f48dd135a3ba532164df7e5f06b1ba42996a052cfbd1f738"},
+            {"desktop/android-write-free.sh", "a62b52500ef88026e3f3901954f94c14d1853e0899699b5be1fe2dbac7473ae3"},
+            {"desktop/android-write-part.sh", "ab78a132c08312507637b0c8ee67c5d8c388df7da2709009c755facd90a76d42"},
             {"desktop/bootchain.sh", "3a7fd552462f8e972787e0dc4b20b70c58246f62f42830b2628198ab97a8e600"},
             {"desktop/files/boot/ext4-geometry.sh", "6ee8b5b429cae620f9c382bae14d127168bb9205aa82406bbca2f23aac7babc6"},
-            {"desktop/files/boot/install-part.sh", "3679792a48129b0be7d8fcaac0eff5cb13e8cf94670769b04410fc348f7d7f7b"},
+            {"desktop/files/boot/install-part.sh", "159ee2485802b30008fb4872dc88e23f48d14d285b124036f77e83c2059d74a1"},
             {"desktop/files/boot/internal-ext4.sh", "6a151650f2dc76a27e0fd32ab9b637d97f3d396e8f06d54ede529b8d39aeb42c"},
-            {"desktop/files/boot/mu300-gpt", "5c8fd0ab85714c360499c898a6b9551e0b689dc27efe0091cc8aab45c1c340aa"},
-            {"desktop/files/boot/original-init", "43cf275b551ce1b35c69bc42650783e0734233cb83f76dd17a3fcd88267a8710"},
-            {"desktop/files/boot/part-prepare.sh", "5086af4be59c320da21fef65b6ae164ba263a8805e1c16c2c45cde7ffd004d5e"},
+            {"desktop/files/boot/mu300-gpt", "df277ad0b52f48d1d34029ea387c9d334fc1838407c2787801f6cccc585b6fab"},
+            {"desktop/files/boot/original-init", "3358b2f668a0255318c3a9ff3640df21d78a1b87c58448ac61c47870d853814b"},
+            {"desktop/files/boot/part-prepare.sh", "6f24501bf8adbb74050bfa05e555adcf024734693e64e1b1d93236d2300d72f9"},
             {"desktop/files/boot/part-progress.sh", "0ded2ac1b99010ff639255b0d2c5725d36e1c5411a07fed7fb9808dd3d336159"},
             {"desktop/files/boot/repair/manifest.json", "b3988894aa88560c73f6e07d9809df8b7fd4815697a5cbb607c7b6fcdcd1bdfc"},
-            {"desktop/files/boot/storage.sh", "0f1b30737b8749af275c61ee21d835d9f858d4347935fa062ccf6020ab48b4e1"},
+            {"desktop/files/boot/storage.sh", "9f8b61f8b8dda3090d61c819193a97bb81891872e905114aeb80cc88fb7e4c62"},
+            {"desktop/storage-lib.sh", "7dc62136b7f95a3d18e8218b13649c04729fe3c7d29814acb68b82ceb1f44233"},
+            {"desktop/files/boot/storage-lib.sh", "7dc62136b7f95a3d18e8218b13649c04729fe3c7d29814acb68b82ceb1f44233"},
     };
 
     /** payload/ files prepare_payload() uploads for the internal methods (rootfs is filtered separately). */
@@ -103,7 +107,7 @@ final class Mu300Internal {
      * Other steps (backups, temporary files) keep the inherited umask.
      */
     static final String IMAGE_STEP = "umask 022\n\"$BB\" sh \"$P/android-image.sh\"";
-    static final String[] DESKTOP_SH = {"android-image.sh", "android-write-part.sh", "android-write-free.sh", "android-loop.sh"};
+    static final String[] DESKTOP_SH = {"android-image.sh", "android-write-part.sh", "android-write-free.sh", "android-loop.sh", "storage-lib.sh"};
     static final String REPAIR = "desktop/files/boot/repair/";
     static final String LOCAL_SUMS = "LOCAL-SUMS";
     static final String ROOTFS = "payload/mu300-openwrt.tar.gz";
@@ -204,9 +208,10 @@ final class Mu300Internal {
     // ------------------------------------------------------------------ device facts
 
     static final class Storage {
-        String node, cid, state = "", type = "", source = "", magic = "", ext = "", root;
+        String node, diskNode, kind, cid, state = "", type = "", source = "", magic = "", ext = "", root;
+        int sectorSize = 512;
         long start, size, diskSize, free;
-        String disk() { return "/dev/block/" + node.substring(0, node.indexOf('p')); }
+        String disk() { return "/dev/block/" + diskNode; }
     }
 
     /** What the read-only check found; sizes in MiB. */
@@ -224,7 +229,8 @@ final class Mu300Internal {
         String summary;
     }
 
-    private static final Pattern NODE = Pattern.compile("mmcblk\\d+p\\d+");
+    private static final Pattern NODE = Pattern.compile("(?:mmcblk[0-9]+p[1-9][0-9]*|sd[a-z]+[1-9][0-9]*)");
+    private static final Pattern DISK = Pattern.compile("(?:mmcblk[0-9]+|sd[a-z]+)");
     private static final Pattern CID = Pattern.compile("[a-f0-9]{32}");
     private static final Pattern NUM = Pattern.compile("\\d{1,20}");
 
@@ -238,26 +244,70 @@ final class Mu300Internal {
     }
 
     static Storage storage(Io io) throws IOException {
-        String out = io.sh("set -e; d=$(readlink -f /dev/block/by-name/userdata); n=${d##*/}; b=${n%p*}; "
-                + "echo NODE=$n; echo CID=$(cat /sys/class/block/$b/device/cid); echo START=$(cat /sys/class/block/$n/start); "
-                + "echo SIZE=$(cat /sys/class/block/$n/size); echo DISK_SIZE=$(cat /sys/class/block/$b/size); "
-                + "echo FREE=$(df -Pk /data | tail -n1 | awk '{print $4}'); "
-                + "echo STATE=$(getprop ro.crypto.state); echo TYPE=$(getprop ro.crypto.type); "
-                + "echo SOURCE=$(awk '$2==\"/data\" {print $1;exit}' /proc/mounts); "
-                + "echo MAGIC=$(dd if=\"$d\" bs=1 skip=1024 count=4 2>/dev/null | od -An -tx1 | tr -d \" \\n\"); "
-                + "echo EXT=$(dd if=\"$d\" bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d \" \\n\"); "
-                + "for u in /sys/class/block/${b}p*/uevent; do if grep -qx PARTNAME=mu300root \"$u\"; then n=${u%/uevent}; echo ROOT=${n##*/}; fi; done", true);
+        String library = io.storageLibrary();
+        String script;
+        if (library != null && !library.isEmpty()) {
+            script = library + "\nset -e\n"
+                    + "d=$(readlink -f /dev/block/by-name/userdata); n=${d##*/}; b=$(mu300_storage_parent \"$n\")\n"
+                    + "[ \"$(mu300_storage_part userdata \"$b\")\" = \"$n\" ]\n"
+                    + "echo NODE=$n; echo DISK=$b; echo STORAGE_KIND=$(mu300_storage_kind \"$b\")\n"
+                    + "echo CID=$(mu300_storage_identity \"$b\"); echo SECTOR_SIZE=$(mu300_storage_sector_size \"$b\")\n"
+                    + "echo START=$(cat /sys/class/block/$n/start); echo SIZE=$(cat /sys/class/block/$n/size); echo DISK_SIZE=$(cat /sys/class/block/$b/size)\n"
+                    + "echo FREE=$(df -Pk /data | tail -n1 | awk '{print $4}')\n"
+                    + "echo STATE=$(getprop ro.crypto.state); echo TYPE=$(getprop ro.crypto.type)\n"
+                    + "echo SOURCE=$(awk '$2==\"/data\" {print $1;exit}' /proc/mounts)\n"
+                    + "echo MAGIC=$(dd if=\"$d\" bs=1 skip=1024 count=4 2>/dev/null | od -An -tx1 | tr -d ' \\n')\n"
+                    + "echo EXT=$(dd if=\"$d\" bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d ' \\n')\n"
+                    + "found=0; for label in mu300root e5root; do candidate=$(mu300_storage_part \"$label\" \"$b\") || continue; [ \"$found\" = 0 ] || exit 1; found=1; echo ROOT=$candidate; done";
+        } else {
+            // EMMC-only compatibility for existing desktop simulator tests; production always supplies the verified library.
+            script = "set -e; d=$(readlink -f /dev/block/by-name/userdata); n=${d##*/}; b=${n%p*}; "
+                    + "echo NODE=$n; echo DISK=$b; echo STORAGE_KIND=emmc; echo SECTOR_SIZE=512; "
+                    + "echo CID=$(cat /sys/class/block/$b/device/cid); echo START=$(cat /sys/class/block/$n/start); "
+                    + "echo SIZE=$(cat /sys/class/block/$n/size); echo DISK_SIZE=$(cat /sys/class/block/$b/size); "
+                    + "echo FREE=$(df -Pk /data | tail -n1 | awk '{print $4}'); "
+                    + "echo STATE=$(getprop ro.crypto.state); echo TYPE=$(getprop ro.crypto.type); "
+                    + "echo SOURCE=$(awk '$2==\"/data\" {print $1;exit}' /proc/mounts); "
+                    + "echo MAGIC=$(dd if=\"$d\" bs=1 skip=1024 count=4 2>/dev/null | od -An -tx1 | tr -d \" \\n\"); "
+                    + "echo EXT=$(dd if=\"$d\" bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d \" \\n\"); "
+                    + "found=0; for label in mu300root e5root; do for u in /sys/class/block/${b}p*/uevent; do if grep -qx PARTNAME=$label \"$u\"; then n=${u%/uevent}; [ \"$found\" = 0 ] || exit 1; found=1; echo ROOT=${n##*/}; fi; done; done";
+        }
+        String out = io.sh(script, true);
         Map<String, String> r = kv(out);
         Storage s = new Storage();
         s.node = r.getOrDefault("NODE", "");
         s.cid = r.getOrDefault("CID", "");
-        if (!NODE.matcher(s.node).matches() || !CID.matcher(s.cid).matches()) throw new IOException("无法识别 eMMC（Invalid eMMC identity）");
+        s.diskNode = parentNode(s.node);
+        s.kind = r.getOrDefault("STORAGE_KIND", "emmc");
+        if (!NODE.matcher(s.node).matches() || !DISK.matcher(s.diskNode).matches() || !CID.matcher(s.cid).matches()
+                || !s.diskNode.equals(r.getOrDefault("DISK", s.diskNode))
+                || !("emmc".equals(s.kind) || "ufs".equals(s.kind))
+                || ("emmc".equals(s.kind) != s.diskNode.startsWith("mmcblk")))
+            throw new IOException("无法确认 eMMC/UFS 存储身份或拓扑（Invalid storage identity）");
+        long block = r.containsKey("SECTOR_SIZE") ? num(r, "SECTOR_SIZE") : 512;
+        if (block != 512 && block != 4096) throw new IOException("不支持的存储逻辑块大小：" + block);
+        s.sectorSize = (int) block;
         s.start = num(r, "START"); s.size = num(r, "SIZE"); s.diskSize = num(r, "DISK_SIZE"); s.free = num(r, "FREE");
+        long factor = s.sectorSize / 512;
+        if (s.start < 0 || s.size <= 0 || s.diskSize <= 0 || s.free < 0 || s.start > s.diskSize || s.size > s.diskSize - s.start
+                || s.start % factor != 0 || s.size % factor != 0 || s.diskSize % factor != 0)
+            throw new IOException("存储范围无效或未按逻辑块对齐");
         s.state = r.getOrDefault("STATE", ""); s.type = r.getOrDefault("TYPE", ""); s.source = r.getOrDefault("SOURCE", "");
         s.magic = r.getOrDefault("MAGIC", ""); s.ext = r.getOrDefault("EXT", "");
         String root = r.get("ROOT");
-        s.root = root != null && NODE.matcher(root).matches() ? root : null;
+        if (root != null && !root.isEmpty()) {
+            if (!NODE.matcher(root).matches() || !parentNode(root).equals(s.diskNode)) throw new IOException("mu300root 不在 userdata 的同一存储设备上");
+            s.root = root;
+        }
         return s;
+    }
+
+    private static String parentNode(String node) {
+        if (node == null) return "";
+        java.util.regex.Matcher m = Pattern.compile("^(mmcblk[0-9]+)p[1-9][0-9]*$").matcher(node);
+        if (m.matches()) return m.group(1);
+        m = Pattern.compile("^(sd[a-z]+)[1-9][0-9]*$").matcher(node);
+        return m.matches() ? m.group(1) : "";
     }
 
     private static long num(Map<String, String> r, String k) throws IOException {
@@ -686,10 +736,12 @@ final class Mu300Internal {
 
     static Mu300Gpt.Space gpt(Io io, Storage s) throws IOException {
         String disk = s.disk();
-        byte[] primary = read(io, "dd if=" + disk + " bs=512 skip=1 count=1 2>/dev/null", 512);
-        byte[] backup = read(io, "dd if=" + disk + " bs=512 skip=" + (s.diskSize - 1) + " count=1 2>/dev/null", 512);
+        int block = s.sectorSize;
+        long logicalSectors = s.diskSize / (block / 512);
+        byte[] primary = read(io, "dd if=" + disk + " bs=" + block + " skip=1 count=1 2>/dev/null", block);
+        byte[] backup = read(io, "dd if=" + disk + " bs=" + block + " skip=" + (logicalSectors - 1) + " count=1 2>/dev/null", block);
         long[] ft;
-        try { ft = Mu300Gpt.backupLayout(primary, backup, s.diskSize); }
+        try { ft = Mu300Gpt.backupLayout(primary, backup, s.diskSize, block); }
         catch (IllegalArgumentException e) { throw new IOException(e.getMessage()); }
         byte[] first = read(io, "dd if=" + disk + " bs=512 count=" + ft[0] + " 2>/dev/null", ft[0] * 512);
         byte[] last = read(io, "dd if=" + disk + " bs=512 skip=" + ft[1] + " count=" + (s.diskSize - ft[1]) + " 2>/dev/null",
@@ -737,12 +789,13 @@ final class Mu300Internal {
         io.log("  读取设备型号、平台与启动槽…");
         Plan p = identify(io);
         io.log("  设备：" + p.model + "（" + p.profile + "），Android 槽 " + p.slot + "，Linux 槽 " + p.linux);
-        io.log("  读取 userdata、eMMC 与加密状态…");
+        io.log("  读取 userdata、eMMC/UFS 与加密状态…");
         Storage s = storage(io);
         p.s = s;
         io.log("  userdata：/dev/block/" + s.node + "，" + s.size / 2048 + " MiB，可用 " + s.free / 1024 + " MiB，文件系统 " + fsName(s));
         io.log("  加密属性：ro.crypto.state=" + orDash(s.state) + "，ro.crypto.type=" + orDash(s.type) + (s.source.isEmpty() ? "" : "，挂载源 " + s.source));
-        io.log("  eMMC：" + s.disk() + "，" + s.diskSize / 2048 + " MiB" + (s.root != null ? "；已有 mu300root：/dev/block/" + s.root : "；没有 mu300root 分区"));
+        io.log("  " + ("ufs".equals(s.kind) ? "UFS" : "eMMC") + "：" + s.disk() + "，逻辑块 " + s.sectorSize + " B，"
+                + s.diskSize / 2048 + " MiB" + (s.root != null ? "；已有 mu300root：/dev/block/" + s.root : "；没有 mu300root 分区"));
         try {
             p.encrypted = Mu300Gpt.encrypted(s.state, s.type, s.source, "53ef".equals(s.ext) ? s.ext : s.magic);
             if (p.encrypted) p.encryptedNote = "userdata 已加密";
@@ -805,7 +858,7 @@ final class Mu300Internal {
         // Default never lands on a destructive path: unallocated space first, then a preserving shrink.
         long base = p.freeMax >= p.min ? p.freeMax : p.shrinkCap >= p.min ? p.shrinkCap : p.formatMax;
         p.def = Math.max(p.min, Math.min(4096, base) / 4 * 4);
-        p.summary = "eMMC " + s.diskSize / 2048 + " MiB；未分配可用 " + p.freeMax + " MiB"
+        p.summary = ("ufs".equals(s.kind) ? "UFS " : "eMMC ") + s.diskSize / 2048 + " MiB；未分配可用 " + p.freeMax + " MiB"
                 + (p.shrinkCap >= p.min ? "；可保留数据缩容至多 " + p.shrinkCap + " MiB" : "；不能保留数据缩容（" + keepWhyNot(p) + "）")
                 + (p.formatMax >= p.min ? "；格式化 userdata 后至多 " + p.formatMax + " MiB" : "");
         return p;
@@ -849,7 +902,8 @@ final class Mu300Internal {
     static String why(Plan p, long mib, boolean format) {
         if (p == null || p.space == null) return "请先完成只读检查";
         Route r = route(p, mib, format);
-        if (r == Route.FREE) return "所选 " + mib + " MiB 放得进 eMMC 未分配空间（最大 " + p.freeMax + " MiB），不缩小也不格式化 userdata";
+        if (r == Route.FREE) return "所选 " + mib + " MiB 放得进" + ("ufs".equals(p.s.kind) ? " UFS" : " eMMC")
+                + " 未分配空间（最大 " + p.freeMax + " MiB），不缩小也不格式化 userdata";
         if (r == Route.KEEP) return "未分配空间只有 " + p.freeMax + " MiB，放不下 " + mib + " MiB；userdata 未加密且数据放得下，离线缩小 userdata 并保留 Android 数据";
         if (r == Route.FORMAT) return "未分配空间只有 " + p.freeMax + " MiB，放不下 " + mib + " MiB；"
                 + (p.encrypted ? "userdata 已加密（" + orDash(p.s.type) + "），加密数据无法离线保留，" : format && mib <= p.shrinkCap ? "按你的选择不保留数据，" : "已用数据放不进缩小后的 userdata，")
@@ -888,7 +942,8 @@ final class Mu300Internal {
     static void backup(Io io, File path, Storage s, String slot, String serial) throws IOException {
         if (path.exists() || !path.mkdirs()) throw new IOException("无法创建备份目录 " + path);
         Map<String, Object> id = new LinkedHashMap<>();
-        id.put("NODE", s.node); id.put("CID", s.cid); id.put("START", s.start); id.put("SIZE", s.size); id.put("DISK_SIZE", s.diskSize);
+        id.put("NODE", s.node); id.put("DISK", s.diskNode); id.put("STORAGE_KIND", s.kind); id.put("SECTOR_SIZE", (long) s.sectorSize);
+        id.put("CID", s.cid); id.put("START", s.start); id.put("SIZE", s.size); id.put("DISK_SIZE", s.diskSize);
         id.put("FREE", s.free); id.put("STATE", s.state); id.put("TYPE", s.type); id.put("SOURCE", s.source); id.put("MAGIC", s.magic);
         id.put("EXT", s.ext); if (s.root != null) id.put("ROOT", s.root); id.put("serial", serial); id.put("android_slot", slot);
         StringBuilder j = new StringBuilder("{\n");
@@ -901,10 +956,12 @@ final class Mu300Internal {
         }
         writeAll(new File(path, "identity.json"), j.append("}\n").toString().getBytes(StandardCharsets.UTF_8));
         String disk = s.disk();
-        byte[] primary = read(io, "dd if=" + disk + " bs=512 skip=1 count=1 2>/dev/null", 512);
-        byte[] alternate = read(io, "dd if=" + disk + " bs=512 skip=" + (s.diskSize - 1) + " count=1 2>/dev/null", 512);
+        int block = s.sectorSize;
+        long logicalSectors = s.diskSize / (block / 512);
+        byte[] primary = read(io, "dd if=" + disk + " bs=" + block + " skip=1 count=1 2>/dev/null", block);
+        byte[] alternate = read(io, "dd if=" + disk + " bs=" + block + " skip=" + (logicalSectors - 1) + " count=1 2>/dev/null", block);
         long[] ft;
-        try { ft = Mu300Gpt.backupLayout(primary, alternate, s.diskSize); }
+        try { ft = Mu300Gpt.backupLayout(primary, alternate, s.diskSize, block); }
         catch (IllegalArgumentException e) { throw new IOException(e.getMessage()); }
         long front = ft[0], tail = ft[1];
         LinkedHashMap<String, String> items = new LinkedHashMap<>();
@@ -1016,7 +1073,7 @@ final class Mu300Internal {
         if (now == Route.FORMAT && !formatData)
             throw new IOException(why(p, size, false) + "；需要勾选“格式化 userdata”并确认清空 Android 数据，未做任何修改");
         if (offset >= 0) {
-            io.log("使用 eMMC 未分配空间 " + size + " MiB（起始扇区 " + offset + "），不缩容、不格式化 Android");
+            io.log("使用" + ("ufs".equals(s.kind) ? " UFS" : " eMMC") + " 未分配空间 " + size + " MiB（起始扇区 " + offset + "），不缩容、不格式化 Android");
             File b = backupDir(backupRoot, s);
             backup(io, b, s, p.slot, serial);
             if (backupSink != null) backupSink.path(b.getAbsolutePath());
@@ -1111,7 +1168,7 @@ final class Mu300Internal {
     /** free_write(): new GPT entry + image written into the unallocated range, GPT read back independently. */
     static Outcome freeWrite(Session x, Storage s, Mu300Gpt.Space space, long offset, long sectors) throws IOException {
         byte[][] copies;
-        try { copies = Mu300Gpt.addRoot(space.first, space.last, s.diskSize, offset, sectors, UUID.randomUUID()); }
+        try { copies = Mu300Gpt.addRoot(space.first, space.last, s.diskSize, offset, sectors, UUID.randomUUID(), s.sectorSize); }
         catch (IllegalArgumentException e) { throw new IOException(e.getMessage()); }
         x.put(space.first, "gpt-before-first.bin");
         x.put(space.last, "gpt-before-last.bin");
@@ -1163,7 +1220,8 @@ final class Mu300Internal {
 
     static LinkedHashMap<String, Object> storageMap(Storage s) {
         LinkedHashMap<String, Object> m = new LinkedHashMap<>();
-        m.put("NODE", s.node); m.put("CID", s.cid); m.put("START", s.start); m.put("SIZE", s.size); m.put("DISK_SIZE", s.diskSize);
+        m.put("NODE", s.node); m.put("DISK", s.diskNode); m.put("STORAGE_KIND", s.kind); m.put("SECTOR_SIZE", (long) s.sectorSize);
+        m.put("CID", s.cid); m.put("START", s.start); m.put("SIZE", s.size); m.put("DISK_SIZE", s.diskSize);
         m.put("FREE", s.free); m.put("STATE", s.state); m.put("TYPE", s.type); m.put("SOURCE", s.source); m.put("MAGIC", s.magic);
         m.put("EXT", s.ext); if (s.root != null) m.put("ROOT", s.root);
         return m;
@@ -1265,7 +1323,10 @@ final class Mu300Internal {
         Storage s = p.s;
         if (s.root == null) throw new IOException("没有找到已准备的 mu300root");
         Map<String, Object> st = (Map<String, Object>) r.get("storage");
-        String mismatch = st == null ? "记录缺少存储信息" : Rebind.diff("eMMC CID", String.valueOf(st.get("CID")), s.cid,
+        String mismatch = st == null ? "记录缺少存储信息" : Rebind.diff("存储身份", String.valueOf(st.get("CID")), s.cid,
+                "存储类型", String.valueOf(st.getOrDefault("STORAGE_KIND", "emmc")), s.kind,
+                "物理磁盘", String.valueOf(st.getOrDefault("DISK", parentNode(String.valueOf(st.get("NODE"))))), s.diskNode,
+                "逻辑块大小", String.valueOf(st.getOrDefault("SECTOR_SIZE", 512L)), String.valueOf(s.sectorSize),
                 "userdata 节点", String.valueOf(st.get("NODE")), s.node,
                 "userdata 起点", String.valueOf(st.get("START")), String.valueOf(s.start),
                 "Android 槽位", String.valueOf(r.get("android_slot")), p.slot, "序列号", String.valueOf(r.get("serial")), String.valueOf(serial));
@@ -1275,7 +1336,7 @@ final class Mu300Internal {
             if (r.get("transport_history") != null) io.log("  已改用新的连接继续：" + io.transport() + "（设备身份核对一致，已记入连接历史）");
         }
         if (mismatch != null)
-            throw new IOException("续装的设备或启动槽与记录不同（eMMC、userdata 位置、Android 槽或序列号不一致）；未做任何修改");
+            throw new IOException("续装的设备或启动槽与记录不同（存储身份、userdata 位置、Android 槽或序列号不一致）；未做任何修改");
         long target = num(r.get("target")), need = num(r.get("need"));
         if (s.size != target || p.rootStart != s.start + target || p.rootSize != need)
             throw new IOException("已准备分区的位置/大小与记录不同；未做任何修改");

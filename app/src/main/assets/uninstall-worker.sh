@@ -3,8 +3,8 @@ set -eu
 set -o pipefail
 
 snapshot_read() {
-    dd if="$disk" of=check-first bs=512 count="$front" 2>/dev/null
-    dd if="$disk" of=check-last bs=512 skip="$tail" count="$((total-tail))" 2>/dev/null
+    dd if="$disk" of=check-first bs="$sector_size" count="$((front/factor))" 2>/dev/null
+    dd if="$disk" of=check-last bs="$sector_size" skip="$((tail/factor))" count="$(((total-tail)/factor))" 2>/dev/null
 }
 snapshot_known() {
     { cmp -s check-first before-first || cmp -s check-first after-first; } &&
@@ -14,12 +14,23 @@ snapshot_commit() {
     snapshot_read
     snapshot_known || { echo 'Unknown GPT; stopped without writing'; return 1; }
     # Flush and verify the backup copy before touching the primary copy.
-    dd if=after-last of="$disk" bs=512 seek="$tail" conv=notrunc,fsync
-    dd if="$disk" of=check-last bs=512 skip="$tail" count="$((total-tail))" 2>/dev/null
+    dd if=after-last of="$disk" bs="$sector_size" seek="$((tail/factor))" count="$(((total-tail)/factor))" conv=notrunc,fsync
+    dd if="$disk" of=check-last bs="$sector_size" skip="$((tail/factor))" count="$(((total-tail)/factor))" 2>/dev/null
     cmp -s check-last after-last
-    dd if=after-first of="$disk" bs=512 conv=notrunc,fsync
+    dd if=after-first of="$disk" bs="$sector_size" count="$((front/factor))" conv=notrunc,fsync
     snapshot_read
     cmp -s check-first after-first && cmp -s check-last after-last
+}
+misc_read_head() {
+    dd if="$misc" of=misc-head bs=4096 count=1 2>/dev/null
+    [ "$(wc -c < misc-head)" = 4096 ]
+}
+misc_write_range() {
+    file=$1 offset=$2 length=$3
+    misc_read_head
+    dd if="$file" of=misc-head bs=1 seek="$offset" count="$length" conv=notrunc 2>/dev/null
+    dd if=misc-head of="$misc" bs=4096 count=1 conv=notrunc,fsync
+    misc_read_head
 }
 idle_partition() {
     node=$1
@@ -36,7 +47,8 @@ kernel_node_matches() {
     [ "$(stat -c '%t:%T' /dev/$1)" = "$(printf '%x:%x' "$major" "$minor")" ]
 }
 fs_measure() {
-    dd if="$1" of=fs-super bs=1024 skip=1 count=1 2>/dev/null
+    dd if="$1" of=fs-first bs=4096 count=1 2>/dev/null
+    dd if=fs-first of=fs-super bs=1 skip=1024 count=1024 2>/dev/null
     [ "$(wc -c < fs-super)" = 1024 ]
     if [ "$action" = grow-f2fs ]; then
         [ "$(od -An -tx1 -N4 fs-super | tr -d ' \n')" = 1020f5f2 ]
@@ -110,12 +122,20 @@ touch /run/stay
 httpd -p 8089 -h /run/openwrt-uninstall || true
 cd /openwrt-uninstall
 sha256sum -c SHA256SUMS
-IFS=: read -r cid disk_node data_node root_node misc_node android_node linux_node total front tail start root_size wipe boot_bytes boot_sha action data_start data_size fs_before fs_uuid extra < request
+IFS=: read -r cid disk_node data_node root_node misc_node android_node linux_node total front tail start root_size wipe boot_bytes boot_sha action data_start data_size fs_before fs_uuid storage_kind sector_size extra < request
 [ -z "$extra" ] && [ "${#cid}" = 32 ] && [ "${#boot_sha}" = 64 ]
 case "$cid$boot_sha" in *[!0-9a-f]*) exit 2 ;; esac
-case "$disk_node" in mmcblk[0-9]) ;; *) exit 2 ;; esac
+case "$storage_kind" in
+    emmc) disk_number=${disk_node#mmcblk}; case "$disk_number" in ''|*[!0-9]*) exit 2 ;; esac ;;
+    ufs) ufs_lun=${disk_node#sd}; case "$disk_node" in sd[a-z]*) ;; *) exit 2 ;; esac; case "$ufs_lun" in ''|*[!a-z]*) exit 2 ;; esac ;;
+    *) exit 2 ;;
+esac
+case "$sector_size" in 512) factor=1 ;; 4096) factor=8 ;; *) exit 2 ;; esac
 for node in "$data_node" "$root_node" "$misc_node" "$android_node" "$linux_node"; do
-    case "$node" in "$disk_node"p[0-9]*) ;; *) exit 2 ;; esac
+    case "$storage_kind" in
+        emmc) case "$node" in "$disk_node"p[1-9]*) ;; *) exit 2 ;; esac ;;
+        ufs) case "$node" in "$disk_node"[1-9]*) ;; *) exit 2 ;; esac ;;
+    esac
     case "$node" in *[!a-z0-9]*) exit 2 ;; esac
 done
 for n in "$total" "$front" "$tail" "$start" "$root_size" "$boot_bytes"; do
@@ -139,10 +159,29 @@ misc=/dev/$misc_node
 android=/dev/$android_node
 linux=/dev/$linux_node
 [ "$android_node" != "$linux_node" ]
-[ "$(cat /sys/class/block/$disk_node/device/cid)" = "$cid" ]
+[ "$(cat /sys/class/block/$disk_node/queue/logical_block_size)" = "$sector_size" ]
+if [ "$storage_kind" = emmc ]; then
+    [ "$(cat /sys/class/block/$disk_node/device/cid)" = "$cid" ]
+else
+    [ -r storage-lib.sh ]
+    . ./storage-lib.sh
+    [ "$(mu300_storage_kind "$disk_node")" = ufs ]
+    [ "$(mu300_storage_identity "$disk_node")" = "$cid" ]
+    [ "$(mu300_storage_parent "$data_node")" = "$disk_node" ]
+    [ "$(mu300_storage_parent "$root_node")" = "$disk_node" ]
+    [ "$(mu300_storage_part userdata "$disk_node")" = "$data_node" ]
+    [ "$(mu300_storage_part mu300root "$disk_node")" = "$root_node" ]
+    [ "$(mu300_storage_part misc "$disk_node")" = "$misc_node" ]
+    [ "$(mu300_storage_part boot_a "$disk_node")" = "$android_node" ] || [ "$(mu300_storage_part boot_b "$disk_node")" = "$android_node" ]
+    [ "$(mu300_storage_part boot_a "$disk_node")" = "$linux_node" ] || [ "$(mu300_storage_part boot_b "$disk_node")" = "$linux_node" ]
+    [ "$(mu300_storage_sector_size "$disk_node")" = "$sector_size" ]
+fi
 [ "$(cat /sys/class/block/$disk_node/size)" = "$total" ]
+[ "$((total%factor))" = 0 ] && [ "$((front%factor))" = 0 ] && [ "$((tail%factor))" = 0 ]
 [ "$front" -ge 3 ] && [ "$front" -le 4096 ] && [ "$tail" -gt "$((total-4096))" ] && [ "$tail" -lt "$total" ]
-[ "$start" -ge "$front" ] && [ "$((start%8))" = 0 ] && [ "$root_size" -ge 4194304 ] && [ "$((start+root_size))" -le "$tail" ]
+[ "$start" -ge "$front" ] && [ "$((start%8))" = 0 ] && [ "$((root_size%factor))" = 0 ] && [ "$root_size" -ge 4194304 ]
+[ "$root_size" -le "$((tail-start))" ]
+[ "$((data_start%factor))" = 0 ] && [ "$((data_size%factor))" = 0 ]
 grep -qx PARTNAME=userdata "/sys/class/block/$data_node/uevent"
 grep -qx PARTNAME=misc "/sys/class/block/$misc_node/uevent"
 idle_partition "$data_node"
@@ -166,7 +205,8 @@ snapshot_read
 snapshot_known
 case "$action" in grow-*)
     # Read-only checks and executable compatibility happen before any GPT write.
-    dd if="$misc" of=current-bcb bs=2048 count=1 2>/dev/null
+    misc_read_head
+    dd if=misc-head of=current-bcb bs=1 count=2048 2>/dev/null
     cmp -s current-bcb before-bcb
     [ "$(cat /sys/class/block/$data_node/start)" = "$data_start" ]
     fs_measure /dev/$data_node
@@ -187,14 +227,15 @@ if [ "$finished" = 0 ]; then
     if [ "$wipe" = 1 ]; then
         # Recovery owns formatting and encryption. Arm its request before GPT
         # changes, but never re-arm it once both restored GPT copies exist.
-        dd if="$misc" of=current-bcb bs=2048 count=1 2>/dev/null
+        misc_read_head
+        dd if=misc-head of=current-bcb bs=1 count=2048 2>/dev/null
         cmp -s current-bcb before-bcb || cmp -s current-bcb recovery-bcb
-        dd if=recovery-bcb of="$misc" bs=2048 count=1 conv=notrunc,fsync
-        dd if="$misc" of=current-bcb bs=2048 count=1 2>/dev/null
+        misc_write_range recovery-bcb 0 2048
+        dd if=misc-head of=current-bcb bs=1 count=2048 2>/dev/null
         cmp -s current-bcb recovery-bcb
     elif [ "$action" = gap ]; then
         # Only the proven OpenWrt range is invalidated; factory gaps stay gaps.
-        dd if=/dev/zero of="$disk" bs=4096 seek="$((start/8))" count=1 conv=notrunc,fsync
+        dd if=/dev/zero of="$disk" bs="$sector_size" seek="$((start/factor))" count="$((8/factor))" conv=notrunc,fsync
     fi
     echo '2/3 restoring the verified partition layout' > /run/openwrt-uninstall/progress.txt
     snapshot_commit
@@ -218,8 +259,8 @@ echo '3/3 restoring Android boot selection' > /run/openwrt-uninstall/progress.tx
 [ "$(sha256sum "$android" | cut -d' ' -f1)" = "$boot_sha" ]
 dd if="$android" of="$linux" bs=1048576 conv=fsync
 [ "$(sha256sum "$linux" | cut -d' ' -f1)" = "$boot_sha" ]
-dd if=android-bc of="$misc" bs=1 seek=2048 count=32 conv=notrunc,fsync
-dd if="$misc" of=current-bc bs=1 skip=2048 count=32 2>/dev/null
+misc_write_range android-bc 2048 32
+dd if=misc-head of=current-bc bs=1 skip=2048 count=32 2>/dev/null
 cmp -s current-bc android-bc
 echo 'Offline uninstall verified; restarting Android' > /run/openwrt-uninstall/progress.txt
 sync

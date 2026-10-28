@@ -13,7 +13,9 @@ VERSION_CODE=$(sed -n 's/^VERSION_CODE=//p' version.properties)
     || { echo "bad version.properties: VERSION_NAME=$VERSION_NAME VERSION_CODE=$VERSION_CODE" >&2; exit 1; }
 OUT=build
 APP=app/src/main
-SIGN=signing
+# Set OWRT_SIGNING_DIR to the existing official signing directory to produce an in-place update.
+# Signing files are never copied into the source archive or delivery bundle.
+SIGN=${OWRT_SIGNING_DIR:-signing}
 
 for t in "$BT/aapt2" "$BT/d8" "$BT/zipalign" "$BT/apksigner" "$JAR"; do
     [ -e "$t" ] || { echo "missing $t" >&2; exit 1; }
@@ -22,7 +24,8 @@ done
 rm -rf "$OUT"
 mkdir -p "$OUT/gen" "$OUT/classes" "$OUT/dex" dist
 
-# 1. Signing key: generated for this project only (never reuse other projects' keys).
+# Use the configured key when available. A generated fallback key cannot update an installation
+# signed by another key; the user should supply the existing official signing directory for that.
 if [ ! -f "$SIGN/release.keystore" ]; then
     mkdir -p "$SIGN"
     chmod 700 "$SIGN"
@@ -32,9 +35,11 @@ if [ ! -f "$SIGN/release.keystore" ]; then
         -dname "CN=OpenWrt Android Installer, O=linote, C=CN" >/dev/null
     printf 'storePassword=%s\nkeyAlias=owrtinstaller\n' "$pass" > "$SIGN/keystore.properties"
     chmod 600 "$SIGN/release.keystore" "$SIGN/keystore.properties"
-    echo "generated new signing key in $SIGN/ (keep it to publish updates)"
+    echo "generated a build-local signing key in $SIGN/ (this key will not update another signed installation)"
 fi
 STOREPASS=$(sed -n 's/^storePassword=//p' "$SIGN/keystore.properties")
+KEY_ALIAS=$(sed -n 's/^keyAlias=//p' "$SIGN/keystore.properties")
+[ -n "$STOREPASS" ] && [ -n "$KEY_ALIAS" ] || { echo "missing signing configuration in $SIGN" >&2; exit 1; }
 
 # 2. Resources + manifest.
 "$BT/aapt2" compile --dir "$APP/res" -o "$OUT/res.zip"
@@ -64,17 +69,18 @@ cp "$OUT/base.apk" "$OUT/unsigned.apk"
 (cd "$OUT/dex" && zip -q -X ../unsigned.apk classes.dex)
 "$BT/zipalign" -p -f 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
 NAME=dist/OpenWrt-Installer-Android-$VERSION_NAME.apk
-"$BT/apksigner" sign --ks "$SIGN/release.keystore" --ks-key-alias owrtinstaller \
+"$BT/apksigner" sign --ks "$SIGN/release.keystore" --ks-key-alias "$KEY_ALIAS" \
     --ks-pass "pass:$STOREPASS" --key-pass "pass:$STOREPASS" --out "$NAME" "$OUT/aligned.apk"
 "$BT/apksigner" verify --verbose "$NAME" > "$OUT/verify.txt"   # no "| head": with pipefail, SIGPIPE would fail the build
 head -6 "$OUT/verify.txt"
-# 5. The APK must carry one version everywhere: manifest, compiled BuildInfo, file name.
+# 5. Verify package and version metadata.
 "$BT/aapt2" dump badging "$NAME" > "$OUT/badging.txt"
 BADGE=$(sed -n 1p "$OUT/badging.txt")
-[[ "$BADGE" == *"versionCode='$VERSION_CODE' versionName='$VERSION_NAME'"* ]] \
-    || { echo "version mismatch in manifest: $BADGE" >&2; exit 1; }
+[[ "$BADGE" == *"package: name='top.linote.owrtinstaller'"* \
+    && "$BADGE" == *"versionCode='$VERSION_CODE' versionName='$VERSION_NAME'"* ]] \
+    || { echo "manifest package/version mismatch: $BADGE" >&2; exit 1; }
 javap -constants -cp "$OUT/classes" top.linote.owrtinstaller.BuildInfo | grep -q "VERSION_NAME = \"$VERSION_NAME\"" \
     || { echo "BuildInfo.VERSION_NAME does not match $VERSION_NAME" >&2; exit 1; }
-echo "version $VERSION_NAME ($VERSION_CODE): manifest, BuildInfo and file name agree"
-(cd dist && sha256sum "$(basename "$NAME")" | tee "$(basename "$NAME").sha256")   # file name only, for the release asset
+echo "version $VERSION_NAME ($VERSION_CODE): official package, manifest, BuildInfo and file name agree"
+(cd dist && sha256sum "$(basename "$NAME")" | tee "$(basename "$NAME").sha256")
 echo "built $NAME"

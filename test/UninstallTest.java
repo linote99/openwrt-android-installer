@@ -105,21 +105,26 @@ public class UninstallTest {
     // Build a small but fully checksummed GPT snapshot. The partition geometry is
     // deliberately kept independent of any host block device.
     static byte[][] gpt(boolean adjacent, String rootName) throws Exception {
-        final long sectors = 1L << 24, firstTable = 2, tableSectors = 32, tail = sectors - 33;
+        return gpt(adjacent, rootName, 512);
+    }
+    static byte[][] gpt(boolean adjacent, String rootName, int block) throws Exception {
+        final int factor = block / 512;
+        final long sectors = 1L << 24, logical = sectors / factor, tableBlocks = (128L * 128 + block - 1) / block;
+        final long firstTable = 2, backupTable = logical - 1 - tableBlocks, tail = backupTable * factor;
         byte[] entries = new byte[128 * 128];
         java.util.UUID disk = java.util.UUID.fromString("11111111-2222-3333-4444-555555555555");
         int n = 0;
         long rootStart = adjacent ? 32768 : 65536;
-        n = gptPart(entries, n, 10000, adjacent ? rootStart - 1 : 50000, "userdata", 1);
-        n = gptPart(entries, n, rootStart, rootStart + 4194303, rootName, 2);
-        n = gptPart(entries, n, 9000000, 9002047, "misc", 3);
-        n = gptPart(entries, n, 9010000, 9018191, "boot_a", 4);
-        n = gptPart(entries, n, 9020000, 9028191, "boot_b", 5);
-        byte[] p = new byte[34 * 512], q = new byte[33 * 512];
-        System.arraycopy(entries, 0, p, (int) (firstTable * 512), entries.length);
+        n = gptPart(entries, n, 10000 / factor, (adjacent ? rootStart - 1 : 49999) / factor, "userdata", 1);
+        n = gptPart(entries, n, rootStart / factor, (rootStart + 4194303) / factor, rootName, 2);
+        n = gptPart(entries, n, 9000000 / factor, 9002047 / factor, "misc", 3);
+        n = gptPart(entries, n, 9010000 / factor, 9018191 / factor, "boot_a", 4);
+        n = gptPart(entries, n, 9020000 / factor, 9028191 / factor, "boot_b", 5);
+        byte[] p = new byte[(int) ((2 + tableBlocks) * block)], q = new byte[(int) ((logical - backupTable) * block)];
+        System.arraycopy(entries, 0, p, (int) (firstTable * block), entries.length);
         System.arraycopy(entries, 0, q, 0, entries.length);
-        header(p, 512, 1, sectors - 1, firstTable, entries, disk, sectors);
-        header(q, q.length - 512, sectors - 1, 1, tail, entries, disk, sectors);
+        header(p, block, block, 1, logical - 1, 2 + tableBlocks, backupTable - 1, firstTable, entries, disk, logical);
+        header(q, q.length - block, block, logical - 1, 1, 2 + tableBlocks, backupTable - 1, backupTable, entries, disk, logical);
         return new byte[][]{p, q};
     }
     static int gptPart(byte[] t, int n, long a, long b, String name, int seed) {
@@ -133,14 +138,74 @@ public class UninstallTest {
     }
     static void header(byte[] raw, int at, long current, long alternate, long table, byte[] entries,
                        java.util.UUID disk, long sectors) {
-        byte[] h = new byte[512]; System.arraycopy("EFI PART".getBytes(StandardCharsets.US_ASCII), 0, h, 0, 8);
+        header(raw, at, 512, current, alternate, 34, sectors - 34, table, entries, disk, sectors);
+    }
+    static void header(byte[] raw, int at, int block, long current, long alternate, long firstUsable, long lastUsable,
+                       long table, byte[] entries, java.util.UUID disk, long sectors) {
+        byte[] h = new byte[block]; System.arraycopy("EFI PART".getBytes(StandardCharsets.US_ASCII), 0, h, 0, 8);
         Mu300Boot.put32le(h, 8, 0x00010000); Mu300Boot.put32le(h, 12, 92);
-        put64(h, 24, current); put64(h, 32, alternate); put64(h, 40, 34); put64(h, 48, sectors - 34);
+        put64(h, 24, current); put64(h, 32, alternate); put64(h, 40, firstUsable); put64(h, 48, lastUsable);
         byte[] dg = Mu300Gpt.guidLe(disk); System.arraycopy(dg, 0, h, 56, 16); put64(h, 72, table); Mu300Boot.put32le(h, 80, 128); Mu300Boot.put32le(h, 84, 128);
         Mu300Boot.put32le(h, 88, Mu300Boot.crc32(entries, 0, entries.length)); Mu300Boot.put32le(h, 16, Mu300Boot.crc32(h, 0, 92));
-        System.arraycopy(h, 0, raw, at, 512);
+        System.arraycopy(h, 0, raw, at, block);
+    }
+    static void put64le(byte[] b, int p, long v) { for (int i = 0; i < 8; i++) b[p + i] = (byte) (v >>> (8 * i)); }
+    static void refresh(byte[][] copies, int block) {
+        int tableBytes = 128 * 128, primaryAt = block, backupAt = copies[1].length - block;
+        int crc = Mu300Boot.crc32(copies[0], 2 * block, tableBytes);
+        Mu300Boot.put32le(copies[0], primaryAt + 88, crc); Mu300Boot.put32le(copies[1], backupAt + 88, crc);
+        Mu300Boot.put32le(copies[0], primaryAt + 16, 0); Mu300Boot.put32le(copies[0], primaryAt + 16, Mu300Boot.crc32(copies[0], primaryAt, 92));
+        Mu300Boot.put32le(copies[1], backupAt + 16, 0); Mu300Boot.put32le(copies[1], backupAt + 16, Mu300Boot.crc32(copies[1], backupAt, 92));
     }
     static void put64(byte[] b, int p, long v) { for (int i = 0; i < 8; i++) b[p + i] = (byte) (v >>> (8 * i)); }
+    static long get64(byte[] b, int p) { long v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | (b[p + i] & 255L); return v; }
+
+    static void ufsUninstallTests() throws Exception {
+        final long sectors = 1L << 24;
+        for (int block : new int[]{512, 4096}) {
+            byte[][] adjacent = gpt(true, "mu300root", block), gap = gpt(false, "mu300root", block);
+            Uninstall.Layout a = Uninstall.deviceLayout(adjacent[0], adjacent[1], sectors, "mu300root");
+            Uninstall.Layout g = Uninstall.deviceLayout(gap[0], gap[1], sectors, "mu300root");
+            ok(a.expands && a.target.start == a.data.start && a.target.end == a.root.end,
+                    "UFS " + block + "-byte adjacent root is reclaimed into userdata exactly");
+            ok(!g.expands && g.target.start == g.data.start && g.target.end == g.data.end && g.root.end > g.data.end,
+                    "UFS " + block + "-byte non-adjacent root leaves intervening gap untouched");
+            ok(a.after[0].length == adjacent[0].length && a.after[1].length == adjacent[1].length,
+                    "UFS " + block + "-byte primary/backup snapshot lengths retain exact bytes");
+
+            byte[][] badBackup = gpt(true, "mu300root", block); badBackup[1][0] ^= 1;
+            rejects(() -> Uninstall.deviceLayout(badBackup[0], badBackup[1], sectors, "mu300root"),
+                    "UFS " + block + "-byte uninstall refuses mismatched backup GPT");
+            byte[][] badRootAlignment = gpt(true, "mu300root", block);
+            int factor = block / 512, pEntry = 2 * block + 128, qEntry = 128;
+            long rootStartLba = get64(badRootAlignment[0], pEntry + 32);
+            long rootEndLba = get64(badRootAlignment[0], pEntry + 40);
+            put64le(badRootAlignment[0], pEntry + 32, rootStartLba + 1); put64le(badRootAlignment[0], pEntry + 40, rootEndLba + 1);
+            put64le(badRootAlignment[1], qEntry + 32, rootStartLba + 1); put64le(badRootAlignment[1], qEntry + 40, rootEndLba + 1);
+            refresh(badRootAlignment, block);
+            rejects(() -> Uninstall.deviceLayout(badRootAlignment[0], badRootAlignment[1], sectors, "mu300root"),
+                    "UFS " + block + "-byte uninstall refuses misaligned reclaim range");
+
+            byte[][] beyondDisk = gpt(true, "mu300root", block);
+            long past = sectors / factor + 10;
+            put64le(beyondDisk[0], pEntry + 40, past); put64le(beyondDisk[1], qEntry + 40, past);
+            refresh(beyondDisk, block);
+            rejects(() -> Uninstall.deviceLayout(beyondDisk[0], beyondDisk[1], sectors, "mu300root"),
+                    "UFS " + block + "-byte uninstall refuses partition beyond last usable LBA");
+            rejects(() -> Uninstall.deviceLayout(adjacent[0], adjacent[1], sectors, "unknown-root"),
+                    "UFS " + block + "-byte uninstall refuses unsupported root identity");
+        }
+        ok(Uninstall.bytes512(8) == 4096, "512-byte sector to byte conversion is exact");
+        rejects(() -> { try { Uninstall.bytes512(Long.MAX_VALUE); } catch (Exception e) { throw new RuntimeException(e); } },
+                "byte conversion refuses overflowing sector count");
+        Uninstall.Device d = new Uninstall.Device(); d.booted = true; d.s = new Mu300Internal.Storage(); d.s.kind = "ufs"; d.s.root = "sda38";
+        Uninstall.Pkg pkg = new Uninstall.Pkg(); pkg.family = "mu300";
+        rejects(() -> { try { Uninstall.prepare(null, d, pkg); } catch (Exception e) { throw new RuntimeException(e); } },
+                "UFS uninstall refuses missing pinned storage identity library before I/O");
+        pkg.storageLibrary = "wrong library".getBytes(StandardCharsets.UTF_8);
+        rejects(() -> { try { Uninstall.prepare(null, d, pkg); } catch (Exception e) { throw new RuntimeException(e); } },
+                "UFS uninstall refuses a storage identity library with the wrong SHA-256");
+    }
 
     static void lifecycle(String family, File work) throws Exception {
         String root = "e5".equals(family) ? "e5root" : "mu300root";
@@ -168,6 +233,7 @@ public class UninstallTest {
     }
     public static void main(String[] args) throws Exception {
         File work = new File(args.length > 0 ? args[0] : "build-test/uninstall"); Mu300Internal.deleteTree(work); if (!work.mkdirs()) throw new IOException("mkdir " + work);
+        ufsUninstallTests();
         String e5 = args.length > 1 ? args[1] : "/home/ubuntu/upload/e5-openwrt-25.12.5-r20261023.183851-g33f8a737-s4bbbcbec-k6.1(1).zip";
         String mu = args.length > 2 ? args[2] : "/home/ubuntu/upload/mu300-openwrt-25.12.5-r20261024.082138-g3c350105-sc498f186-k.zip";
         for (String[] x : new String[][]{{"e5",e5},{"mu300",mu}}) { bootTests(x[0],x[1]); evidence(x[0],x[1],work); helperTests(x[0]); lifecycle(x[0], work); }

@@ -19,7 +19,7 @@ final class UninstallBoot {
     private UninstallBoot() {}
 
     /** sha256 of assets/uninstall-worker.sh (backend uninstall_worker WORKER with the GROWTH functions). */
-    static final String WORKER_SHA = "80c9cec1460f36a6a9ab6bf236a9da1771ef86ead179e458e4096412af803c99";
+    static final String WORKER_SHA = "d60044caa3315f56ba69b01ac0da52ded743e541dfd930f62e17ba3134728526";
     static final int BOOT_BYTES = 64 << 20;
     static final int LZ4_MAGIC = 0x184C2102;
     static final int S_IFMT = 0170000, S_IFREG = 0100000, S_IFDIR = 0040000;

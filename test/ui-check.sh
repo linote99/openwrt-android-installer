@@ -54,7 +54,14 @@ t "ufi: page redraws on ladder state" 'grep -q "d.wait + \",\" + d.waitHint) + \
 t "ufi: backup notice on formatting plans" 'grep -q "UfiTool.backupBeforeFormat(un)" "$M"'
 t "ufi: no-ADB steps on resume / method / done pages" 'grep -q "没有检测到目标设备的 ADB" "$M" && grep -q "String noAdb = pending != null" "$M" && grep -q "UfiTool.noAdbAfterFormat(jm.mu300Family(), false)" "$M"'
 t "ufi: ladder log + foreground while waiting" 'grep -q "String uh = ufiHint(r.state" "$JM" && grep -q "if (ownFg) InstallService.start(app" "$JM" && grep -q "if (ownFg) InstallService.stop(app)" "$JM"'
-t "ufi: about documents both families" 'grep -q "section(\"配合 \" + UfiTool.NAME)" "$A" && grep -q "MU300 系列" "$A" && grep -q "E5 系" "$A"'
+t "ufi: about documents both families" 'grep -q "UfiTool.NAME" "$A" && grep -q "MU300 系列" "$A" && grep -q "E5 系" "$A"'
 t "about documents uninstall + cleanup" 'grep -q "卸载并归还空间【高级】" "$A" && grep -q "section(\"清理本机占用\")" "$A"'
+t "使用说明 documents bounded MU300 UFS package and limitations" 'grep -q "section(\"MU300 UFS 适配\")" "$A" && grep -q "mu300-openwrt-25.12.5-r20261027.135818-g0043a5d8-s5351d2bc-k.zip" "$A" && grep -q "从 UFS 删除 OpenWrt 并把空间归还给 Android" "$A" && grep -q "UFS 安装与重装流程保持不变" "$A" && grep -q "没有在真实 UFS 设备上验证安装或卸载" "$A"'
+t "resume identity note covers eMMC and UFS" 'grep -q "核对 eMMC/UFS 存储身份和槽位" "$A"'
+t "launcher name is formal, not UFS test edition" 'grep -Fq "<string name=\"app_name\">OpenWrt 安装器</string>" app/src/main/res/values/strings.xml && ! grep -q "UFS 测试版" app/src/main/res/values/strings.xml'
+t "home entry and page header are named 设置" 'grep -q "ui.text(\"设置\", 13" "$M" && grep -q "setTitle(\"设置\")" "$A" && grep -q "ui.text(\"设置\", 17" "$A"'
+t "使用说明 and MU300 UFS 适配 remain separate accordion sections" 'grep -q "section(\"使用说明\")" "$A" && grep -q "section(\"MU300 UFS 适配\")" "$A"'
+t "settings sections start collapsed and toggle on tap" 'grep -q "details.setVisibility(View.GONE)" "$A" && grep -q "header.setOnClickListener" "$A" && grep -q "details.setVisibility(expanded ? View.VISIBLE : View.GONE)" "$A"'
+t "step-4 package/device gate runs before uninstall or storage preflight" 'awk "/void runCheck\\(\\)/{p=1} p && /readOnlyCheckBlocker\\(pkg, target\\(\\)\\)/{g=NR} p && /if \\(m == Method.UNINSTALL\\)/{u=NR} END{exit !(g && u && g<u)}" "$JM"'
 echo "ui check: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

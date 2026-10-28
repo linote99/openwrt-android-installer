@@ -24,6 +24,22 @@ final class UninstallRun {
     static final String[] SNAPSHOTS = {"before-first", "before-last", "after-first", "after-last"};
     static final String BOOTCHAIN_MU300[] = {"boot", "uboot", "sml", "teecfg", "trustos", "vbmeta"};
     static final int ARM_SILENCE_S = 900;
+    static final int MISC_HEAD_BYTES = 4096, BCB_OFFSET = 2048, BCB_BYTES = 32;
+
+    static byte[] miscHead(Mu300Internal.Io io) throws IOException {
+        return Mu300Internal.read(io, "dd if=/dev/block/by-name/misc bs=" + MISC_HEAD_BYTES + " count=1 2>/dev/null", MISC_HEAD_BYTES);
+    }
+    static byte[] miscBcb(byte[] head) throws Uninstall.Refused {
+        if (head == null || head.length != MISC_HEAD_BYTES) throw new Uninstall.Refused("misc head is incomplete");
+        return Arrays.copyOfRange(head, BCB_OFFSET, BCB_OFFSET + BCB_BYTES);
+    }
+    static byte[] withMiscBcb(byte[] head, byte[] bcb) throws Uninstall.Refused {
+        if (head == null || head.length != MISC_HEAD_BYTES || bcb == null || bcb.length != BCB_BYTES)
+            throw new Uninstall.Refused("misc BCB range is invalid");
+        byte[] out = head.clone();
+        System.arraycopy(bcb, 0, out, BCB_OFFSET, BCB_BYTES);
+        return out;
+    }
 
     /** One-line result for the UI: pending = more work after the target reboots / reconnects. */
     static final class Outcome {
@@ -107,6 +123,9 @@ final class UninstallRun {
         r.put("profile", p.device.profile);
         r.put("model", p.device.model);
         r.put("cid", p.device.s.cid);
+        r.put("storage_kind", p.device.s.kind);
+        r.put("disk_node", p.device.s.diskNode);
+        r.put("sector_size", (long) p.device.s.sectorSize);
         r.put("slot", p.device.slot);
         r.put("transport", io.transport());
         r.put("boot_id", p.device.bootId);
@@ -135,6 +154,9 @@ final class UninstallRun {
         meta.put("total", p.total);
         meta.put("front", p.front);
         meta.put("tail", p.tail);
+        meta.put("storage_kind", p.device.s.kind);
+        meta.put("disk_node", p.device.s.diskNode);
+        meta.put("sector_size", (long) p.device.s.sectorSize);
         meta.put("tool_hashes", new LinkedHashMap<String, Object>(p.toolHashes));
         meta.put("root_start", p.rootStart);
         meta.put("root_size", p.rootSize);
@@ -203,17 +225,25 @@ final class UninstallRun {
         return finish(io, rec, pkg, d);
     }
 
-    /** ready(): probe and bind to the record's device (eMMC CID, slot). */
+    /** ready(): probe and bind to the record's internal-storage identity, topology and slot. */
     static Uninstall.Device ready(Mu300Internal.Io io, Rec rec, Uninstall.Pkg pkg) throws IOException {
         Uninstall.Device d = Uninstall.probe(io, pkg.rootName(), rec.s("profile"));
         // rebind_uninstall: another connection may continue only for the same cid, profile and slot.
-        String mismatch = Rebind.diff("eMMC CID", rec.s("cid"), d.s.cid, "机型配置", rec.s("profile"), d.profile,
+        String expectedKind = rec.s("storage_kind").isEmpty() ? "emmc" : rec.s("storage_kind");
+        String idName = "ufs".equals(expectedKind) ? "UFS storage identity" : "eMMC CID";
+        String mismatch = Rebind.diff(idName, rec.s("cid"), d.s.cid, "机型配置", rec.s("profile"), d.profile,
                 "Android 槽位", "_" + rec.s("slot"), "_" + d.slot);
         if (Rebind.apply(rec.r, io.transport(), io.ready(), mismatch, System.currentTimeMillis() / 1000)) {
             rec.save();
             if (rec.r.get("transport_history") != null) io.log("已改用新的连接继续：" + io.transport() + "（设备身份核对一致，已记入连接历史）");
         }
-        if (!d.s.cid.equals(rec.s("cid"))) throw new Uninstall.Refused("目标设备与卸载记录不是同一台（eMMC CID 不同），已停止。");
+        if (!expectedKind.equals(d.s.kind)) throw new Uninstall.Refused("存储类型与卸载记录不一致，已停止（Storage kind differs from record）");
+        if (!rec.s("disk_node").isEmpty() && !rec.s("disk_node").equals(d.s.diskNode))
+            throw new Uninstall.Refused("内部磁盘节点与卸载记录不一致，已停止（Internal disk topology differs from record）");
+        long expectedSector = Uninstall.lng(rec.r.get("sector_size"));
+        if (expectedSector > 0 && expectedSector != d.s.sectorSize)
+            throw new Uninstall.Refused("GPT 逻辑块大小与卸载记录不一致，已停止（Logical sector size differs from record）");
+        if (!d.s.cid.equals(rec.s("cid"))) throw new Uninstall.Refused("目标设备与卸载记录不是同一台（存储身份不同），已停止。");
         if (!d.slot.equals(rec.s("slot"))) throw new Uninstall.Refused("目标设备当前 Android 槽位与卸载记录不同（记录 _" + rec.s("slot") + "，现在 _" + d.slot + "），已停止，请保留备份。");
         return d;
     }
@@ -231,10 +261,20 @@ final class UninstallRun {
     static String layoutState(Mu300Internal.Io io, Rec rec, Uninstall.Device d) throws IOException {
         Map<String, Object> m = rec.meta();
         long front = Uninstall.lng(m.get("front")), tail = Uninstall.lng(m.get("tail")), total = Uninstall.lng(m.get("total"));
-        if (total != d.s.diskSize) throw new Uninstall.Refused("eMMC 容量与卸载记录不一致");
+        if (total != d.s.diskSize) throw new Uninstall.Refused("内部存储容量与卸载记录不一致");
+        int block = d.s.sectorSize, factor = block / 512;
+        String recordedKind = Uninstall.str(m.get("storage_kind"));
+        String recordedDisk = Uninstall.str(m.get("disk_node"));
+        if (!recordedKind.isEmpty() && !recordedKind.equals(d.s.kind)
+                || !recordedDisk.isEmpty() && !recordedDisk.equals(d.s.diskNode)
+                || (block != 512 && block != 4096) || total <= 0 || total % factor != 0
+                || front < 3 || front > 4096 || front % factor != 0 || tail <= front || tail >= total
+                || tail <= total - 4096 || (total - tail) % factor != 0
+                || Uninstall.lng(m.get("sector_size")) != 0 && Uninstall.lng(m.get("sector_size")) != block)
+            throw new Uninstall.Refused("GPT 逻辑块大小与卸载记录不一致");
         String disk = "/dev/block/" + d.partitionNode();
-        byte[] first = Mu300Internal.read(io, "dd if=" + disk + " bs=512 count=" + front + " 2>/dev/null", front * 512);
-        byte[] last = Mu300Internal.read(io, "dd if=" + disk + " bs=512 skip=" + tail + " count=" + (total - tail) + " 2>/dev/null", (total - tail) * 512);
+        byte[] first = Mu300Internal.read(io, "dd if=" + disk + " bs=" + block + " count=" + (front / factor) + " 2>/dev/null", Uninstall.bytes512(front));
+        byte[] last = Mu300Internal.read(io, "dd if=" + disk + " bs=" + block + " skip=" + (tail / factor) + " count=" + ((total - tail) / factor) + " 2>/dev/null", Uninstall.bytes512(total - tail));
         if (Arrays.equals(first, snapshot(rec, "after-first")) && Arrays.equals(last, snapshot(rec, "after-last"))) return "after";
         if (Arrays.equals(first, snapshot(rec, "before-first")) && Arrays.equals(last, snapshot(rec, "before-last"))) return "before";
         throw new Uninstall.Refused("GPT is changed or partially written. Keep backups; offline recovery is required. / GPT 已变化或写入不完整，请保留备份并进行离线恢复；不会自动重跑卸载。");
@@ -254,11 +294,12 @@ final class UninstallRun {
         String disk = "/dev/block/" + d.partitionNode();
         Map<String, Object> m = rec.meta();
         long front = Uninstall.lng(m.get("front")), tail = Uninstall.lng(m.get("tail")), total = Uninstall.lng(m.get("total"));
+        int block = d.s.sectorSize, factor = block / 512;
         LinkedHashMap<String, String> items = new LinkedHashMap<>();
         LinkedHashMap<String, Long> sizes = new LinkedHashMap<>();
         items.put("misc-head.bin", "dd if=/dev/block/by-name/misc bs=4096 count=1"); sizes.put("misc-head.bin", 4096L);
-        items.put("gpt-first.bin", "dd if=" + disk + " bs=512 count=" + front); sizes.put("gpt-first.bin", front * 512);
-        items.put("gpt-last.bin", "dd if=" + disk + " bs=512 skip=" + tail + " count=" + (total - tail)); sizes.put("gpt-last.bin", (total - tail) * 512);
+        items.put("gpt-first.bin", "dd if=" + disk + " bs=" + block + " count=" + (front / factor)); sizes.put("gpt-first.bin", Uninstall.bytes512(front));
+        items.put("gpt-last.bin", "dd if=" + disk + " bs=" + block + " skip=" + (tail / factor) + " count=" + ((total - tail) / factor)); sizes.put("gpt-last.bin", Uninstall.bytes512(total - tail));
         List<String> parts = new ArrayList<>();
         if ("mu300".equals(rec.s("family"))) parts.addAll(Arrays.asList(BOOTCHAIN_MU300)); else parts.add("boot");
         for (String n : parts) for (String sl : new String[]{"a", "b"}) {
@@ -335,12 +376,17 @@ final class UninstallRun {
             Uninstall.Volume saved = Uninstall.Volume.of((Map<String, Object>) m.get("volume"));
             if (!v.uuid.equals(saved.uuid) || !v.source.equals(saved.source) || !v.filesystem.equals(saved.filesystem) || v.filesystemBytes != saved.filesystemBytes)
                 throw new Uninstall.Refused("Android data changed; create a new removal plan / Android data 已变化，请重新生成卸载计划");
-            tools = Uninstall.growthTools(pkg, v.filesystem);
-            TreeMap<String, Object> hashes = new TreeMap<>();
-            for (Map.Entry<String, byte[]> e : tools.entrySet()) hashes.put(e.getKey(), Mu300Boot.sha256(e.getValue()));
-            if (!Uninstall.Json.write(hashes, true).equals(Uninstall.Json.write(m.get("tool_hashes"), true)))
-                throw new Uninstall.Refused("Preservation tools changed; review removal plan / 保数据工具已变化，需重新核对卸载计划");
+            tools.putAll(Uninstall.growthTools(pkg, v.filesystem));
         }
+        if ("ufs".equals(d.s.kind)) {
+            if (pkg.storageLibrary == null || !Mu300Boot.sha256(pkg.storageLibrary).equals("7dc62136b7f95a3d18e8218b13649c04729fe3c7d29814acb68b82ceb1f44233"))
+                throw new Uninstall.Refused("UFS storage library checksum differs / UFS 存储身份库校验不符");
+            tools.put("openwrt-uninstall/storage-lib.sh", pkg.storageLibrary.clone());
+        }
+        TreeMap<String, Object> hashes = new TreeMap<>();
+        for (Map.Entry<String, byte[]> e : tools.entrySet()) hashes.put(e.getKey(), Mu300Boot.sha256(e.getValue()));
+        if (!Uninstall.Json.write(hashes, true).equals(Uninstall.Json.write(m.get("tool_hashes"), true)))
+            throw new Uninstall.Refused("Uninstall tools changed; review removal plan / 卸载工具已变化，需重新核对计划");
         if (retry.isEmpty()) {
             rec.stage("uninstall_backup", io, "▶ 备份分区表、misc 与启动分区（写入前）");
             backup(io, rec, d);
@@ -384,6 +430,8 @@ final class UninstallRun {
         request.add(Uninstall.lng(rec.plan().get("android_bytes")) / 512);
         request.add(volume.filesystemBytes);
         request.add(volume.uuid.isEmpty() ? "00000000000000000000000000000000" : volume.uuid);
+        request.add(d.s.kind);
+        request.add((long) d.s.sectorSize);
         StringBuilder req = new StringBuilder();
         for (int i = 0; i < request.size(); i++) req.append(i > 0 ? ":" : "").append(request.get(i));
         req.append('\n');
@@ -409,25 +457,34 @@ final class UninstallRun {
         rec.r.put("uninstall_boot_sha256", Mu300Boot.sha256(image));
         rec.r.put("uninstall_android_sha256", androidSha);
         rec.r.put("uninstall_trial_sha256", Mu300Boot.sha256(trial));
+        byte[] trialHead = withMiscBcb(misc, trial);
+        File beforeHeadFile = new File(rec.dir, "before-misc-head.bin");
+        File trialHeadFile = new File(rec.dir, "trial-misc-head.bin");
+        Mu300Internal.writeAll(beforeHeadFile, misc);
+        Mu300Internal.writeAll(trialHeadFile, trialHead);
+        rec.r.put("uninstall_before_misc_sha256", Mu300Boot.sha256(misc));
+        rec.r.put("uninstall_trial_misc_sha256", Mu300Boot.sha256(trialHead));
         rec.save();
         io.log("离线卸载启动镜像已生成：" + Mu300Internal.human(image.length) + "，sha256 " + Mu300Boot.sha256(image).substring(0, 16) + "…");
         io.step("上传离线卸载启动镜像（" + Mu300Internal.human(image.length) + "）", false);
         io.sh("umask 077; mkdir -p " + remote + "; chown 2000:2000 " + remote + "; chmod 700 " + remote, true);
         io.push(path, remote + "/boot.img");
         io.push(new File(rec.dir, "trial.bin"), remote + "/trial.bin");
+        io.push(beforeHeadFile, remote + "/before-misc-head.bin");
+        io.push(trialHeadFile, remote + "/trial-misc-head.bin");
         String bootdev = "/dev/block/by-name/boot_" + other;
         String disk = "/dev/block/" + d.partitionNode();
         long front = Uninstall.lng(m.get("front")), tail = Uninstall.lng(m.get("tail")), total = Uninstall.lng(m.get("total"));
-        String layoutChecks = "[ \"$(dd if=" + disk + " bs=512 count=" + front + " | sha256sum | cut -d\" \" -f1)\" = " + Mu300Boot.sha256(snapshot(rec, "before-first"))
-                + " ]; [ \"$(dd if=" + disk + " bs=512 skip=" + tail + " count=" + (total - tail) + " | sha256sum | cut -d\" \" -f1)\" = " + Mu300Boot.sha256(snapshot(rec, "before-last")) + " ]; ";
+        int block = d.s.sectorSize, factor = block / 512;
+        String layoutChecks = "[ \"$(dd if=" + disk + " bs=" + block + " count=" + (front / factor) + " | sha256sum | cut -d\" \" -f1)\" = " + Mu300Boot.sha256(snapshot(rec, "before-first"))
+                + " ]; [ \"$(dd if=" + disk + " bs=" + block + " skip=" + (tail / factor) + " count=" + ((total - tail) / factor) + " | sha256sum | cut -d\" \" -f1)\" = " + Mu300Boot.sha256(snapshot(rec, "before-last")) + " ]; ";
         String linuxSha = retry.isEmpty() ? sums(rec.backup()).get("boot_" + other + ".img") : retry;
         String script = "set -eu; set -o pipefail; [ \"$(getprop ro.boot.slot_suffix)\" = \"_" + slot + "\" ]; " + layoutChecks
                 + "[ \"$(sha256sum /dev/block/by-name/boot_" + slot + " | cut -d\" \" -f1)\" = " + androidSha + " ]; [ \"$(sha256sum " + bootdev + " | cut -d\" \" -f1)\" = " + linuxSha
-                + " ]; dd if=" + bootdev + " of=" + remote + "/before-boot.img bs=1048576; dd if=/dev/block/by-name/misc of=" + remote
-                + "/before-bc bs=1 skip=2048 count=32; [ \"$(sha256sum " + remote + "/before-bc | cut -d\" \" -f1)\" = " + Mu300Boot.sha256(control)
+                + " ]; dd if=" + bootdev + " of=" + remote + "/before-boot.img bs=1048576; [ \"$(dd if=/dev/block/by-name/misc bs=4096 count=1 | sha256sum | cut -d\" \" -f1)\" = " + Mu300Boot.sha256(misc)
                 + " ]; dd if=" + remote + "/boot.img of=" + bootdev + " bs=1048576 conv=fsync; [ \"$(sha256sum " + bootdev + " | cut -d\" \" -f1)\" = " + Mu300Boot.sha256(image)
-                + " ]; if dd if=" + remote + "/trial.bin of=/dev/block/by-name/misc bs=1 seek=2048 count=32 conv=notrunc,fsync && [ \"$(dd if=/dev/block/by-name/misc bs=1 skip=2048 count=32 | sha256sum | cut -d\" \" -f1)\" = "
-                + Mu300Boot.sha256(trial) + " ]; then :; else dd if=" + remote + "/before-bc of=/dev/block/by-name/misc bs=1 seek=2048 count=32 conv=notrunc,fsync; exit 1; fi";
+                + " ]; if dd if=" + remote + "/trial-misc-head.bin of=/dev/block/by-name/misc bs=4096 count=1 conv=notrunc,fsync && [ \"$(dd if=/dev/block/by-name/misc bs=4096 count=1 | sha256sum | cut -d\" \" -f1)\" = "
+                + Mu300Boot.sha256(trialHead) + " ]; then :; else dd if=" + remote + "/before-misc-head.bin of=/dev/block/by-name/misc bs=4096 count=1 conv=notrunc,fsync; exit 1; fi";
         effect(io, rec, "uninstall-arm", script, "写入离线卸载启动镜像到 boot_" + other + " 并设置一次性试启动");
         rec.r.put("uninstall_armed", true);
         rec.r.put("uninstall_wait_boot_id", d.bootId);
@@ -469,16 +526,21 @@ final class UninstallRun {
         if (!d.booted) throw new Uninstall.Refused("Reconnect rooted Android to inspect the interrupted boot write / 请连接有 root 的 Android，复核中断的启动写入");
         if (!"before".equals(layoutState(io, rec, d)))
             throw new Uninstall.Refused("Interrupted boot/misc readback is not recognized / 中断的 boot/misc 回读不符合已保存记录，请保留备份恢复");
-        byte[] original = Arrays.copyOfRange(backupFile(rec, "misc-head.bin", "Interrupted uninstall backups are damaged / 中断卸载的备份损坏"), 2048, 2080);
+        byte[] originalHead = backupFile(rec, "misc-head.bin", "Interrupted uninstall backups are damaged / 中断卸载的备份损坏");
+        byte[] original = miscBcb(originalHead);
         byte[] trial = Mu300Internal.readAll(new File(rec.dir, "trial.bin"));
         if (!Mu300Boot.sha256(trial).equals(rec.s("uninstall_trial_sha256")))
             throw new Uninstall.Refused("Interrupted uninstall backups are damaged / 中断卸载的备份损坏");
-        byte[] bc = Mu300Internal.read(io, "dd if=/dev/block/by-name/misc bs=1 skip=2048 count=32 2>/dev/null", 32);
+        byte[] trialHead = withMiscBcb(originalHead, trial);
+        if (!rec.s("uninstall_trial_misc_sha256").isEmpty() && !Mu300Boot.sha256(trialHead).equals(rec.s("uninstall_trial_misc_sha256")))
+            throw new Uninstall.Refused("Interrupted uninstall backups are damaged / 中断卸载的备份损坏");
+        byte[] currentHead = miscHead(io);
+        byte[] bc = miscBcb(currentHead);
         String active = firstField(io.sh("sha256sum /dev/block/by-name/boot_" + d.slot, true));
         String target = firstField(io.sh("sha256sum /dev/block/by-name/boot_" + d.other, true));
         if (!active.equals(rec.s("uninstall_android_sha256")) || !Uninstall.HEX64.matcher(target).matches())
             throw new Uninstall.Refused("Android boot identity changed during interrupted uninstall / 中断卸载期间 Android 启动身份已变化");
-        if (Arrays.equals(bc, original)) {
+        if (Arrays.equals(currentHead, originalHead)) {
             rec.r.put("uninstall_retry_linux_sha256", target);
             rec.effects().remove("uninstall-arm");
             rec.r.put("unsafe", false);
@@ -486,7 +548,7 @@ final class UninstallRun {
             io.log("Verified original GPT, misc and Android boot; retrying inactive boot staging only / 已确认分区表、misc 与 Android 启动均为原样，只重试非活动槽的卸载镜像写入");
             return;
         }
-        if (!Arrays.equals(bc, trial) || !target.equals(rec.s("uninstall_boot_sha256")))
+        if (!Arrays.equals(currentHead, trialHead) || !target.equals(rec.s("uninstall_boot_sha256")))
             throw new Uninstall.Refused("Interrupted boot/misc readback is not recognized / 中断的 boot/misc 回读不符合已保存记录，请保留备份恢复");
         @SuppressWarnings("unchecked") Map<String, Object> e = (Map<String, Object>) rec.effects().get("uninstall-arm");
         e.put("state", "done"); e.put("time", System.currentTimeMillis() / 1000); e.put("result", "verified by recovery readback");
@@ -528,7 +590,8 @@ final class UninstallRun {
         String[] rows = io.sh("sha256sum /dev/block/by-name/boot_" + slot + " /dev/block/by-name/boot_" + other, true).trim().split("\n");
         if (rows.length != 2 || !firstField(rows[0]).equals(rec.s("uninstall_android_sha256")) || !firstField(rows[1]).equals(rec.s("uninstall_boot_sha256")))
             throw new Uninstall.Refused("Pending growth boot identity differs / 待完成扩容的启动镜像身份不符");
-        byte[] current = Mu300Internal.read(io, "dd if=/dev/block/by-name/misc bs=1 skip=2048 count=32 2>/dev/null", 32);
+        byte[] currentHead = miscHead(io);
+        byte[] current = miscBcb(currentHead);
         Map<String, Object> effect = (Map<String, Object>) rec.effects().get("uninstall-grow-rearm");
         byte[] savedTrial = fromHex(rec.s("uninstall_growth_trial"));
         byte[] before, trial;
@@ -536,11 +599,17 @@ final class UninstallRun {
             before = fromHex(rec.s("uninstall_growth_before_bc"));
             trial = fromHex(rec.s("uninstall_growth_trial"));
             if (Arrays.equals(current, trial)) {
+                String savedHead = rec.s("uninstall_growth_trial_misc_sha256");
+                if (!savedHead.isEmpty() && !Mu300Boot.sha256(currentHead).equals(savedHead))
+                    throw new Uninstall.Refused("Unconfirmed growth misc head; keep backups / 扩容启动控制整块状态不符，请保留备份恢复");
                 effect.put("state", "done"); effect.put("result", "verified by readback");
                 rec.r.put("unsafe", false);
             } else if (!Arrays.equals(current, before)) {
                 throw new Uninstall.Refused("Unconfirmed growth boot control; keep backups / 扩容启动控制写入尚未确认，请保留备份恢复");
             } else {
+                String savedHead = rec.s("uninstall_growth_before_misc_sha256");
+                if (!savedHead.isEmpty() && !Mu300Boot.sha256(currentHead).equals(savedHead))
+                    throw new Uninstall.Refused("Unconfirmed growth misc head; keep backups / 扩容启动控制整块状态不符，请保留备份恢复");
                 rec.effects().remove("uninstall-grow-rearm");
                 rec.r.put("unsafe", false);
                 rec.save();
@@ -557,16 +626,20 @@ final class UninstallRun {
         if (!Arrays.equals(current, trial)) {
             String remote = TMP + rec.s("id") + "-grow";
             io.sh("umask 077; mkdir -p " + remote + "; chown 2000:2000 " + remote + "; chmod 700 " + remote, true);
-            File lb = new File(rec.dir, "grow-before-bc"), lt = new File(rec.dir, "grow-trial-bc");
-            Mu300Internal.writeAll(lb, before);
-            Mu300Internal.writeAll(lt, trial);
-            io.push(lb, remote + "/before-bc");
-            io.push(lt, remote + "/trial-bc");
+            byte[] trialHead = withMiscBcb(currentHead, trial);
+            File lb = new File(rec.dir, "grow-before-misc-head.bin"), lt = new File(rec.dir, "grow-trial-misc-head.bin");
+            Mu300Internal.writeAll(lb, currentHead);
+            Mu300Internal.writeAll(lt, trialHead);
+            rec.r.put("uninstall_growth_before_misc_sha256", Mu300Boot.sha256(currentHead));
+            rec.r.put("uninstall_growth_trial_misc_sha256", Mu300Boot.sha256(trialHead));
+            rec.save();
+            io.push(lb, remote + "/before-misc-head.bin");
+            io.push(lt, remote + "/trial-misc-head.bin");
             String script = "set -eu; set -o pipefail; [ \"$(getprop ro.boot.slot_suffix)\" = _" + slot + " ]; [ \"$(sha256sum /dev/block/by-name/boot_" + slot
                     + " | cut -d\" \" -f1)\" = " + rec.s("uninstall_android_sha256") + " ]; [ \"$(sha256sum /dev/block/by-name/boot_" + other + " | cut -d\" \" -f1)\" = "
-                    + rec.s("uninstall_boot_sha256") + " ]; [ \"$(dd if=/dev/block/by-name/misc bs=1 skip=2048 count=32 | sha256sum | cut -d\" \" -f1)\" = " + Mu300Boot.sha256(before)
-                    + " ]; if dd if=" + remote + "/trial-bc of=/dev/block/by-name/misc bs=1 seek=2048 count=32 conv=notrunc,fsync && [ \"$(dd if=/dev/block/by-name/misc bs=1 skip=2048 count=32 | sha256sum | cut -d\" \" -f1)\" = "
-                    + Mu300Boot.sha256(trial) + " ]; then :; else dd if=" + remote + "/before-bc of=/dev/block/by-name/misc bs=1 seek=2048 count=32 conv=notrunc,fsync; exit 1; fi";
+                    + rec.s("uninstall_boot_sha256") + " ]; [ \"$(dd if=/dev/block/by-name/misc bs=4096 count=1 | sha256sum | cut -d\" \" -f1)\" = " + Mu300Boot.sha256(currentHead)
+                    + " ]; if dd if=" + remote + "/trial-misc-head.bin of=/dev/block/by-name/misc bs=4096 count=1 conv=notrunc,fsync && [ \"$(dd if=/dev/block/by-name/misc bs=4096 count=1 | sha256sum | cut -d\" \" -f1)\" = "
+                    + Mu300Boot.sha256(trialHead) + " ]; then :; else dd if=" + remote + "/before-misc-head.bin of=/dev/block/by-name/misc bs=4096 count=1 conv=notrunc,fsync; exit 1; fi";
             effect(io, rec, "uninstall-grow-rearm", script, "重新设置一次性试启动，继续离线 data 扩容");
         }
         rec.r.put("uninstall_wait_boot_id", d.bootId);
@@ -583,7 +656,7 @@ final class UninstallRun {
         rec.stage("verify_android", io, "▶ 离线卸载后复核 Android（只读）");
         Map<String, Object> plan = rec.plan();
         long androidBytes = Uninstall.lng(plan.get("android_bytes"));
-        long userdataBytes = d.s.size * 512;
+        long userdataBytes = Uninstall.bytes512(d.s.size);
         if (d.s.root != null || userdataBytes != androidBytes)
             throw new Uninstall.Refused("Android partition capacity was not restored / Android 分区容量未恢复");
         boolean preserving = Uninstall.str(rec.meta().get("action")).startsWith("grow-");
@@ -602,15 +675,15 @@ final class UninstallRun {
         }
         if (Math.abs(v.mappedBytes - expected) > Uninstall.MIB4 || !(expected - Uninstall.MIB4 <= v.filesystemBytes && v.filesystemBytes <= expected))
             throw new Uninstall.Refused("Android filesystem has not reached the restored allocation / Android 文件系统尚未达到恢复后的分配容量: " + v.filesystemBytes + " != " + expected + " bytes");
-        byte[] bcb = Mu300Internal.read(io, "dd if=/dev/block/by-name/misc bs=2048 count=1 2>/dev/null", 2048);
+        byte[] bcb = miscHead(io);
         for (int i = 0; i < 32; i++) if (bcb[i] != 0) throw new Uninstall.Refused("Recovery reset is still pending / 原厂 Recovery 重置尚未完成");
         finishBoot(io, rec, d);
         rec.r.put("uninstall_growth_pending", false);
         String remote = rec.s("uninstall_remote");
         if (!remote.isEmpty()) {
             try {
-                io.sh("rm -f " + remote + "/boot.img " + remote + "/trial.bin " + remote + "/before-boot.img " + remote + "/before-bc " + remote + "-finish/android-bc "
-                        + remote + "-grow/before-bc " + remote + "-grow/trial-bc; rmdir " + remote + " " + remote + "-finish " + remote + "-grow 2>/dev/null; true", true);
+                io.sh("rm -f " + remote + "/boot.img " + remote + "/trial.bin " + remote + "/before-boot.img " + remote + "/before-misc-head.bin " + remote + "/trial-misc-head.bin "
+                        + remote + "-finish/android-misc-head.bin " + remote + "-finish/before-misc-head.bin " + remote + "-grow/before-misc-head.bin " + remote + "-grow/trial-misc-head.bin; rmdir " + remote + " " + remote + "-finish " + remote + "-grow 2>/dev/null; true", true);
             } catch (IOException e) { io.log("提示：目标设备上的卸载暂存文件未能全部删除：" + e.getMessage()); }
         }
         LinkedHashMap<String, Object> result = new LinkedHashMap<>();
@@ -632,7 +705,8 @@ final class UninstallRun {
     @SuppressWarnings("unchecked")
     static void finishBoot(Mu300Internal.Io io, Rec rec, Uninstall.Device d) throws IOException {
         String slot = d.slot, other = d.other;
-        byte[] bc = Mu300Internal.read(io, "dd if=/dev/block/by-name/misc bs=1 skip=2048 count=32 2>/dev/null", 32);
+        byte[] beforeHead = miscHead(io);
+        byte[] bc = miscBcb(beforeHead);
         try { UninstallBoot.checkAndroidHealthy(bc, slot); }
         catch (IllegalArgumentException e) { throw new Uninstall.Refused(e.getMessage()); }
         byte[] desired = UninstallBoot.androidControl(bc, slot);
@@ -666,16 +740,22 @@ final class UninstallRun {
         io.sh("umask 077; mkdir -p " + remote + "; chown 2000:2000 " + remote + "; chmod 700 " + remote, true);
         File local = new File(rec.dir, "finish-android-bc");
         Mu300Internal.writeAll(local, desired);
-        io.push(local, remote + "/android-bc");
+        File localBeforeHead = new File(rec.dir, "finish-before-misc-head.bin");
+        File localDesiredHead = new File(rec.dir, "finish-android-misc-head.bin");
+        byte[] desiredHead = withMiscBcb(beforeHead, desired);
+        Mu300Internal.writeAll(localBeforeHead, beforeHead);
+        Mu300Internal.writeAll(localDesiredHead, desiredHead);
+        io.push(localBeforeHead, remote + "/before-misc-head.bin");
+        io.push(localDesiredHead, remote + "/android-misc-head.bin");
         if (rec.effects().containsKey("uninstall-final-boot")) {
             rec.effects().remove("uninstall-final-boot");
             io.log("Retrying verified inactive Android boot restoration; no partition/reset replay / 重试非活动槽的 Android 启动恢复，不会重放分区或恢复出厂操作");
         }
         String script = "set -eu; set -o pipefail; [ \"$(getprop ro.boot.slot_suffix)\" = _" + slot + " ]; [ \"$(sha256sum /dev/block/by-name/boot_" + slot
                 + " | cut -d\" \" -f1)\" = " + source + " ]; dd if=/dev/block/by-name/boot_" + slot + " of=/dev/block/by-name/boot_" + other
-                + " bs=1048576 conv=fsync; [ \"$(sha256sum /dev/block/by-name/boot_" + other + " | cut -d\" \" -f1)\" = " + source + " ]; dd if=" + remote
-                + "/android-bc of=/dev/block/by-name/misc bs=1 seek=2048 count=32 conv=notrunc,fsync; [ \"$(dd if=/dev/block/by-name/misc bs=1 skip=2048 count=32 | sha256sum | cut -d\" \" -f1)\" = "
-                + Mu300Boot.sha256(desired) + " ]";
+                + " bs=1048576 conv=fsync; [ \"$(sha256sum /dev/block/by-name/boot_" + other + " | cut -d\" \" -f1)\" = " + source + " ]; [ \"$(dd if=/dev/block/by-name/misc bs=4096 count=1 | sha256sum | cut -d\" \" -f1)\" = " + Mu300Boot.sha256(beforeHead)
+                + " ]; if dd if=" + remote + "/android-misc-head.bin of=/dev/block/by-name/misc bs=4096 count=1 conv=notrunc,fsync && [ \"$(dd if=/dev/block/by-name/misc bs=4096 count=1 | sha256sum | cut -d\" \" -f1)\" = "
+                + Mu300Boot.sha256(desiredHead) + " ]; then :; else dd if=" + remote + "/before-misc-head.bin of=/dev/block/by-name/misc bs=4096 count=1 conv=notrunc,fsync; exit 1; fi";
         effect(io, rec, "uninstall-final-boot", script, "复制 boot_" + slot + " → boot_" + other + "，启动控制只指向 Android");
     }
 }
