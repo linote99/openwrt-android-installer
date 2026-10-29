@@ -383,6 +383,18 @@ final class Uninstall {
     // ================================================================== installation evidence over ADB
 
     static Map<String, Object> evidence(Mu300Internal.Io io, Device d, Pkg pkg, Mu300Gpt.Part root, byte[] bootBackup) throws IOException {
+        return evidenceInternal(io, d, pkg, root, bootBackup, false);
+    }
+
+    /** Repair preflight only: proves the same boot/marker evidence while admitting one exact needs_recovery bit. */
+    static Map<String, Object> evidenceForJournalRecovery(Mu300Internal.Io io, Device d, Pkg pkg,
+                                                          Mu300Gpt.Part root, byte[] bootBackup) throws IOException {
+        return evidenceInternal(io, d, pkg, root, bootBackup, true);
+    }
+
+    private static Map<String, Object> evidenceInternal(Mu300Internal.Io io, Device d, Pkg pkg,
+                                                         Mu300Gpt.Part root, byte[] bootBackup,
+                                                         boolean journalRecoveryCandidate) throws IOException {
         String disk = d.partitionNode();
         String node = partNode(disk, root.n);
         long capacity = bytes512(sectorsBetween(root.start, root.end));
@@ -432,7 +444,9 @@ final class Uninstall {
             if (raw.length < from + length) throw new IOException("Incomplete OpenWrt partition read");
             return Arrays.copyOfRange(raw, from, from + length);
         };
-        try { return InstallEvidence.inspect(pkg.family, disk, d.other, size, header, tail, pages, reader, capacity); }
+        try { return journalRecoveryCandidate
+                    ? InstallEvidence.inspectJournalRecoveryCandidate(pkg.family, disk, d.other, size, header, tail, pages, reader, capacity)
+                    : InstallEvidence.inspect(pkg.family, disk, d.other, size, header, tail, pages, reader, capacity); }
         catch (InstallEvidence.Failed e) { throw new Refused(e.getMessage()); }
     }
 

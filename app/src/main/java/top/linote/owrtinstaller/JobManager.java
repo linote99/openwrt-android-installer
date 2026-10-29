@@ -416,6 +416,8 @@ final class JobManager {
                 } catch (Exception e) { /* unreadable record: the check step reports it */ }
             }
         }
+        String recovery = Mu300Ext4Recovery.pendingDescription(backupBase(Mu300Ext4Recovery.ROOT_NAME));
+        if (recovery != null) return recovery;
         return null;
     }
     /** Dirs of unfinished resume / uninstall records (never deleted by the local cleanup). */
@@ -442,6 +444,7 @@ final class JobManager {
                 } catch (Exception e) { out.add(d); }
             }
         }
+        out.addAll(Mu300Ext4Recovery.protectedDirs(backupBase(Mu300Ext4Recovery.ROOT_NAME)));
         return out;
     }
     File backupBase(String name) {
@@ -510,6 +513,8 @@ final class JobManager {
         unResume = null;
         unResetOk = false;
         unSummary = null;
+        ext4RecoveryPlan = null;
+        ext4RecoveryMessage = null;
     }
 
     void setMethod(Method m) {
@@ -1335,8 +1340,11 @@ final class JobManager {
     boolean unResetOk;                  // user ticked the factory-reset box on the confirm page
     String unSummary;                   // plan text for the confirm page
     UninstallRun.Outcome unOutcome;
+    Mu300Ext4Recovery.Candidate ext4RecoveryPlan;
+    String ext4RecoveryMessage;
     private String unProfile;
     File uninstallRoot() { return backupBase("uninstall"); }
+    File ext4RecoveryRoot() { return backupBase(Mu300Ext4Recovery.ROOT_NAME); }
     boolean uninstallPending() { return UninstallRun.pending(uninstallRoot()) != null; }
     boolean uninstallWipe() { return method == Method.UNINSTALL && unResume == null && unPrep != null && unPrep.wipe; }
     void setUninstallReset(boolean v) { unResetOk = v; changed(); }
@@ -1422,8 +1430,40 @@ final class JobManager {
         lastLine = "只读检查：分区表、启动镜像、安装证据与 Android data";
         changed();
         Uninstall.Device d = Uninstall.probe(io, up.rootName(), unProfile);
-        Uninstall.Prepared p = Uninstall.prepare(io, d, up);
+        Mu300Ext4Recovery.Tx recoveryTx = Mu300Ext4Recovery.findForCid(ext4RecoveryRoot(), d.s.cid);
+        Uninstall.Prepared p;
+        if (recoveryTx != null && ("journal_replay_started".equals(recoveryTx.stage())
+                || "journal_replay_returned".equals(recoveryTx.stage()))) {
+            append("发现上次 ext4 journal 修复中断记录；只执行只读核验，不会重放或重试。");
+            p = Mu300Ext4Recovery.verifyInterrupted(io, ext4RecoveryRoot(), recoveryTx, d, up);
+            ext4RecoveryMessage = "检测到上次修复中断；只读 e2fsck、分区身份与正常卸载证据均已通过。尚未卸载。";
+        } else {
+            if (recoveryTx != null && "manual_review".equals(recoveryTx.stage()))
+                throw new IOException("此前 ext4 journal 修复未通过，需人工检查；应用不会再次写入或卸载。");
+            try {
+                p = Uninstall.prepare(io, d, up);
+            } catch (IOException e) {
+                String detail = e.getMessage() == null ? "" : e.getMessage();
+                if ("mu300".equals(up.family) && detail.contains("needs_recovery(0x4)")) {
+                    try {
+                        ext4RecoveryPlan = Mu300Ext4Recovery.prepareCandidate(io, d, up);
+                        ext4RecoveryMessage = "只读预检通过：仅允许对已验证的 MU300 mu300root 回放内部 ext4 journal。请查看范围并输入指定确认语；不会自动卸载。";
+                        append("⚠ 已生成受限的 ext4 journal 修复候选；正常卸载检查仍失败，未写入任何分区。");
+                    } catch (IOException candidateFailure) {
+                        ext4RecoveryPlan = null;
+                        ext4RecoveryMessage = "受限修复预检未通过：" + candidateFailure.getMessage();
+                        append("  修复候选拒绝：" + candidateFailure.getMessage());
+                    }
+                }
+                throw e;
+            }
+        }
+        showPreparedUninstall(d, up, p);
+    }
+
+    private void showPreparedUninstall(Uninstall.Device d, Uninstall.Pkg up, Uninstall.Prepared p) {
         unPrep = p;
+        unResume = null;
         StringBuilder b = new StringBuilder();
         b.append("将删除：").append(up.rootName()).append("（/dev/block/").append(d.s.root).append("，").append(Uninstall.human(p.openwrtBytes)).append("，含 OpenWrt 系统与全部设置）");
         b.append("\n内部存储：").append("ufs".equals(d.s.kind) ? "UFS" : "eMMC").append(" · /dev/block/").append(d.s.diskNode)
@@ -1443,6 +1483,34 @@ final class JobManager {
         String s = a == null ? "?" : String.valueOf(a);
         return "reset".equals(s) ? "格式化 userdata（恢复出厂）" : "gap".equals(s) ? "释放为未分配空间" : "保留 Android 数据（" + s + "）";
     }
+
+    void runExt4Recovery() {
+        if (busy != null) { append("正在执行：" + busy + "，请稍候"); return; }
+        final Mu300Ext4Recovery.Candidate approved = ext4RecoveryPlan;
+        if (approved == null) { append("没有有效的 ext4 修复候选；请先重新做只读检查"); return; }
+        if (method != Method.UNINSTALL || mode == Mode.LOCAL) { append(UNINSTALL_LOCAL_NO); return; }
+        ext4RecoveryPlan = null; // A failed or ambiguous run must be re-preflighted, never retried from a stale approval.
+        ext4RecoveryMessage = "正在执行受限 journal 回放；不会自动卸载。";
+        changed();
+        submit("MU300 ext4 journal 修复与复核", true, () -> {
+            try {
+                if (!targetReady()) throw new IOException(notReady(true));
+                String why = problemFor(pkg, target());
+                if (why != null) throw new IOException(why + "；设备状态已变化，未修复");
+                Mu300Internal.Io io = muIo();
+                Uninstall.Pkg up = uninstallPkg(io);
+                Uninstall.Prepared plan = Mu300Ext4Recovery.repairAndRecheck(io, ext4RecoveryRoot(), approved, up, unProfile);
+                ext4RecoveryMessage = "ext4 journal 回放后，超级块、完整只读 e2fsck、MU300 安装证据和正常卸载计划均已复核通过。尚未卸载；请另行完成既有卸载确认。";
+                showPreparedUninstall(plan.device, up, plan);
+                append("✓ 受限修复与正常卸载只读复核完成；未开始卸载。");
+            } catch (IOException | RuntimeException e) {
+                ext4RecoveryMessage = "修复未完成或结果需要只读核验：" + (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+                changed();
+                throw e;
+            }
+        });
+    }
+
     private void installUninstall() throws IOException {
         if (mode == Mode.LOCAL) throw new IOException(UNINSTALL_LOCAL_NO);
         String block = installBlocker();

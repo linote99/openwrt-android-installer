@@ -36,12 +36,17 @@ final class InstallEvidence {
         final Map<String, byte[]> cache = new HashMap<>();
         byte[] sb; long bs, blocks, inodes, perGroup; int isz, desc; long incompat;
 
-        Ext4(Reader raw, long capacity) throws IOException {
+        Ext4(Reader raw, long capacity) throws IOException { this(raw, capacity, false); }
+
+        /** Only the separate MU300 journal-recovery preflight may inspect this exact dirty layout. */
+        Ext4(Reader raw, long capacity, boolean journalRecoveryCandidate) throws IOException {
             this.raw = raw; this.capacity = capacity;
             sb = rd(1024, 1024);
             if (sb[56] != 'S' || (sb[57] & 0xff) != 0xef) throw new IllegalArgumentException("OpenWrt partition is not ext4 / OpenWrt 分区不是 ext4");
             long log = u32(sb, 24); incompat = u32(sb, 96); int state = u16(sb, 58);
-            if (log > 2 || (incompat & ~0x22C2L) != 0 || state != 1)
+            boolean exactRecoveryCandidate = journalRecoveryCandidate && incompat == 0x46L && state == 1
+                    && log == 2 && (u32(sb, 92) & 0x4L) != 0 && u32(sb, 0x194) == 0;
+            if (log > 2 || ((incompat & ~0x22C2L) != 0 && !exactRecoveryCandidate) || state != 1)
                 throw new IllegalArgumentException("OpenWrt filesystem is unclean or unsupported; boot and shut it down cleanly first / OpenWrt 文件系统未正常卸载或布局不受支持，请先启动 OpenWrt 并正常切回 Android"
                         + "\n" + diagnose(sb));
             bs = 1024L << log;
@@ -209,6 +214,19 @@ final class InstallEvidence {
      */
     static LinkedHashMap<String, Object> inspect(String family, String disk, String otherSlot, long bootSize, byte[] header, byte[] tail,
                                                  byte[] ramdiskPages, Reader part, long capacity) throws Failed {
+        return inspectInternal(family, disk, otherSlot, bootSize, header, tail, ramdiskPages, part, capacity, false);
+    }
+
+    /** Full install-marker proof for the repair preflight; the normal uninstall path never calls this mode. */
+    static LinkedHashMap<String, Object> inspectJournalRecoveryCandidate(String family, String disk, String otherSlot,
+                                                                           long bootSize, byte[] header, byte[] tail,
+                                                                           byte[] ramdiskPages, Reader part, long capacity) throws Failed {
+        return inspectInternal(family, disk, otherSlot, bootSize, header, tail, ramdiskPages, part, capacity, true);
+    }
+
+    private static LinkedHashMap<String, Object> inspectInternal(String family, String disk, String otherSlot, long bootSize, byte[] header, byte[] tail,
+                                                                  byte[] ramdiskPages, Reader part, long capacity,
+                                                                  boolean journalRecoveryCandidate) throws Failed {
         try {
             UninstallBoot.LinuxBoot lb = UninstallBoot.inspectLinuxBoot(header, tail, bootSize, family, otherSlot);
             if (ramdiskPages == null || ramdiskPages.length < lb.ramdisk) throw new IllegalArgumentException("Incomplete installed ramdisk / 已安装 ramdisk 不完整");
@@ -236,7 +254,8 @@ final class InstallEvidence {
                 paths.put(".mu300/boot-os", null);
                 paths.put("openwrt/etc/openwrt_release", null);
             }
-            Ext4 fs = new Ext4(part, capacity);
+            Ext4 fs = new Ext4(part, capacity, journalRecoveryCandidate);
+            if (journalRecoveryCandidate) rejectDataJournalMode(fs.sb, header, all, fs);
             TreeMap<String, String> markers = new TreeMap<>();
             for (Map.Entry<String, String> p : paths.entrySet()) {
                 String value = new String(fs.file(p.getKey()), StandardCharsets.UTF_8).trim();
@@ -267,6 +286,48 @@ final class InstallEvidence {
         outer:
         for (int i = 0; i + n.length <= hay.length; i++) {
             for (int k = 0; k < n.length; k++) if (hay[i + k] != n[k]) continue outer;
+            return true;
+        }
+        return false;
+    }
+
+    /** Journal replay may write file data in data=journal mode, so admit metadata-only modes only. */
+    private static void rejectDataJournalMode(byte[] sb, byte[] header, Map<String, UninstallBoot.Entry> ramdisk, Ext4 fs) throws IOException {
+        long mode = u32(sb, 0x100) & 0x60L; // EXT4_DEFM_JMODE; 0x20 means data=journal.
+        String mountOpts = ascii(sb, 0x200, 64).toLowerCase(java.util.Locale.ROOT);
+        int cmdEnd = firstNul(header, 44, Math.min(1536, header.length - 44));
+        String cmdline = ascii(header, 44, Math.max(0, cmdEnd - 44)).toLowerCase(java.util.Locale.ROOT);
+        if (mode == 0x20L || mountOpts.contains("data=journal") || cmdline.contains("data=journal"))
+            throw new IllegalArgumentException("检测到 ext4 data=journal 配置；journal replay 可能回写文件数据，拒绝修复");
+        byte[] fstab = fs.file("etc/config/fstab");
+        if (containsAsciiIgnoreCase(fstab, "data=journal"))
+            throw new IllegalArgumentException("OpenWrt /etc/config/fstab 含 data=journal；拒绝修复");
+        if (ramdisk != null) for (UninstallBoot.Entry e : ramdisk.values()) {
+            if (e != null && e.regular() && containsAsciiIgnoreCase(e.data, "data=journal"))
+                throw new IllegalArgumentException("启动 ramdisk 含 data=journal 配置；拒绝修复");
+        }
+    }
+
+    private static int firstNul(byte[] b, int off, int len) {
+        int end = off + len;
+        for (int i = off; i < end; i++) if (b[i] == 0) return i;
+        return end;
+    }
+
+    private static String ascii(byte[] b, int off, int len) {
+        if (b == null || off < 0 || len <= 0 || off > b.length - len) return "";
+        return new String(b, off, len, StandardCharsets.ISO_8859_1);
+    }
+
+    private static boolean containsAsciiIgnoreCase(byte[] hay, String needle) {
+        byte[] n = needle.toLowerCase(java.util.Locale.ROOT).getBytes(StandardCharsets.US_ASCII);
+        outer:
+        for (int i = 0; hay != null && i + n.length <= hay.length; i++) {
+            for (int k = 0; k < n.length; k++) {
+                int c = hay[i + k] & 0xff;
+                if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                if (c != (n[k] & 0xff)) continue outer;
+            }
             return true;
         }
         return false;

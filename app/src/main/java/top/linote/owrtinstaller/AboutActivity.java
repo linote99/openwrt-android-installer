@@ -175,6 +175,11 @@ public final class AboutActivity extends Activity {
                 + "UFS 安装与重装流程保持不变，原有 eMMC 内置安装和 TF 卡流程也保留。");
         para("UFS 卸载只接受已识别的 MU300 UFS 身份、512 或 4096 字节 GPT 逻辑块，以及边界完整且唯一的 mu300root/userdata 布局和安装证据。"
                 + "无法唯一确认设备、分区归属、GPT 范围、扇区单位或布局时会拒绝；同意恢复出厂也不能绕过这些拒绝。");
+        para("若卸载检查只因 mu300root 的 ext4 needs_recovery 停止，符合严格条件时可选择“仅回放 mu300root ext4 journal”："
+                + "只支持已核验的 MU300 UFS sda75、state=0x0001、incompat=0x00000046、4096-byte block、error_count=0 和内部 journal；"
+                + "目标必须未挂载，且不能配置 data=journal。输入“修复 mu300root journal”后，只执行 e2fsck -p -E journal_only，"
+                + "再做完整只读检查并重新核对安装证据。其它状态、身份变化、修复返回异常或只读复核失败时停止，不会用 -y、格式化、扩容、重试或自动卸载；"
+                + "修复成功后仍要单独走正常卸载确认。工具暂存于 RAM；只写目标 ext4 内部 journal/元数据，不写 GPT、boot、misc、userdata 或其它分区。");
         para("UFS 卸载目前只通过离线静态检查、固定哈希校验、512/4096-byte 合成 GPT 测试和模拟流程验证；"
                 + "没有在真实 UFS 设备上验证安装或卸载，不能据此认定实际设备操作成功。开始前请先备份重要数据。");
 

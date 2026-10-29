@@ -33,7 +33,7 @@ t "stage-one done page shows the steps" 'grep -q "if (jm.stage1 \&\& jm.muOutcom
 t "method page: pending notice + RESUME impact show the steps" '[ "$(echo "$page" | grep -c "Mu300Internal.resumePrep()")" -ge 1 ] && grep -A1 "也不动重新设置后的 Android 数据" "$M" | grep -q "Mu300Internal.resumePrep()"'
 t "device page: before connecting and on no-root" '[ "$(grep -c "Mu300Internal.resumePrep()" "$M")" -ge 5 ] && grep -q "继续格式化后的安装：先准备目标设备" "$M"'
 t "connection without root logs the steps while a record is pending" 'sed -n "/private void waitReady/,/^    }/p" "$JM" | grep -A2 "if (pendingRecord() != null)" | grep -q "TargetProbe.checklist(r.state"'
-t "not-connected errors point at the steps" '[ "$(grep -c "throw new IOException(notReady(" "$JM")" = 4 ]'
+t "not-connected errors point at the steps" '[ "$(grep -c "throw new IOException(notReady(" "$JM")" = 5 ]'
 t "stage1 set for both families" 'grep -q "stage1 = fmt;" "$JM" && grep -q "stage1 = m == Method.PART;" "$JM"'
 CL=$J/CleanupActivity.java
 t "uninstall is an advanced method" 'grep -q "m == Method.UNINSTALL; }" "$JM"'
@@ -63,5 +63,10 @@ t "home entry and page header are named 设置" 'grep -q "ui.text(\"设置\", 13
 t "使用说明 and MU300 UFS 适配 remain separate accordion sections" 'grep -q "section(\"使用说明\")" "$A" && grep -q "section(\"MU300 UFS 适配\")" "$A"'
 t "settings sections start collapsed and toggle on tap" 'grep -q "details.setVisibility(View.GONE)" "$A" && grep -q "header.setOnClickListener" "$A" && grep -q "details.setVisibility(expanded ? View.VISIBLE : View.GONE)" "$A"'
 t "step-4 package/device gate runs before uninstall or storage preflight" 'awk "/void runCheck\\(\\)/{p=1} p && /readOnlyCheckBlocker\\(pkg, target\\(\\)\\)/{g=NR} p && /if \\(m == Method.UNINSTALL\\)/{u=NR} END{exit !(g && u && g<u)}" "$JM"'
+t "ext4 repair button is shown only for a current strict candidate" 'grep -q "if (jm.ext4RecoveryPlan != null)" "$M" && grep -q "仅回放 mu300root ext4 journal" "$M" && grep -q "prepareCandidate(io, d, up)" "$JM"'
+t "ext4 repair requires the exact typed phrase" 'grep -q "修复 mu300root journal" "$M" && grep -q "word.equals(input.getText().toString().trim())" "$M"'
+t "ext4 repair is journal-only, rejects broad auto-fix and does not auto-uninstall" 'grep -q "e2fsck -p -E journal_only" "$M" && grep -q "不会格式化、扩容、使用 -y，也不会自动卸载" "$M"'
+t "repair success returns to the ordinary uninstall confirmation path" 'grep -q "repairAndRecheck(io" "$JM" && grep -q "showPreparedUninstall(plan.device, up, plan)" "$JM" && grep -q "尚未卸载；请另行完成既有卸载确认" "$JM"'
+t "repair rejects mounted targets and pins the only mutation node" 'grep -q "mu300root 仍被挂载或映射，拒绝修复" app/src/main/java/top/linote/owrtinstaller/Mu300Ext4Recovery.java && grep -q "static final String DEVICE = \"/dev/block/sda75\"" app/src/main/java/top/linote/owrtinstaller/Mu300Ext4Recovery.java'
 echo "ui check: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

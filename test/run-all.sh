@@ -31,6 +31,7 @@ else
 fi
 
 for z in "$Z"/*.zip; do
+  [ -f "$z" ] || continue
   n=$(basename "$z")
   rm -rf "$B/work"; mkdir -p "$B/work"
   java -cp "$B/cls" DesktopInspect "$z" "$B/work" > "$B/inspect.txt" 2>&1
@@ -101,17 +102,29 @@ if [ -n "$AJ" ] && [ -f build/gen/top/linote/owrtinstaller/BuildInfo.java ]; the
   rm -rf "$B/unt" "$B/unt-work"; mkdir -p "$B/unt"
   javac -encoding UTF-8 -nowarn -cp "$AJ" -sourcepath app/src/main/java:build/gen -d "$B/unt" test/UninstallTest.java 2>&1 | grep -v '^Note'
   E5Z=$(ls "$Z"/e5-openwrt-*.zip 2>/dev/null | head -1); MUZ=$(ls "$Z"/mu300-openwrt-*.zip 2>/dev/null | head -1)
-  timeout 600 java -Xmx2g -cp "$B/unt:$AJ" top.linote.owrtinstaller.UninstallTest "$B/unt-work" "$E5Z" "$MUZ" > "$B/uninstall.txt" 2>&1
-  note "UninstallTest rc=$? $(tail -1 "$B/uninstall.txt")"
+  if [ -n "$E5Z" ] && [ -n "$MUZ" ]; then
+    timeout 600 java -Xmx2g -cp "$B/unt:$AJ" top.linote.owrtinstaller.UninstallTest "$B/unt-work" "$E5Z" "$MUZ" > "$B/uninstall.txt" 2>&1
+    note "UninstallTest rc=$? $(tail -1 "$B/uninstall.txt")"
+  else
+    note "UninstallTest skipped: provide both E5 and MU300 installer ZIPs"
+  fi
+  rm -rf "$B/recovery" "$B/recovery-work"; mkdir -p "$B/recovery"
+  javac -encoding UTF-8 -nowarn -cp "$AJ" -sourcepath app/src/main/java:build/gen -d "$B/recovery" test/Mu300Ext4RecoveryTest.java 2>&1 | grep -v '^Note'
+  java -cp "$B/recovery:$AJ" top.linote.owrtinstaller.Mu300Ext4RecoveryTest "$B/recovery-work" > "$B/ext4-recovery.txt" 2>&1
+  note "Mu300Ext4RecoveryTest rc=$? $(tail -1 "$B/ext4-recovery.txt")"
 else
-  note "UninstallTest rc=1 FAIL: run ./build.sh first (needs build/gen and android.jar)"
+  note "UninstallTest/Mu300Ext4RecoveryTest rc=1 FAIL: run ./build.sh first (needs build/gen and android.jar)"
 fi
 # command-level uninstall lifecycle against a mock target (both families)
 if [ -n "$AJ" ] && [ -f build/gen/top/linote/owrtinstaller/BuildInfo.java ]; then
   rm -rf "$B/unf" "$B/unf-work"; mkdir -p "$B/unf"
   javac -encoding UTF-8 -nowarn -cp "$AJ" -sourcepath app/src/main/java:build/gen -d "$B/unf" test/UninstallFlowTest.java 2>&1 | grep -v '^Note'
-  timeout 600 java -Xmx2g -cp "$B/unf:$AJ" top.linote.owrtinstaller.UninstallFlowTest "$B/unf-work" "$E5Z" "$MUZ" > "$B/uninstallflow.txt" 2>&1
-  note "UninstallFlowTest rc=$? $(tail -1 "$B/uninstallflow.txt")"
+  if [ -n "$E5Z" ] && [ -n "$MUZ" ]; then
+    timeout 600 java -Xmx2g -cp "$B/unf:$AJ" top.linote.owrtinstaller.UninstallFlowTest "$B/unf-work" "$E5Z" "$MUZ" > "$B/uninstallflow.txt" 2>&1
+    note "UninstallFlowTest rc=$? $(tail -1 "$B/uninstallflow.txt")"
+  else
+    note "UninstallFlowTest skipped: provide both E5 and MU300 installer ZIPs"
+  fi
 else
   note "UninstallFlowTest rc=1 FAIL: run ./build.sh first (needs build/gen and android.jar)"
 fi

@@ -844,6 +844,14 @@ public class MainActivity extends Activity implements JobManager.Listener {
             if (!match) card.addView(ui.text(why + "，检查会失败。", 13, ui.danger, true), ui.mw(6));
             if (jm.checkFailed()) {
                 card.addView(ui.notice("!", "检查未通过", jm.lastFail + checkHint(), 1), ui.mw(8));
+                if (jm.ext4RecoveryMessage != null)
+                    card.addView(ui.notice("i", "ext4 修复状态", jm.ext4RecoveryMessage, 0), ui.mw(8));
+                if (jm.ext4RecoveryPlan != null) {
+                    card.addView(ui.notice("!", "受限修复范围", jm.ext4RecoveryPlan.summary(), 1), ui.mw(8));
+                    TextView repair = ui.button("仅回放 mu300root ext4 journal", 1, v -> confirmExt4Recovery());
+                    repair.setEnabled(idle);
+                    card.addView(repair, ui.mw(8));
+                }
                 if (jm.method != JobManager.Method.TF) {
                     TextView alt = ui.button("更换安装方式", 0, v -> go(T_METHOD));
                     alt.setEnabled(idle);
@@ -856,6 +864,8 @@ public class MainActivity extends Activity implements JobManager.Listener {
             add(logCard(220), 12);
             return;
         }
+        if (jm.ext4RecoveryMessage != null)
+            add(ui.notice("✓", "ext4 journal 已复核", jm.ext4RecoveryMessage, 0), 12);
         JobManager.Method m = jm.method;
         String slots = jm.checkSlots == null ? "a,b" : jm.checkSlots;
         String linux = slots.contains(",") ? slots.substring(slots.indexOf(',') + 1) : "b";
@@ -1355,6 +1365,40 @@ public class MainActivity extends Activity implements JobManager.Listener {
             sizeText = null;
             jm.loadPackage(uri);
         }
+    }
+
+    private void confirmExt4Recovery() {
+        Mu300Ext4Recovery.Candidate c = jm.ext4RecoveryPlan;
+        if (c == null || jm.busy != null || jm.method != JobManager.Method.UNINSTALL) {
+            Toast.makeText(this, "修复候选已失效，请重新做只读检查", Toast.LENGTH_LONG).show();
+            return;
+        }
+        final String word = "修复 mu300root journal";
+        String msg = "只读预检已核实以下目标：\n" + c.summary()
+                + "\n\n将执行：e2fsck -p -E journal_only，再独立运行完整只读检查。"
+                + "只有确认日志为内部 journal、且没有 data=journal 配置时才允许继续。"
+                + "工具暂存于 RAM；写入范围仅为该 mu300root ext4 文件系统的 journal/元数据。"
+                + "不会改 GPT、boot、misc、userdata 或其他分区；不会格式化、扩容、使用 -y，也不会自动卸载。"
+                + "若返回码或复核异常，停止且不自动重试。\n\n输入“" + word + "”确认：";
+        final EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        input.setHint(word);
+        AlertDialog dlg = new AlertDialog.Builder(this)
+                .setTitle("确认仅回放 mu300root ext4 journal")
+                .setMessage(msg)
+                .setView(input)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("执行受限修复", (x, w) -> {
+                    if (word.equals(input.getText().toString().trim())) jm.runExt4Recovery();
+                })
+                .create();
+        dlg.setOnShowListener(x -> {
+            final android.widget.Button ok = dlg.getButton(AlertDialog.BUTTON_POSITIVE);
+            ok.setEnabled(false);
+            ok.setTextColor(ui.danger);
+            input.addTextChangedListener(watcher(s -> ok.setEnabled(word.equals(s.trim()))));
+        });
+        dlg.show();
     }
 
     private void confirmInstall() {

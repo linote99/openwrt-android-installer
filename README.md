@@ -1,8 +1,15 @@
-# OpenWrt 安装器（安卓版）v1.6.9
+# OpenWrt 安装器（安卓版）v1.7.0
 
 这是 OpenWrt 一键刷入包的 Android 安装器正式版。它保留原有机型、TF 卡、eMMC 内置安装和 MU300 UFS 安装/重装流程，并为指定 MU300 安装包增加 UFS 卸载与空间回收。APK 会校验完整安装包、读取目标设备存储信息，再调用安装包内对应脚本完成操作。
 
-- APK：`dist/OpenWrt-Installer-Android-1.6.9.apk`（package `top.linote.owrtinstaller`；Android 8.0+，versionCode 21；沿用正式签名证书）
+- APK：`dist/OpenWrt-Installer-Android-1.7.0.apk`（package `top.linote.owrtinstaller`；Android 8.0+，versionCode 22；沿用正式签名证书）
+
+## 1.7.0 正式版
+
+- 新增 MU300 UFS `mu300root` 的受限 ext4 journal 修复：仅当只读检查精确匹配 `sda75`、`state=0x0001`、`incompat=0x00000046`、4096-byte block、`error_count=0`、内部 journal 和受支持的安装证据时才显示入口。其它 ext4 状态、外置 journal、`data=journal`、挂载/映射中或身份/几何不一致均拒绝。
+- 用户必须输入“修复 mu300root journal”确认；只运行 `e2fsck -p -E journal_only`，随后独立运行完整只读 `e2fsck -f -n`、复读超级块并重新走正常卸载检查。任何异常都停止，不使用 `-y`、格式化、扩容或自动重试；通过后仍需完成原有卸载确认，不会自动卸载。
+- 维护工具仅暂存于设备 RAM `/dev` tmpfs；事务阶段原子写入并回读。修复只针对已核实的 `mu300root` ext4 内部 journal/元数据，不改 GPT、boot、misc、userdata 或其它分区。没有原始安装记录时仍要求现有启动镜像与文件标记证据；用户的备份 ZIP 不会自动导入。
+- 保留正式包名、应用显示名、既有正式签名和原有安装/卸载功能。验证仅使用合成数据与本地模拟；未连接或写入真实设备，真实设备兼容性和恢复效果仍待验证。
 
 ## 1.6.9 正式版
 
