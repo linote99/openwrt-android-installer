@@ -1,8 +1,45 @@
-# OpenWrt 安装器（安卓版）v1.7.0
+# OpenWrt 安装器（安卓版）v1.7.6
 
-这是 OpenWrt 一键刷入包的 Android 安装器正式版。它保留原有机型、TF 卡、eMMC 内置安装和 MU300 UFS 安装/重装流程，并为指定 MU300 安装包增加 UFS 卸载与空间回收。APK 会校验完整安装包、读取目标设备存储信息，再调用安装包内对应脚本完成操作。
+本仓库是 v1.7.6 Android APK 的公开源码。此版本保留原有安装、更新、启动与卸载流程，并新增 Changxing60 专用目标机型识别；高级“多分区规划”仍是离线合成预览，设备分区写入入口保持关闭。
 
-- APK：`dist/OpenWrt-Installer-Android-1.7.0.apk`（package `top.linote.owrtinstaller`；Android 8.0+，versionCode 22；沿用正式签名证书）
+- APK：[v1.7.6 Release 附件](https://github.com/linote99/openwrt-android-installer/releases/download/v1.7.6/OpenWrt-Installer-Android-1.7.6.apk)（package `top.linote.owrtinstaller`；Android 8.0+；versionCode 28）。
+- 源码 ZIP：[下载 v1.7.6 源码](https://github.com/linote99/openwrt-android-installer/releases/download/v1.7.6/OpenWrt-Installer-Android-1.7.6-source.zip)；[GitHub Release 页面](https://github.com/linote99/openwrt-android-installer/releases/tag/v1.7.6)。
+- APK SHA-256：`dd1a4c7b6a672efb6091e151c4d2170cc23bf4771118010155180b43f2e8f8ff`；源码 ZIP SHA-256：`204161e4a70643b4671411697622dfb7d6992295d31a5ad6a308cec77aebccb3`。
+
+## 1.7.6 正式发布版（Changxing60 适配；离线验证边界）
+
+- Changxing60 专用包只接受 Android 型号 `ZTE 7552N`、主板 `P720S20` 与匹配的 `changxing60` profile；型号、主板或 profile 不符时在设备预检阶段拒绝。远航 41S 原规则保持不变。
+- 对本次远航 41S、Changxing60 和 MU300 固件 ZIP 做了包内身份、板号、清单哈希、启动镜像和安装资产的离线核验。ZIP 自述不等于实机身份或硬件验证；Changxing60 与远航包未刷机，仅离线检查。
+- MU300 最新包仍走既有 `format=2` 清单验证。只有 APK 固定哈希锁定的桌面/存储工具与该版本相符时，才开放对应内置存储方法；TF 路径与 MU300 设备端脚本校验保持原样。
+- 没有改写 TF、内置分区、userdata 镜像、更新、启动、续装、ADB、卸载、备份或数据保护流程；没有连接、写入或修改真实设备。相关适配经过离线测试，不代表已在真实设备上验证。
+
+## 1.7.5 基础版本（安全导入原型；仅离线模拟）
+
+- 高级选项新增“多分区规划”，可编辑多个新分区用途/标签/大小，并预览每项的起止扇区、1 MiB 对齐、userdata 调整、GPT 主备表/CRC 变化及受影响数据。预览来自虚构的内存合成布局，不代表目标设备。
+- 规划页与“清理本机占用”页可导入安全格式的分区备份 ZIP。支持本应用导出的 `info.json` + `SHA256SUMS` ZIP，以及兼容的旧式 `mu300-backup/<目录>/` 内部清单格式；拒绝不规范/冲突路径、重名、超限压缩、缺失/重复成员、清单哈希错误、内部身份/续装记录不一致及无效 GPT CRC/范围/几何。多份备份时由用户选一份 GPT 主/备快照，原子保存到应用私有目录，作为“历史基线”展示；不提取/保存身份 JSON、镜像或其他附件。
+- 续装记录 JSON 仅接受当前已知 E5 v2 与 MU300 transaction v1 schema；逐字段校验版本、必需/可选字段、重复键及哈希格式，脱敏显示。旧版、缺字段、未知字段、命令/路径型字段或损坏内容拒绝。包内脚本、命令、路径都不会执行/跟随，记录不会进入续装队列。
+- 导入的历史基线与当前布局严格区分；当前规划仍是合成预览，没有真实设备只读快照。历史重复 GUID/结构异常仅保留告警，不能变成当前设备证据、身份验证或恢复授权。源码归档不包含用户的真实备份 ZIP 或设备身份数据。
+- 所有既有分区都保持原位；userdata 规划保留原起始边界、类型 GUID、唯一 GUID、标签和属性。格式化 userdata 会清空应用数据和加密元数据，只有输入与当前计划指纹绑定的确认语才会在模拟结果中标记为已确认。
+- 现有代码与资料不能证明目标设备格式化 userdata 后 Android 的 recovery、metadata encryption、vold、fstab/init、A/B/AVB 启动链能正常完成，因此设备写入资格硬性关闭；不声称改分区后一定能启动 Android。
+- 保留 ext4 journal 安全检查所需的 ext4-root-relative `etc/config/fstab` 路径；缺少该证据时继续 fail closed。离线模拟覆盖哈希/几何/身份错误、路径穿越、恶意字段不执行及失败不开放写入口。
+
+## 签名与安装提醒
+
+- v1.7.6 APK 使用与 v1.7.5 相同的新签名，证书 SHA-256 指纹为 `84895da2db82cae13497c93d92697841df13f57bb3924add0bc69ab9e3bf4f31`。它与旧正式签名版不同，不能直接覆盖安装；请先备份需要保留的数据，再卸载旧版后安装 v1.7.6，卸载可能删除本应用保存的数据。
+- 签名私钥与密码配置不在本仓库或源码 ZIP 中。请勿把签名材料放入源码包、APK、聊天或公开仓库。
+
+## 1.7.3 本地候选版（测试）
+
+- 不再把 OpenWrt 根分区写死为 `sda75`；只接受当前已校验 GPT 中唯一 `mu300root` 标签所对应的内核节点，并核对它与 userdata、分区 GUID、GPT 几何、ext4 UUID/超级块和设备身份一致。`sda76` 仅在真实 GPT/内核探测同时证明其为唯一 mu300root 时才可能通过；不会因日志单独放宽到该分区号。
+- 写入前脚本再次核对 GPT 主备快照、该候选节点超级块哈希、设备几何、启动身份以及未挂载/无 holders；恢复仍限于手动确认后的 `e2fsck -p -E journal_only`，不会自动卸载、格式化、扩容或重试。
+- 继续保留拒绝未知/重复 GPT 标签、不同磁盘、节点或几何不符、错误 ext4 状态和身份/UUID 不一致的 fail-closed 行为；不输出完整 CID。此次未连接或写入真实设备，不能据此宣称真机修复已验证。
+- 仅本地构建和离线/模拟验证，未连接或写入真实设备，未发布到 GitHub 或博客。
+
+## 1.7.1 本地修复版（测试）
+
+- 修正 MU300 UFS ext4 journal 恢复预检对 U30 Air profile 的误拒；现在复用 Android 机型识别并核对 profile 一致性，未知机型仍拒绝。
+- 保留“先只读检测、用户手动点击并输入确认语后才执行受限 journal-only 修复”的流程；移除设置页中用户指定的 MU300 UFS 安装包版本提示段落。
+- 仅本地构建和离线/模拟测试，未连接或写入真实设备，未发布到 GitHub 或博客；用于用户测试前仍需在真实设备上验证。
 
 ## 1.7.0 正式版
 
@@ -150,11 +187,14 @@ MU300 现在除了 TF 卡，还可以装到内置存储，三种方式都按原�
 | VIPME M8 | VIPME M8 | orange | TF / 缩容分区 / 镜像 |
 | angelcare K1 | angelcare K1，且主板 `ro.product.device` = ums9157_2h10 | orange | TF / 缩容分区 / 镜像 |
 | 远航41S | ZTE 7546N，且主板 P720S11 | 不要求 | TF / 缩容分区 / 镜像 |
+| Changxing60（v1.7.6 起） | ZTE 7552N，且主板 P720S20 | 不要求 | TF / 缩容分区 / 镜像 |
 | MU300（内核 7.2.8 和 6.18.54 两个包） | ZTE F50 / MU300 / U30 Air，或 V50 / MU3351（须为 UMS9620 平台） | 不要求 | TF / 独立内置分区 / 重装已有分区 / 镜像（1.4.0 起） |
 
-- 前 6 种和 E5 结构相同，设备端脚本逐字节一致，沿用原有流程；槽位方向由脚本在运行时按 `ro.boot.slot_suffix` 决定。
+- Changxing60 自 v1.7.6 起使用专用 `changxing60` profile，并精确校验型号与主板；其他机型仍按各自安装包规则处理。
 - APK 内置了上表的机型规则：安装包声明的机型不在表里会拒绝；目标设备与安装包不匹配时，「开始安装」不可用。
 - MU300 安装包结构完全不同（`payload/`、`desktop/manifest.json`）。APK 会按 `desktop/manifest.json` 校验全部 451 个文件，只提取 Magisk 安装需要的 24 个文件（约 108 MiB），再按安装包 `payload/customize.sh` 的方式生成同样的部署参数，调用包内 `payload/tf-install-worker.sh`：只读检查时只运行它的 `--preflight`，安装时运行它完整的分阶段流程（预检 → 提取本机固件 → 写入 TF → 写入并回读另一槽 boot → 切换启动槽）。1.3.0 时 MU300 只提供 TF 卡方式（1.4.0 起支持内置存储，见上文），管理地址是 `http://192.168.77.1`，日志在 `/data/local/tmp/mu300-tf-install`。
+
+## 1.2.0：每一步单独一个 tab 页
 
 ## 1.2.0：每一步单独一个 tab 页
 
@@ -178,8 +218,8 @@ MU300 现在除了 TF 卡，还可以装到内置存储，三种方式都按原�
 
 每个安装包只适用于上表中对应的机型。安装脚本会检查**目标设备**的型号和主板，不一致就拒绝；APK 在机型不匹配时也不会让你点「开始」。
 
-- 用畅行60 当「遥控器」通过 USB 或局域网给这些设备刷机：可以，这正是「其他设备」模式的用途。
-- 把这些包刷进畅行60 本身：**不可以，也不要强行这么做**（畅行60 不在任何一个包的支持列表里）。
+- 用畅行60当「遥控器」通过 USB 或局域网给其他受支持设备刷机：可以，这正是「其他设备」模式的用途。
+- v1.7.6 起，畅行60也支持作为目标设备安装专用 `changxing60` 包；只接受型号 `ZTE 7552N`、主板 `P720S20`。不要把其他机型的包刷进畅行60，错配时 APK 会拒绝。
 
 ## 选择目标设备
 
@@ -217,7 +257,7 @@ MU300 现在除了 TF 卡，还可以装到内置存储，三种方式都按原�
 
 三种方式都会做的事：提取本机的 Wi-Fi、蓝牙、音频固件，写入 OpenWrt；启动链有差异时，先备份两个槽再同步；写入另一个槽 `boot_<另一槽>` 并回读校验；设置下次从 OpenWrt 槽试启动，连续失败两次会自动回到 Android。当前的 Android 槽和 NV 都不会写入。
 
-**不支持（请用电脑端安装器）**：在线更新和卸载并归还空间。重装已有内置分区、userdata 镜像在“高级功能”里（连点标题 5 下开启）。
+**更新与卸载范围**：本 Android 安装器不提供 OpenWrt 固件在线 OTA 更新；需要固件在线更新时请使用电脑端安装器或固件自身支持的更新流程。本应用 APK 的版本更新需从“获取更新”中的来源下载 APK 并手动安装。卸载内置 OpenWrt 并归还空间由本应用高级功能支持，但必须通过型号、分区、启动链和安装证据检查；某些布局可能需要额外确认清空 Android 数据。重装已有内置分区、userdata 镜像在“高级功能”里（连点标题 5 下开启）。
 
 ## 使用步骤
 
@@ -240,10 +280,10 @@ E5 系列的安装器日志和备份在 `/data/adb/e5-tf-install/`，启动链�
 ## 构建
 
 ```bash
-./build.sh   # 需要 JDK 17+，以及 Android SDK（platforms;android-34、build-tools;34.0.0）
+OWRT_SIGNING_DIR="$HOME/.local/share/openwrt-installer-signing" bash ./build.sh   # 需要 JDK 17+ 和 Android SDK 34 / Build Tools 34.0.0
 ```
 
-不使用 Gradle，构建流程是 aapt2 → javac → d8 → zipalign → apksigner。签名密钥在 `signing/` 目录下，是本项目第一次构建时新生成的，没有用任何其他项目的密钥。这个目录不在源码包里，请自行妥善保管：以后发布更新必须用同一把密钥。
+不使用 Gradle，构建流程是 aapt2 → javac → d8 → zipalign → apksigner。首次构建会在固定的本机签名目录生成新密钥；之后脚本复用已有 keystore，不会每次构建都换密钥。密码仅写在同目录、权限为 0600 的 `keystore.properties` 中；若该配置仍在但私钥文件缺失，脚本会停止而不静默生成替代密钥。此密钥不同于历史正式签名，无法覆盖旧签名版；源码归档会排除签名目录、APK 和构建输出。
 
 ## 测试（都在电脑上运行，不执行安装包里的任何东西）
 

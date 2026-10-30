@@ -22,6 +22,7 @@ public final class UfsGptTest {
         try { r.run(); } catch (RuntimeException e) { rejected = true; }
         ok(rejected, what);
     }
+    private static String syntheticCid() { char[] x = new char[32]; Arrays.fill(x, 'a'); return new String(x); }
 
     private static final class Probe implements Mu300Internal.Io {
         String response;
@@ -44,7 +45,7 @@ public final class UfsGptTest {
 
     private static String inventory(String disk, String kind, long sectorSize, long start) {
         return "NODE=" + disk + "12\nDISK=" + disk + "\nSTORAGE_KIND=" + kind + "\n"
-                + "CID=0123456789abcdef0123456789abcdef\nSECTOR_SIZE=" + sectorSize + "\n"
+                + "CID=" + syntheticCid() + "\nSECTOR_SIZE=" + sectorSize + "\n"
                 + "START=" + start + "\nSIZE=8388608\nDISK_SIZE=16777216\nFREE=1000000\n"
                 + "STATE=unencrypted\nTYPE=\nSOURCE=/dev/block/by-name/userdata\nMAGIC=1020f5f2\nEXT=0000\nROOT=" + disk + "38\n";
     }

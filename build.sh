@@ -13,9 +13,9 @@ VERSION_CODE=$(sed -n 's/^VERSION_CODE=//p' version.properties)
     || { echo "bad version.properties: VERSION_NAME=$VERSION_NAME VERSION_CODE=$VERSION_CODE" >&2; exit 1; }
 OUT=build
 APP=app/src/main
-# Set OWRT_SIGNING_DIR to the existing official signing directory to produce an in-place update.
-# Signing files are never copied into the source archive or delivery bundle.
-SIGN=${OWRT_SIGNING_DIR:-signing}
+# This persistent local key is distinct from the historical official signing key.
+# Keep this directory across source versions; signing files are never packaged or delivered.
+SIGN=${OWRT_SIGNING_DIR:-$HOME/.local/share/openwrt-installer-signing}
 
 for t in "$BT/aapt2" "$BT/d8" "$BT/zipalign" "$BT/apksigner" "$JAR"; do
     [ -e "$t" ] || { echo "missing $t" >&2; exit 1; }
@@ -23,20 +23,29 @@ done
 
 rm -rf "$OUT"
 mkdir -p "$OUT/gen" "$OUT/classes" "$OUT/dex" dist
-
-# Use the configured key when available. A generated fallback key cannot update an installation
-# signed by another key; the user should supply the existing official signing directory for that.
+# Use this same local key for subsequent builds. It cannot update an installation signed by another key.
+if [ -e "$SIGN/keystore.properties" ] && [ ! -f "$SIGN/release.keystore" ]; then
+    echo "keystore configuration exists but release.keystore is missing in $SIGN; refusing to regenerate" >&2
+    exit 1
+fi
+OLD_UMASK=$(umask)
+umask 077
+mkdir -p "$SIGN"
+chmod 700 "$SIGN"
 if [ ! -f "$SIGN/release.keystore" ]; then
-    mkdir -p "$SIGN"
-    chmod 700 "$SIGN"
     pass=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)
     keytool -genkeypair -keystore "$SIGN/release.keystore" -storetype PKCS12 -alias owrtinstaller \
         -keyalg RSA -keysize 3072 -validity 10000 -storepass "$pass" -keypass "$pass" \
         -dname "CN=OpenWrt Android Installer, O=linote, C=CN" >/dev/null
     printf 'storePassword=%s\nkeyAlias=owrtinstaller\n' "$pass" > "$SIGN/keystore.properties"
-    chmod 600 "$SIGN/release.keystore" "$SIGN/keystore.properties"
-    echo "generated a build-local signing key in $SIGN/ (this key will not update another signed installation)"
+    unset pass
+    echo "generated a new local signing key in $SIGN; preserve it for future updates (it cannot update differently-signed installations)"
 fi
+umask "$OLD_UMASK"
+chmod 700 "$SIGN"
+[ -f "$SIGN/release.keystore" ] && [ -f "$SIGN/keystore.properties" ] \
+    || { echo "incomplete signing directory: $SIGN" >&2; exit 1; }
+chmod 600 "$SIGN/release.keystore" "$SIGN/keystore.properties"
 STOREPASS=$(sed -n 's/^storePassword=//p' "$SIGN/keystore.properties")
 KEY_ALIAS=$(sed -n 's/^keyAlias=//p' "$SIGN/keystore.properties")
 [ -n "$STOREPASS" ] && [ -n "$KEY_ALIAS" ] || { echo "missing signing configuration in $SIGN" >&2; exit 1; }
@@ -69,8 +78,10 @@ cp "$OUT/base.apk" "$OUT/unsigned.apk"
 (cd "$OUT/dex" && zip -q -X ../unsigned.apk classes.dex)
 "$BT/zipalign" -p -f 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
 NAME=dist/OpenWrt-Installer-Android-$VERSION_NAME.apk
+export OWRT_APKSIGNER_PASS="$STOREPASS"
 "$BT/apksigner" sign --ks "$SIGN/release.keystore" --ks-key-alias "$KEY_ALIAS" \
-    --ks-pass "pass:$STOREPASS" --key-pass "pass:$STOREPASS" --out "$NAME" "$OUT/aligned.apk"
+    --ks-pass env:OWRT_APKSIGNER_PASS --key-pass env:OWRT_APKSIGNER_PASS --out "$NAME" "$OUT/aligned.apk"
+unset OWRT_APKSIGNER_PASS STOREPASS
 "$BT/apksigner" verify --verbose "$NAME" > "$OUT/verify.txt"   # no "| head": with pipefail, SIGPIPE would fail the build
 head -6 "$OUT/verify.txt"
 # 5. Verify package and version metadata.

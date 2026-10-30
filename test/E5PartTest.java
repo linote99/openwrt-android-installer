@@ -20,6 +20,8 @@ import java.util.regex.Pattern;
 public class E5PartTest {
     static int fails, passes;
 
+    static String syntheticCid(char c) { char[] x = new char[32]; Arrays.fill(x, c); return new String(x); }
+
     static void ok(boolean c, String what) {
         if (c) passes++; else fails++;
         System.out.println((c ? "ok   " : "FAIL ") + what);
@@ -82,7 +84,7 @@ public class E5PartTest {
     // ------------------------------------------------------------------ simulated target
     static final class Dev implements Mu300Internal.Io {
         String slot = "_a", serial = "SER5", model = "E5";
-        final String cid = "0123456789abcdef0123456789abcdef";
+        final String cid = syntheticCid('a');
         final Map<String, long[]> rows = new LinkedHashMap<>();   // name -> {partno, start, size}
         final Map<String, byte[]> byName = new HashMap<>();
         final Map<String, byte[]> files = new HashMap<>();

@@ -20,6 +20,9 @@ import java.util.regex.Pattern;
 final class InstallEvidence {
     private InstallEvidence() {}
 
+    /** Path relative to ext4 inode 2 (filesystem root); Ext4.file() must not receive an absolute host path. */
+    static final String OPENWRT_FSTAB_EXT4_PATH = "etc/config/fstab";
+
     interface Reader { byte[] read(long offset, int length) throws IOException; }
 
     static final class Failed extends IOException {
@@ -299,7 +302,7 @@ final class InstallEvidence {
         String cmdline = ascii(header, 44, Math.max(0, cmdEnd - 44)).toLowerCase(java.util.Locale.ROOT);
         if (mode == 0x20L || mountOpts.contains("data=journal") || cmdline.contains("data=journal"))
             throw new IllegalArgumentException("检测到 ext4 data=journal 配置；journal replay 可能回写文件数据，拒绝修复");
-        byte[] fstab = fs.file("etc/config/fstab");
+        byte[] fstab = fs.file(OPENWRT_FSTAB_EXT4_PATH);
         if (containsAsciiIgnoreCase(fstab, "data=journal"))
             throw new IllegalArgumentException("OpenWrt /etc/config/fstab 含 data=journal；拒绝修复");
         if (ramdisk != null) for (UninstallBoot.Entry e : ramdisk.values()) {

@@ -12,6 +12,7 @@ public class UninstallFlowTest {
     static int passed, failed;
     static void ok(boolean c, String s) { if (c) { passed++; System.out.println("PASS " + s); } else { failed++; System.out.println("FAIL " + s); } }
     static void fail(String s) { ok(false, s); }
+    static String syntheticCid(char c) { char[] x = new char[32]; Arrays.fill(x, c); return new String(x); }
     static byte[][] gpt(String rootName) {
         final long n = 1L << 24, first = 2, tail = n - 33;
         byte[] e = new byte[128 * 128]; int k = 0;
@@ -50,7 +51,7 @@ public class UninstallFlowTest {
         final List<String> commands = new ArrayList<>();
         byte[] staged;
         String family, rootName, slot = "_a", bootId = "boot-before";
-        String cid = "0123456789abcdef0123456789abcdef";
+        String cid = syntheticCid('a');
         boolean after, rebooted, interrupted; String transport = "", transportNext = ""; boolean ready = true; byte[] misc = new byte[4096];
         byte[] bootA, bootB, userdata, rootRaw; long dataSectors = 50001, rootStart = 65536, rootEnd = 65536 + 4194303;
         Dev(File r, String fam, byte[] android, byte[] linux, byte[] rootImage) throws Exception { this(r,fam,android,linux,rootImage,false); }

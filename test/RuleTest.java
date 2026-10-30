@@ -26,6 +26,10 @@ public class RuleTest {
         expect("k1", "angelcare K1", "ums9157_2h10", "green", false);
         expect("yuanhang41s", "ZTE 7546N", "P720S11", "green", true);
         expect("yuanhang41s", "ZTE 7546N", "P720S12", "orange", false);
+        expect("changxing60", "ZTE 7552N", "P720S20", "green", true);
+        expect("changxing60", "ZTE 7552N", "P720S11", "green", false);
+        expect("changxing60", "ZTE 7552N", "other_board", "orange", false);
+        expect("changxing60", "ZTE 7546N", "P720S20", "green", false);
         expect("t512n", "T512N", "anything", "green", true);
         expect("t551m", "T551M", "x", "orange", true);
         expect("t551m", "T551M", "x", "green", false);

@@ -168,15 +168,13 @@ public final class AboutActivity extends Activity {
                 + "完成后按提示重启目标设备进入 OpenWrt，默认用户名和密码均为 root，请尽快修改。");
 
         section("MU300 UFS 适配");
-        para("UFS 独立内置安装仅适配此完整安装包：mu300-openwrt-25.12.5-r20261027.135818-g0043a5d8-s5351d2bc-k.zip。"
-                + "其他 MU300 安装包版本未针对 UFS 适配，请勿用于 UFS 内置安装。");
         para("支持 MU300 的 UFS 独立内置分区安装与重装；该安装包脚本支持的两阶段路径是先准备、按提示重启后再续装。");
         para("现在可用“卸载并归还空间”从 UFS 删除 OpenWrt 并把空间归还给 Android；只适用于上方列出的完整安装包。"
                 + "UFS 安装与重装流程保持不变，原有 eMMC 内置安装和 TF 卡流程也保留。");
         para("UFS 卸载只接受已识别的 MU300 UFS 身份、512 或 4096 字节 GPT 逻辑块，以及边界完整且唯一的 mu300root/userdata 布局和安装证据。"
                 + "无法唯一确认设备、分区归属、GPT 范围、扇区单位或布局时会拒绝；同意恢复出厂也不能绕过这些拒绝。");
         para("若卸载检查只因 mu300root 的 ext4 needs_recovery 停止，符合严格条件时可选择“仅回放 mu300root ext4 journal”："
-                + "只支持已核验的 MU300 UFS sda75、state=0x0001、incompat=0x00000046、4096-byte block、error_count=0 和内部 journal；"
+                + "根分区节点必须与当前 GPT 中唯一的 mu300root 标签及其分区几何一致（分区号不固定），并满足 state=0x0001、incompat=0x00000046、4096-byte block、error_count=0 和内部 journal；"
                 + "目标必须未挂载，且不能配置 data=journal。输入“修复 mu300root journal”后，只执行 e2fsck -p -E journal_only，"
                 + "再做完整只读检查并重新核对安装证据。其它状态、身份变化、修复返回异常或只读复核失败时停止，不会用 -y、格式化、扩容、重试或自动卸载；"
                 + "修复成功后仍要单独走正常卸载确认。工具暂存于 RAM；只写目标 ext4 内部 journal/元数据，不写 GPT、boot、misc、userdata 或其它分区。");
@@ -193,6 +191,7 @@ public final class AboutActivity extends Activity {
         String all = "TF 卡 / 独立内置分区；高级功能：重装已有内置分区、userdata 镜像（实验性）";
         model("E5", "E5（需 Bootloader 已解锁：orange）", all, "http://192.168.9.1");
         model("远航41S", "ZTE 7546N，主板 P720S11", all, "http://192.168.9.1");
+        model("Changxing60", "ZTE 7552N，主板 P720S20", all, "http://192.168.9.1");
         model("T551M", "T551M（需 orange）", all, "http://192.168.9.1");
         model("T512N", "T512N", all, "http://192.168.9.1");
         model("VIPME M8", "VIPME M8（需 orange）", all, "http://192.168.9.1");
@@ -223,6 +222,12 @@ public final class AboutActivity extends Activity {
                 + "「安装方式」页会多出“高级选项”。状态会记住，下次打开仍然有效。");
         para("关闭：再连点标题 5 下，或点“高级选项”右侧的“关闭高级功能”。"
                 + "“继续格式化后的安装”是普通安装方式，不受这个开关影响，一直显示在「安装方式」页。");
+        para("• 多分区规划【仅离线模拟】：可预览多个分区的布局和 userdata 影响；当前布局仍是合成预览，设备分区写入入口关闭。"
+                + "安全导入只用于对照历史备份，不能验证当前设备身份，也不授权恢复或写入。");
+        para("• 导入分区备份 ZIP：校验受支持的嵌套备份目录、文件路径/清单 SHA-256、GPT 主备 CRC 与几何后，仅把选定的一份 GPT 历史基线保存在应用私有存储。"
+                + "其它附件不会提取；身份、布局或续装记录不一致、损坏、未知格式会拒绝或只显示警告。导入不是设备验证。");
+        para("• 导入续装记录 JSON：只校验已支持版本的字段和哈希格式并脱敏展示，不写入本机续装队列、不执行命令或路径。"
+                + "不支持的旧版/未知字段或损坏记录会拒绝；不能据此恢复任务。");
         para("• 重装已有内置分区【高级】：清空已有的 OpenWrt 内置分区（e5root / mu300root，含 OpenWrt 系统和设置）并重新写入；"
                 + "不改分区表，保留 Android。适合已有内置 OpenWrt、只想重新安装，无需插 TF 卡。");
         para("• userdata 镜像安装【实验性】：在 userdata 里创建 OpenWrt 镜像，不格式化 userdata，仅限未加密的 userdata。"

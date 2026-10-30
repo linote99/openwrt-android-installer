@@ -743,9 +743,6 @@ public class MainActivity extends Activity implements JobManager.Listener {
             add(ui.notice("i", "仅支持 TF 卡", jm.pkg.title + " 安装包在本应用中只能用 TF 卡安装"
                     + (jm.pkg.internalProblem != null ? "：" + jm.pkg.internalProblem : "") + "。", 0), 10);
         leaveHiddenMethod();
-        boolean anyAdvanced = false;
-        for (JobManager.Method m : JobManager.Method.values())
-            if (jm.methodAllowed(m) && JobManager.advanced(m)) anyAdvanced = true;
         boolean unPending = jm.uninstallPending();
         for (JobManager.Method m : JobManager.Method.values()) {
             if (!jm.methodAllowed(m)) continue;
@@ -762,7 +759,7 @@ public class MainActivity extends Activity implements JobManager.Listener {
             add(ui.notice("!", "有未完成的操作", pending + "。请选上面的“继续格式化后的安装”完成它；在完成之前不要开始新的安装。\n"
                     + (noAdb != null ? noAdb : Mu300Internal.resumePrep()), 0), 10);
         if (noAdb != null) add(ufiButton(), 6);
-        if (advancedOn && anyAdvanced) {
+        if (advancedOn) {
             LinearLayout ah = ui.row();
             ah.setGravity(Gravity.CENTER_VERTICAL);
             ah.addView(ui.text("高级选项", 14, ui.primary, true), ui.weight(1));
@@ -774,6 +771,9 @@ public class MainActivity extends Activity implements JobManager.Listener {
             ah.setPadding(ui.dp(4), ui.dp(8), ui.dp(4), ui.dp(4));
             add(ah, 6);
             add(ui.text("与电脑端“高级选项”相同。连点顶部“OpenWrt 安装器”标题 5 下可关闭；有风险，用前请看「使用说明 → 高级功能」。", 12, ui.muted, false), 6);
+            add(ui.actionRow("▦", "多分区规划（仅离线模拟）",
+                    "规划多个分区、缩小 userdata，并预览用途/大小/扇区/对齐/GPT 主备表与数据影响；当前布局证据不足，设备写入已关闭。",
+                    true, v -> startActivity(new Intent(this, PartitionPlannerActivity.class))), 8);
             for (JobManager.Method m : JobManager.Method.values())
                 if (jm.methodAllowed(m) && JobManager.advanced(m) && !(m == JobManager.Method.UNINSTALL && unPending)) methodRow(m, idle);
         }

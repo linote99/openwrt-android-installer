@@ -1472,6 +1472,7 @@ final class JobManager {
         b.append("\n归还 Android 的空间：").append(Uninstall.human(Math.max(0, p.reclaimed())));
         b.append("\n释放为空闲的空间：").append(Uninstall.human(p.released()));
         b.append("\n数据处理：").append(uninstallActionText(p));
+        b.append("\n历史 GPT 对照：").append(ImportedBaselineStore.compare(app.getFilesDir(), p.before[0], p.before[1], p.total));
         unSummary = b.toString();
         checkedFingerprint = checkKey();
         append("✓ 检查通过，未修改任何分区。设备 " + d.model + "，Android 槽 " + d.slot);

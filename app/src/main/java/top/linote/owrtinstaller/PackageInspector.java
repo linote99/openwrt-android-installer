@@ -136,6 +136,7 @@ public final class PackageInspector {
             new DeviceRule("m8", "VIPME M8", "VIPME M8", null, true),
             new DeviceRule("t512n", "T512N", "T512N", null, false),          // engineering firmware reports green/locked
             new DeviceRule("yuanhang41s", "中兴远航 41S（ZTE 7546N）", "ZTE 7546N", "P720S11", false),
+            new DeviceRule("changxing60", "Changxing60（ZTE 7552N）", "ZTE 7552N", "P720S20", false),
             new DeviceRule("k1", "angelcare K1", "angelcare K1", "ums9157_2h10", true),
     };
 
@@ -393,6 +394,8 @@ public final class PackageInspector {
         DeviceRule rule = rule(prof);
         if (rule == null)
             throw new PackageException("不支持的机型 profile “" + prof + "”。本应用适配：" + supportedTitles());
+        if (("yuanhang41s".equals(prof) || "changxing60".equals(prof)) && !rule.model.equals(model))
+            throw new PackageException("安装包 profile “" + prof + "” 的型号 " + model + " 与机型规则要求的 " + rule.model + " 不一致");
         if (!rule.model.equals(model))
             res.warnings.add("安装包型号 " + model + " 与该 profile 常见型号 " + rule.model + " 不同；以安装包为准");
         res.title = rule.title;

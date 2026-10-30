@@ -52,6 +52,7 @@ final class MiniJson {
             ws();
             expect(':');
             ws();
+            if (m.containsKey(k)) throw new IllegalArgumentException("duplicate JSON key");
             m.put(k, value(depth + 1));
             ws();
             char c = next();
@@ -107,16 +108,43 @@ final class MiniJson {
 
     private Object number() {
         int start = i;
-        while (i < s.length() && "+-0123456789.eE".indexOf(s.charAt(i)) >= 0) i++;
-        if (start == i) throw new IllegalArgumentException("unexpected JSON token");
+        if (i < s.length() && s.charAt(i) == '-') i++;
+        if (i >= s.length()) throw new IllegalArgumentException("bad JSON number");
+        if (s.charAt(i) == '0') {
+            i++;
+            if (i < s.length() && digit(s.charAt(i))) throw new IllegalArgumentException("leading zero in JSON number");
+        } else if (s.charAt(i) >= '1' && s.charAt(i) <= '9') {
+            while (i < s.length() && digit(s.charAt(i))) i++;
+        } else {
+            throw new IllegalArgumentException("unexpected JSON token");
+        }
+        if (i < s.length() && s.charAt(i) == '.') {
+            i++;
+            int fraction = i;
+            while (i < s.length() && digit(s.charAt(i))) i++;
+            if (fraction == i) throw new IllegalArgumentException("bad JSON fraction");
+        }
+        if (i < s.length() && (s.charAt(i) == 'e' || s.charAt(i) == 'E')) {
+            i++;
+            if (i < s.length() && (s.charAt(i) == '+' || s.charAt(i) == '-')) i++;
+            int exponent = i;
+            while (i < s.length() && digit(s.charAt(i))) i++;
+            if (exponent == i) throw new IllegalArgumentException("bad JSON exponent");
+        }
         String n = s.substring(start, i);
         try {
-            if (n.contains(".") || n.contains("e") || n.contains("E")) return Double.parseDouble(n);
+            if (n.contains(".") || n.contains("e") || n.contains("E")) {
+                double d = Double.parseDouble(n);
+                if (Double.isNaN(d) || Double.isInfinite(d)) throw new NumberFormatException();
+                return d;
+            }
             return Long.parseLong(n);
         } catch (NumberFormatException ex) {
             throw new IllegalArgumentException("bad JSON number");
         }
     }
+
+    private static boolean digit(char c) { return c >= '0' && c <= '9'; }
 
     private char peek() {
         if (i >= s.length()) throw new IllegalArgumentException("unexpected end of JSON");

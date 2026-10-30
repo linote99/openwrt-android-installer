@@ -39,6 +39,8 @@ import java.util.zip.ZipOutputStream;
  */
 public final class CleanupActivity extends Activity {
     private static final int REQ_EXPORT = 41;
+    private static final int REQ_IMPORT_ZIP = 42;
+    private static final int REQ_IMPORT_RECORD = 43;
 
     /** One selectable category. backup = needs a verified export before deletion. */
     private static final class Cat {
@@ -59,6 +61,7 @@ public final class CleanupActivity extends Activity {
     private boolean exportVerified;
     private String exportName;
     private TextView status;
+    private String importMessage;
     private volatile boolean working;
     private final Handler main = new Handler(Looper.getMainLooper());
 
@@ -66,6 +69,7 @@ public final class CleanupActivity extends Activity {
         super.onCreate(state);
         ui = new Ui(this);
         jm = JobManager.get(this);
+        importMessage = ImportedBaselineStore.description(getFilesDir());
         if (Build.VERSION.SDK_INT >= 21) getWindow().setStatusBarColor(ui.bg);
         LinearLayout root = ui.col();
         root.setBackgroundColor(ui.bg);
@@ -175,9 +179,100 @@ public final class CleanupActivity extends Activity {
                 : "分区备份与卸载记录须先导出 ZIP 并校验通过，才能删除。ZIP 内含 SHA256SUMS 和 info.json（应用版本、来源目录、导出时间）。",
                 12.5f, exportVerified ? ui.primary : ui.muted, false);
         body.addView(status, ui.mw(10));
+        body.addView(ui.text("安全导入（只读）", 15, ui.text, true), ui.mw(8));
+        body.addView(ui.text(importMessage == null ? ImportedBaselineStore.description(getFilesDir()) : importMessage,
+                12.5f, ui.muted, false), ui.mw(6));
+        TextView impZip = ui.button("导入分区备份 ZIP（校验后选择历史基线）", 0, v -> chooseImportZip());
+        impZip.setEnabled(!busy && !working);
+        body.addView(impZip, ui.mw(4));
+        TextView impRecord = ui.button("导入续装记录 JSON（仅查看）", 0, v -> chooseImportRecord());
+        impRecord.setEnabled(!busy && !working);
+        body.addView(impRecord, ui.mw(8));
         TextView del = ui.button("删除所选", 2, v -> confirmDelete());
         del.setEnabled(!busy && !working);
         body.addView(del, ui.mw(8));
+    }
+
+    private void chooseImportZip() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("application/zip");
+        i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"application/zip", "application/x-zip-compressed", "application/octet-stream"});
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try { startActivityForResult(i, REQ_IMPORT_ZIP); }
+        catch (RuntimeException e) { importMessage = "无法打开文件选择器；没有导入任何备份。"; build(); }
+    }
+
+    private void chooseImportRecord() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("application/json");
+        i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"application/json", "text/plain", "application/octet-stream"});
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try { startActivityForResult(i, REQ_IMPORT_RECORD); }
+        catch (RuntimeException e) { importMessage = "无法打开文件选择器；没有导入或恢复任何记录。"; build(); }
+    }
+
+    private void startImport(Uri uri, int request) {
+        working = true;
+        importMessage = request == REQ_IMPORT_ZIP ? "正在离线校验 ZIP；不会提取附件或访问设备……"
+                : "正在离线校验续装记录；仅查看，不会恢复……";
+        build();
+        new Thread(() -> {
+            try (InputStream in = getContentResolver().openInputStream(uri)) {
+                if (request == REQ_IMPORT_RECORD) {
+                    SafeImport.RecordSummary record = SafeImport.readResumeRecord(in);
+                    main.post(() -> {
+                        working = false;
+                        importMessage = record.safeText(false);
+                        build();
+                    });
+                } else {
+                    SafeImport.ArchiveReport report = SafeImport.readBackupZip(in);
+                    main.post(() -> {
+                        working = false;
+                        handleArchive(report);
+                    });
+                }
+            } catch (Exception e) {
+                main.post(() -> {
+                    working = false;
+                    importMessage = "导入拒绝：" + (e.getMessage() == null ? "格式或完整性校验失败" : e.getMessage())
+                            + "。未保存 ZIP 成员、未恢复记录、未访问设备。";
+                    build();
+                });
+            }
+        }, "safe-cleanup-import").start();
+    }
+
+    private void handleArchive(SafeImport.ArchiveReport report) {
+        StringBuilder b = new StringBuilder(report.safeSummary());
+        for (SafeImport.RecordSummary record : report.records) b.append("\n\n").append(record.safeText(report.outerHashVerified));
+        if (report.backups.isEmpty()) {
+            importMessage = b.append("\n\n没有可保存的 GPT 基线。").toString();
+            build();
+            return;
+        }
+        String[] labels = new String[report.backups.size()];
+        for (int i = 0; i < labels.length; i++) labels[i] = report.backups.get(i).safeLabel(i + 1);
+        if (labels.length == 1) saveImportedBaseline(report.backups.get(0), b.toString());
+        else new AlertDialog.Builder(this).setTitle("选择共享的历史 GPT 基线")
+                .setItems(labels, (dialog, which) -> saveImportedBaseline(report.backups.get(which), b.toString()))
+                .setNegativeButton("取消", (dialog, which) -> {
+                    importMessage = b.append("\n\n未更换已保存的历史基线。").toString(); build();
+                }).show();
+    }
+
+    private void saveImportedBaseline(SafeImport.BackupItem item, String summary) {
+        try {
+            ImportedBaselineStore.save(getFilesDir(), item.baseline);
+            importMessage = summary + "\n\n已保存选定的 " + item.family + " 历史 GPT 主/备快照，供分区规划页与卸载检查做布局对照。"
+                    + "不含身份 JSON、续装记录、镜像或包内路径；不验证当前设备身份，不授权恢复或写入。\n"
+                    + ImportedBaselineStore.description(getFilesDir());
+        } catch (IOException e) {
+            importMessage = "ZIP 校验完成，但历史 GPT 基线保存失败；既有基线未更换。";
+        }
+        build();
     }
 
     // ------------------------------------------------------------------ export
@@ -208,6 +303,11 @@ public final class CleanupActivity extends Activity {
     }
     @Override protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
+        if ((req == REQ_IMPORT_ZIP || req == REQ_IMPORT_RECORD) && res == RESULT_OK
+                && data != null && data.getData() != null) {
+            startImport(data.getData(), req);
+            return;
+        }
         if (req != REQ_EXPORT || res != RESULT_OK || data == null || data.getData() == null) return;
         final Uri uri = data.getData();
         working = true;

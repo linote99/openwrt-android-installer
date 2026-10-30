@@ -29,6 +29,8 @@ import java.util.regex.Pattern;
 public class Mu300FlowTest {
     static int failures = 0, checks = 0;
 
+    static String syntheticCid(char c) { char[] x = new char[32]; Arrays.fill(x, c); return new String(x); }
+
     static void ok(boolean c, String what) {
         checks++;
         if (!c) { failures++; System.out.println("FAIL " + what); }
@@ -47,7 +49,7 @@ public class Mu300FlowTest {
         final List<String> pushed = new ArrayList<>();
         final File cache;
         String model = "MU300\nMU300", platform = "ums9620", slot = "_a";
-        String cid = "15010044353136474102a1b2c3d4e5f6".substring(0, 32);
+        String cid = syntheticCid('a');
         long udStart, udSize, freeKib;
         String state = "unencrypted", type = "", source = "/dev/block/by-name/userdata", magic = "1020f5f2", ext = "0000";
         String rootNode;            // existing mu300root node, e.g. mmcblk0p40

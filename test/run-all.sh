@@ -10,6 +10,14 @@ sudo rm -rf "$B"; mkdir -p "$B/cls" "$B/adb" "$B/usb"
 summary=()
 note() { summary+=("$1"); echo "== $1"; }
 
+# Offline multi-partition planning: uses only synthetic GPT snapshots and no Android SDK/device.
+mkdir -p "$B/partition-planner"
+javac -encoding UTF-8 -nowarn -d "$B/partition-planner" $J/MiniJson.java $J/Mu300Gpt.java $J/Mu300Boot.java $J/Lz4.java $J/PartitionPlanner.java $J/SafeImport.java $J/ImportedBaselineStore.java test/PartitionPlannerTest.java test/SafeImportTest.java 2>&1 | grep -v '^Note'
+java -cp "$B/partition-planner" top.linote.owrtinstaller.PartitionPlannerTest > "$B/partition-planner.txt" 2>&1
+note "PartitionPlannerTest rc=$? $(tail -1 "$B/partition-planner.txt")"
+java -cp "$B/partition-planner" top.linote.owrtinstaller.SafeImportTest > "$B/safe-import.txt" 2>&1
+note "SafeImportTest rc=$? $(tail -1 "$B/safe-import.txt")"
+
 MUJ="$J/Mu300Internal.java $J/Mu300Gpt.java $J/Mu300Boot.java $J/Lz4.java $J/RootfsFilter.java"
 AJ=$(ls -d "${ANDROID_HOME:-/workspace/.android-sdk}"/platforms/android-35/android.jar 2>/dev/null)
 javac -encoding UTF-8 -nowarn -cp "$AJ" -sourcepath app/src/main/java:build/gen -d "$B/cls" $J/MiniJson.java $J/PackageInspector.java $MUJ test/DesktopInspect.java test/RuleTest.java test/Mu300FlowTest.java test/UfsGptTest.java 2>&1 | grep -v '^Note'
@@ -43,6 +51,12 @@ MU=$(ls "$Z"/mu300-openwrt-*.zip 2>/dev/null | head -1)
 K1=$(ls "$Z"/k1-openwrt-*.zip 2>/dev/null | head -1)
 [ -n "$K1" ] && { python3 test/negative-package-test.py "$K1" "$B/cls" "$B/neg-k1" > "$B/negk1.txt" 2>&1; note "negative-package(K1, model rules) rc=$? $(tail -1 "$B/negk1.txt")"; }
 [ -n "$E5" ] && { python3 test/negative-package-test.py "$E5" "$B/cls" "$B/neg" > "$B/neg.txt" 2>&1; note "negative-package rc=$? $(tail -1 "$B/neg.txt")"; }
+for z in "$Z"/yuanhang41s-openwrt-*.zip "$Z"/changxing60-openwrt-*.zip; do
+  [ -f "$z" ] || continue
+  n=$(basename "$z" .zip)
+  python3 test/negative-package-test.py "$z" "$B/cls" "$B/neg-$n" > "$B/neg-$n.txt" 2>&1
+  note "negative-package($n) rc=$? $(tail -1 "$B/neg-$n.txt")"
+done
 # MU300 internal-storage port against a simulated device (package scripts are simulated, never executed)
 for z in "$Z"/mu300-openwrt-*.zip; do
   [ -f "$z" ] || continue

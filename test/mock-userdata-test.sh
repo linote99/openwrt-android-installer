@@ -251,7 +251,7 @@ out=$($H e5-tool arm 2>&1); expect 'e5-tool arm rc 0' "$out" 'OWRT-APK-TOOL-RC=0
 expect 'e5-tool arm backup path' "$out" "Boot control backup: $T/adb/e5-boot-control/before\."
 grep -q "^bootctl arm $T/adb/e5-boot-control/before\.[A-Za-z0-9]* a\$" "$LOG" && ok 'bootctl arm BACKUP a' || { bad 'bootctl arm args'; cat "$LOG"; }
 # part-write argument validation (nothing copied, nothing run)
-TOK=0123456789abcdef0123456789abcdef
+TOK=$(printf '%32s' '' | tr ' ' a)
 mkdir -p "$T/sys/mmcblk0p71"; printf 'MAJOR=179\nPARTNAME=e5root\n' > "$T/sys/mmcblk0p71/uevent"; echo 71 > "$T/sys/mmcblk0p71/partition"; echo 8388608 > "$T/sys/mmcblk0p71/size"
 echo 70 > "$T/sys/mmcblk0p70/partition"
 : > "$LOG"
@@ -260,7 +260,7 @@ out=$($H e5-tool part-write /dev/sda1 4096 2048 1 $TOK 2>&1); expect 'part-write
 out=$($H e5-tool part-write /dev/block/mmcblk0p71 40x 2048 1 $TOK 2>&1); expect 'part-write: bad size' "$out" 'invalid size'
 out=$($H e5-tool part-write /dev/block/mmcblk0p71 4096 2048 2 $TOK 2>&1); expect 'part-write: bad grow' "$out" 'grow flag must be 0 or 1'
 out=$($H e5-tool part-write /dev/block/mmcblk0p71 4096 2048 1 0123 2>&1); expect 'part-write: short token' "$out" 'invalid token'
-out=$($H e5-tool part-write /dev/block/mmcblk0p71 4096 2048 1 0123456789ABCDEF0123456789abcdef 2>&1); expect 'part-write: upper-case token' "$out" 'invalid token'
+out=$($H e5-tool part-write /dev/block/mmcblk0p71 4096 2048 1 "${TOK^^}" 2>&1); expect 'part-write: upper-case token' "$out" 'invalid token'
 out=$($H e5-tool part-write /dev/block/mmcblk0p70 4096 2048 1 $TOK 2>&1); expect 'part-write: userdata is not e5root' "$out" 'target is not e5root'
 out=$($H e5-tool part-write /dev/block/mmcblk0p99 4096 2048 1 $TOK 2>&1); expect 'part-write: missing partition' "$out" 'target is not a partition'
 rm -f "$T/data/local/tmp/e5-device-files.tar"

@@ -18,7 +18,7 @@ import java.util.regex.Pattern;
 
 /**
  * Narrow MU300 UFS ext4 journal recovery. The only block device ever passed to a
- * mutating command is the already-verified /dev/block/sda75 mu300root partition.
+ * mutating command is the unique mu300root partition resolved from the verified current GPT.
  * Maintenance binaries and logs are staged under /dev (tmpfs/devtmpfs), never
  * under userdata. This class does not edit GPT, boot, misc, userdata or other nodes.
  */
@@ -28,15 +28,14 @@ final class Mu300Ext4Recovery {
     static final String ROOT_NAME = "mu300-ext4-journal-recovery";
     static final String RECORD = "journal-recovery.json";
     static final String DISK_NODE = "sda";
-    static final String ROOT_NODE = "sda75";
     static final String ROOT_LABEL = "mu300root";
-    static final String DEVICE = "/dev/block/sda75";
     static final int EXT4_BLOCK_BYTES = 4096;
     static final long RECOVERY_INCOMPAT = 0x46L; // filetype + needs_recovery + extents
     static final long CLEAN_INCOMPAT = 0x42L;    // same layout after journal replay
     static final long NEEDS_RECOVERY = 0x4L;
     static final String UFS_LIBRARY_SHA = "7dc62136b7f95a3d18e8218b13649c04729fe3c7d29814acb68b82ceb1f44233";
     private static final Pattern HEX32 = Pattern.compile("[a-f0-9]{32}");
+    private static final Pattern UFS_PARTITION_NODE = Pattern.compile("sda[1-9][0-9]{0,2}");
     private static final String TOOL_PREFIX = "openwrt-uninstall/tools/";
     private static final String E2FSCK_REL = "usr/sbin/e2fsck";
     private static final String LOADER_REL = "lib/ld-musl-aarch64.so.1";
@@ -52,15 +51,19 @@ final class Mu300Ext4Recovery {
         Uninstall.Pkg pkg;
         Mu300Gpt.Part root;
         long capacityBytes;
-        String rootGuid, gptPrimarySha, gptBackupSha, superblockSha, fingerprint;
+        String rootNode, rootGuid, gptPrimarySha, gptBackupSha, superblockSha, fingerprint;
+        long gptFrontSectors512, gptTailStart512;
         FsFacts fs;
         Map<String, Object> proof;
         LinkedHashMap<String, byte[]> tools = new LinkedHashMap<>();
         Map<String, String> toolHashes = new TreeMap<>();
 
-        String devicePath() { return DEVICE; }
+        String devicePath() {
+            return rootNode != null && UFS_PARTITION_NODE.matcher(rootNode).matches()
+                    ? "/dev/block/" + rootNode : "";
+        }
         String summary() {
-            return "设备：MU300 UFS · /dev/block/" + DISK_NODE + "\n分区：mu300root · " + DEVICE
+            return "设备：MU300 UFS · /dev/block/" + DISK_NODE + "\n分区：mu300root · " + devicePath()
                     + "\next4 UUID：" + fs.uuid + " · 4096 B/block · incompat=0x"
                     + String.format(Locale.US, "%08x", fs.incompat)
                     + "\n只回放 ext4 journal；不会卸载、格式化、扩容或改写 GPT/boot/misc/userdata。";
@@ -88,6 +91,7 @@ final class Mu300Ext4Recovery {
             if (!s("id").equals(disk.s("id")) || !s("stage").equals(disk.stage()) || !s("cid").equals(disk.s("cid"))
                     || !s("remote_tmpfs").equals(disk.s("remote_tmpfs"))
                     || !s("candidate_fingerprint").equals(disk.s("candidate_fingerprint"))
+                    || !s("root_node").equals(disk.s("root_node")) || !s("root_path").equals(disk.s("root_path"))
                     || !s("root_guid").equals(disk.s("root_guid")) || !s("ext4_uuid").equals(disk.s("ext4_uuid"))
                     || n("root_start") != disk.n("root_start") || n("root_end") != disk.n("root_end")
                     || !s("pre_superblock_sha256").equals(disk.s("pre_superblock_sha256")))
@@ -99,12 +103,14 @@ final class Mu300Ext4Recovery {
         int run(String devicePath) throws IOException;
     }
 
-    /** Pure guard used by the live path and synthetic tests: a mutation callback only receives sda75. */
+    /** Pure guard used by synthetic tests: a mutation callback receives only the bound candidate path. */
     static int replayGuarded(Candidate expected, Candidate current, boolean mounted, Replay replay) throws IOException {
         if (expected == null || current == null || replay == null) throw new IOException("修复计划不完整");
         if (mounted) throw new IOException("mu300root 仍被挂载或映射，拒绝修复");
         if (!samePreWrite(expected, current)) throw new IOException("设备、GPT 或 ext4 身份与预检不一致，拒绝写入");
-        int rc = replay.run(DEVICE);
+        if (expected.devicePath().isEmpty() || !expected.devicePath().equals(current.devicePath()))
+            throw new IOException("修复目标路径与只读候选不一致，拒绝写入");
+        int rc = replay.run(current.devicePath());
         if (!acceptedReplayRc(rc)) throw new IOException("e2fsck journal-only 返回码 " + rc + "；停止，不自动重试或扩大修复范围");
         return rc;
     }
@@ -200,14 +206,8 @@ final class Mu300Ext4Recovery {
         Uninstall.Layout layout;
         try { layout = Uninstall.deviceLayout(first, last, sectors, ROOT_LABEL); }
         catch (Uninstall.Refused e) { throw new IOException(e.getMessage()); }
-        if (!ROOT_NODE.equals(Uninstall.partNode(DISK_NODE, layout.root.n)) || !ROOT_LABEL.equals(layout.root.name)
-                || !d.s.root.equals(ROOT_NODE) || d.rootStart != layout.root.start
-                || Uninstall.bytes512(d.rootSize) != Uninstall.bytes512(Uninstall.sectorsBetween(layout.root.start, layout.root.end)))
-            throw new IOException("内核节点、GPT 的 mu300root 标签与分区范围不一致");
-        if (d.s.start != layout.data.start || Uninstall.bytes512(d.s.size)
-                != Uninstall.bytes512(Uninstall.sectorsBetween(layout.data.start, layout.data.end)))
-            throw new IOException("userdata 与 GPT 范围不一致");
-        verifySysfs(io, d, layout.root, sectors);
+        String rootNode = resolveRootNode(d, layout);
+        verifySysfs(io, d, layout.root, rootNode, sectors);
 
         Map<String, Object> proof;
         try {
@@ -215,7 +215,7 @@ final class Mu300Ext4Recovery {
                     : Uninstall.evidence(io, d, pkg, layout.root, null);
         } catch (Uninstall.Refused e) { throw new IOException(e.getMessage()); }
         long capacity = Uninstall.bytes512(Uninstall.sectorsBetween(layout.root.start, layout.root.end));
-        byte[] sb = readSuperblock(io, d, capacity);
+        byte[] sb = readSuperblock(io, d, rootNode, capacity);
         FsFacts fs = recoveryCandidate ? parseRecoverySuperblock(sb, capacity)
                 : parseCleanSuperblock(sb, capacity, null);
         String guid;
@@ -228,7 +228,9 @@ final class Mu300Ext4Recovery {
         } catch (IllegalArgumentException | ArithmeticException e) { throw new IOException("无法读取 GPT mu300root 唯一 GUID"); }
 
         Candidate c = new Candidate();
-        c.device = d; c.pkg = pkg; c.root = layout.root; c.capacityBytes = capacity; c.rootGuid = guid;
+        c.device = d; c.pkg = pkg; c.root = layout.root; c.rootNode = rootNode;
+        c.gptFrontSectors512 = ft[0]; c.gptTailStart512 = ft[1];
+        c.capacityBytes = capacity; c.rootGuid = guid;
         c.gptPrimarySha = Mu300Boot.sha256(first); c.gptBackupSha = Mu300Boot.sha256(last);
         c.superblockSha = Mu300Boot.sha256(sb); c.fs = fs; c.proof = proof;
         c.tools = maintenanceSubset(Uninstall.growthTools(pkg, "ext4"));
@@ -237,25 +239,73 @@ final class Mu300Ext4Recovery {
         return c;
     }
 
+    /** Bind the kernel-reported nodes and geometry to the unique labels in the just-read GPT. */
+    static String resolveRootNode(Uninstall.Device d, Uninstall.Layout layout) throws IOException {
+        if (d == null || d.s == null || layout == null || layout.root == null || layout.data == null)
+            throw new IOException("设备或 GPT 分区布局不完整");
+        if (!DISK_NODE.equals(d.s.diskNode)) throw new IOException("MU300 UFS GPT 磁盘节点不是已核验的 sda");
+        if (!ROOT_LABEL.equals(layout.root.name)) throw new IOException("GPT 根分区标签不是 mu300root");
+        final String node;
+        try { node = Uninstall.partNode(DISK_NODE, layout.root.n); }
+        catch (IllegalArgumentException e) { throw new IOException("GPT mu300root 分区号无效"); }
+        if (!UFS_PARTITION_NODE.matcher(node).matches()) throw new IOException("GPT mu300root 节点格式不受支持");
+        if (!node.equals(d.s.root)) throw new IOException("内核 mu300root 节点与 GPT 唯一标签位置不一致");
+        long rootSectors = Uninstall.sectorsBetween(layout.root.start, layout.root.end);
+        long dataSectors = Uninstall.sectorsBetween(layout.data.start, layout.data.end);
+        if (d.rootStart != layout.root.start || d.rootSize != rootSectors)
+            throw new IOException("mu300root 起点/长度与 GPT 不一致");
+        if (d.s.start != layout.data.start || d.s.size != dataSectors)
+            throw new IOException("userdata 起点/长度与 GPT 不一致");
+        return node;
+    }
+
+    static boolean supportedMu300Profile(String profile) {
+        return "f50".equals(profile) || "u30air".equals(profile) || "v50".equals(profile);
+    }
+
+    static boolean matchesAndroidProfile(String model, String platform, String profile) {
+        if (!supportedMu300Profile(profile)) return false;
+        try { return profile.equals(Mu300Gpt.androidProfile(model, platform)); }
+        catch (IllegalArgumentException e) { return false; }
+    }
+
+    static String targetGateFailure(Uninstall.Device d, Uninstall.Pkg pkg) {
+        if (d == null || d.s == null || pkg == null) return "设备或安装包信息缺失";
+        List<String> failed = new ArrayList<>();
+        if (!"mu300".equals(pkg.family)) failed.add("package_family 不匹配");
+        if (!"ufs".equals(d.s.kind)) failed.add("storage_kind=" + ("emmc".equals(d.s.kind) ? "emmc" : "other") + "（要求 ufs）");
+        if (!DISK_NODE.equals(d.s.diskNode)) failed.add("disk_node=" + safeNode(d.s.diskNode) + "（要求 " + DISK_NODE + "）");
+        if (d.s.root == null || !UFS_PARTITION_NODE.matcher(d.s.root).matches())
+            failed.add("root_node=" + safeNode(d.s.root) + "（须匹配当前 GPT 中唯一的 mu300root）");
+        if (!HEX32.matcher(d.s.cid == null ? "" : d.s.cid).matches()) failed.add("storage_identity_format=invalid（值已隐藏）");
+        if (d.s.sectorSize != 512 && d.s.sectorSize != 4096) failed.add("logical_block_size=" + d.s.sectorSize + "（仅支持 512/4096）");
+        if (!supportedMu300Profile(d.profile)) failed.add("device_profile=unsupported_or_missing");
+        return failed.isEmpty() ? null : String.join("；", failed);
+    }
+
+    private static String safeNode(String node) {
+        return node != null && node.matches("[A-Za-z0-9]+") ? node : "<missing_or_invalid>";
+    }
+
     private static void requireTarget(Mu300Internal.Io io, Uninstall.Device d, Uninstall.Pkg pkg) throws IOException {
         if (d == null || d.s == null || pkg == null || !d.booted)
             throw new IOException("需要已启动并完成设置的 rooted Android");
-        if (!"mu300".equals(pkg.family) || !"ufs".equals(d.s.kind)
-                || !DISK_NODE.equals(d.s.diskNode) || !ROOT_NODE.equals(d.s.root)
-                || !HEX32.matcher(d.s.cid).matches() || (d.s.sectorSize != 512 && d.s.sectorSize != 4096)
-                || !"f50".equals(d.profile))
-            throw new IOException("仅支持已核验的 MU300 UFS sda75/mu300root，不支持其他存储或分区");
+        String gateFailure = targetGateFailure(d, pkg);
+        if (gateFailure != null)
+            throw new IOException("仅支持已核验的 MU300 UFS 唯一 mu300root 分区；未通过项：" + gateFailure);
         if (pkg.storageLibrary == null || !UFS_LIBRARY_SHA.equals(Mu300Boot.sha256(pkg.storageLibrary)))
             throw new IOException("UFS identity library 缺失或校验不符");
-        String props = io.sh("getprop ro.product.model; getprop ro.product.device", true).toUpperCase(Locale.ROOT);
-        if (!props.contains("MU300")) throw new IOException("设备属性未能确认是 MU300，拒绝修复");
+        String props = io.sh("getprop ro.product.model; getprop ro.product.device", true);
+        String platform = io.sh("getprop ro.board.platform", true).trim();
+        if (!matchesAndroidProfile(props, platform, d.profile))
+            throw new IOException("设备属性与已识别的 MU300 系列 profile 不一致，拒绝修复");
         if (!"a".equals(d.slot) && !"b".equals(d.slot)) throw new IOException("Android slot 无效");
         if (d.bootId == null || !d.bootId.matches("[0-9a-fA-F-]{20,64}")) throw new IOException("无法确认本次 Android 启动身份");
     }
 
     private static void verifySysfs(Mu300Internal.Io io, Uninstall.Device d, Mu300Gpt.Part root,
-                                    long diskSectors) throws IOException {
-        String script = "set -e; n=" + ROOT_NODE + "; b=" + DISK_NODE + "; u=/sys/class/block/$n/uevent; "
+                                    String rootNode, long diskSectors) throws IOException {
+        String script = "set -e; n=" + Mu300Internal.q(rootNode) + "; b=" + DISK_NODE + "; u=/sys/class/block/$n/uevent; "
                 + "grep -qx PARTNAME=" + ROOT_LABEL + " \"$u\"; test -b /dev/block/$n; "
                 + "echo ROOT_START=$(cat /sys/class/block/$n/start); echo ROOT_SIZE=$(cat /sys/class/block/$n/size); "
                 + "echo DISK_SIZE=$(cat /sys/class/block/$b/size); "
@@ -267,16 +317,16 @@ final class Mu300Ext4Recovery {
                 || !String.valueOf(diskSectors).equals(m.get("DISK_SIZE"))
                 || !String.valueOf(d.s.sectorSize).equals(m.get("LOGICAL"))
                 || m.getOrDefault("DEV", "").isEmpty() || !d.bootId.equals(m.get("BOOT_ID")))
-            throw new IOException("sda75 的 sysfs 节点、GPT 几何或启动身份与只读探测不一致");
+            throw new IOException("mu300root 的 sysfs 节点、GPT 几何或启动身份与只读探测不一致");
     }
 
-    private static byte[] readSuperblock(Mu300Internal.Io io, Uninstall.Device d, long capacity) throws IOException {
+    private static byte[] readSuperblock(Mu300Internal.Io io, Uninstall.Device d, String rootNode, long capacity) throws IOException {
         if (capacity < 2048) throw new IOException("mu300root 分区容量过小");
         int ioBlock = d.s.sectorSize;
         long offset = 1024, skip = offset / ioBlock;
         int remainder = (int) (offset % ioBlock);
         long count = (remainder + 1024L + ioBlock - 1) / ioBlock;
-        byte[] raw = Mu300Internal.read(io, "dd if=" + Mu300Internal.q(DEVICE) + " bs=" + ioBlock
+        byte[] raw = Mu300Internal.read(io, "dd if=" + Mu300Internal.q("/dev/block/" + rootNode) + " bs=" + ioBlock
                 + " skip=" + skip + " count=" + count + " 2>/dev/null", count * ioBlock);
         if (raw.length < remainder + 1024) throw new IOException("ext4 superblock 读取不完整");
         return Arrays.copyOfRange(raw, remainder, remainder + 1024);
@@ -303,10 +353,13 @@ final class Mu300Ext4Recovery {
 
     static String fingerprint(Candidate c) {
         LinkedHashMap<String, Object> m = new LinkedHashMap<>();
-        m.put("cid", c.device.s.cid); m.put("kind", c.device.s.kind); m.put("disk", DISK_NODE); m.put("root", ROOT_NODE);
+        m.put("cid", c.device.s.cid); m.put("kind", c.device.s.kind); m.put("disk", DISK_NODE);
+        m.put("root", c.rootNode); m.put("root_path", c.devicePath());
         m.put("profile", c.device.profile); m.put("slot", c.device.slot); m.put("boot_id", c.device.bootId);
         m.put("sector_size", c.device.s.sectorSize); m.put("disk_size", c.device.s.diskSize);
         m.put("root_guid", c.rootGuid); m.put("root_start", c.root.start); m.put("root_end", c.root.end);
+        m.put("root_number", (long) c.root.n); m.put("gpt_front_sectors_512", c.gptFrontSectors512);
+        m.put("gpt_tail_start_sectors_512", c.gptTailStart512);
         m.put("uuid", c.fs.uuid); m.put("blocks", c.fs.blocks); m.put("block_bytes", 1L << (10 + c.fs.logBlockSize));
         m.put("gpt_primary_sha256", c.gptPrimarySha); m.put("gpt_backup_sha256", c.gptBackupSha);
         m.put("superblock_sha256", c.superblockSha); m.put("proof", c.proof); m.put("tool_hashes", c.toolHashes);
@@ -323,7 +376,10 @@ final class Mu300Ext4Recovery {
                 && a.device.s.kind.equals(b.device.s.kind) && a.device.s.sectorSize == b.device.s.sectorSize
                 && a.device.s.diskSize == b.device.s.diskSize && a.device.profile.equals(b.device.profile)
                 && a.device.slot.equals(b.device.slot) && (!requireBootId || a.device.bootId.equals(b.device.bootId))
-                && a.rootGuid.equals(b.rootGuid) && a.root.start == b.root.start && a.root.end == b.root.end
+                && a.rootNode.equals(b.rootNode) && a.devicePath().equals(b.devicePath())
+                && a.root.n == b.root.n && a.rootGuid.equals(b.rootGuid)
+                && a.root.start == b.root.start && a.root.end == b.root.end
+                && a.gptFrontSectors512 == b.gptFrontSectors512 && a.gptTailStart512 == b.gptTailStart512
                 && a.gptPrimarySha.equals(b.gptPrimarySha) && a.gptBackupSha.equals(b.gptBackupSha)
                 && a.fs.uuid.equals(b.fs.uuid) && a.fs.blocks == b.fs.blocks
                 && a.fs.logBlockSize == b.fs.logBlockSize;
@@ -342,7 +398,10 @@ final class Mu300Ext4Recovery {
             Tx tx;
             try { tx = load(record); }
             catch (IOException e) { throw new IOException("发现无法读取的 ext4 修复记录；为安全起见停止：" + dir.getName()); }
-            if (cid.equals(tx.s("cid"))) found = tx;
+            if (cid.equals(tx.s("cid"))) {
+                if (found != null) throw new IOException("发现同一设备的多个 ext4 修复记录；为安全起见停止");
+                found = tx;
+            }
         }
         return found;
     }
@@ -380,13 +439,15 @@ final class Mu300Ext4Recovery {
         LinkedHashMap<String, Object> m = new LinkedHashMap<>();
         m.put("schema", 1L); m.put("id", id); m.put("created_ms", System.currentTimeMillis()); m.put("updated_ms", System.currentTimeMillis());
         m.put("stage", "precheck_failed"); m.put("operation", "e2fsck -p -E journal_only");
-        m.put("cid", c.device.s.cid); m.put("storage_kind", c.device.s.kind); m.put("disk", DISK_NODE); m.put("root_node", ROOT_NODE);
+        m.put("cid", c.device.s.cid); m.put("storage_kind", c.device.s.kind); m.put("disk", DISK_NODE);
+        m.put("root_node", c.rootNode); m.put("root_path", c.devicePath());
         m.put("root_label", ROOT_LABEL); m.put("profile", c.device.profile); m.put("slot", c.device.slot); m.put("boot_id", c.device.bootId);
         m.put("sector_size", (long) c.device.s.sectorSize); m.put("disk_size", c.device.s.diskSize);
         m.put("root_guid", c.rootGuid); m.put("root_start", c.root.start); m.put("root_end", c.root.end);
         m.put("ext4_uuid", c.fs.uuid); m.put("ext4_blocks", c.fs.blocks); m.put("ext4_log_block_size", (long) c.fs.logBlockSize);
         m.put("pre_incompat", c.fs.incompat); m.put("pre_superblock_sha256", c.superblockSha);
         m.put("gpt_primary_sha256", c.gptPrimarySha); m.put("gpt_backup_sha256", c.gptBackupSha);
+        m.put("gpt_front_sectors_512", c.gptFrontSectors512); m.put("gpt_tail_start_sectors_512", c.gptTailStart512);
         m.put("candidate_fingerprint", c.fingerprint); m.put("tool_hashes", c.toolHashes); m.put("remote_tmpfs", remoteRoot);
         Tx tx = new Tx(dir, m); tx.save(); return tx;
     }
@@ -500,9 +561,12 @@ final class Mu300Ext4Recovery {
 
     private static boolean matchesTx(Tx tx, Candidate c) {
         return tx.s("cid").equals(c.device.s.cid) && "ufs".equals(tx.s("storage_kind"))
-                && DISK_NODE.equals(tx.s("disk")) && ROOT_NODE.equals(tx.s("root_node"))
+                && DISK_NODE.equals(tx.s("disk")) && c.rootNode.equals(tx.s("root_node"))
+                && c.devicePath().equals(tx.s("root_path"))
                 && ROOT_LABEL.equals(tx.s("root_label")) && tx.s("profile").equals(c.device.profile)
-                && tx.s("slot").equals(c.device.slot) && tx.s("root_guid").equals(c.rootGuid)
+                && tx.s("slot").equals(c.device.slot) && tx.s("boot_id").equals(c.device.bootId)
+                && tx.n("sector_size") == c.device.s.sectorSize && tx.n("disk_size") == c.device.s.diskSize
+                && tx.s("root_guid").equals(c.rootGuid)
                 && tx.n("root_start") == c.root.start && tx.n("root_end") == c.root.end
                 && tx.s("ext4_uuid").equals(c.fs.uuid) && tx.n("ext4_blocks") == c.fs.blocks
                 && tx.n("ext4_log_block_size") == c.fs.logBlockSize
@@ -515,7 +579,7 @@ final class Mu300Ext4Recovery {
         return c.gptPrimarySha.equals(Mu300Boot.sha256(p.before[0]))
                 && c.gptBackupSha.equals(Mu300Boot.sha256(p.before[1]))
                 && p.device != null && c.device.s.cid.equals(p.device.s.cid)
-                && ROOT_NODE.equals(p.nodes.get(ROOT_LABEL));
+                && c.rootNode.equals(p.nodes.get(ROOT_LABEL));
     }
 
     private static final class Stage {
@@ -584,25 +648,54 @@ final class Mu300Ext4Recovery {
                 + " " + Mu300Internal.q(e2fsck) + " -E journal_only -V; rc=$?; echo OWRT-E2FSCK-OPTION-RC=$rc; exit 0";
     }
 
-    private static String replayScript(String remote, Candidate c) throws IOException {
+    private static String gptMismatchConditions(Candidate c) throws IOException {
+        int block = c.device.s.sectorSize;
+        int factor = block / 512;
+        if ((block != 512 && block != 4096) || c.gptFrontSectors512 <= 0 || c.gptTailStart512 <= 0
+                || c.gptFrontSectors512 % factor != 0 || c.gptTailStart512 % factor != 0
+                || c.device.s.diskSize <= c.gptTailStart512 || c.gptFrontSectors512 > c.gptTailStart512
+                || (c.device.s.diskSize - c.gptTailStart512) % factor != 0)
+            throw new IOException("候选中的 GPT 读取范围无效；拒绝启动 e2fsck");
+        long frontBlocks = c.gptFrontSectors512 / factor;
+        long tailStartBlocks = c.gptTailStart512 / factor;
+        long tailCountBlocks = (c.device.s.diskSize - c.gptTailStart512) / factor;
+        String disk = Mu300Internal.q("/dev/block/" + DISK_NODE);
+        return "[ \"$(dd if=" + disk + " bs=" + block + " count=" + frontBlocks
+                + " 2>/dev/null | sha256sum | awk '{print $1}')\" != " + Mu300Internal.q(c.gptPrimarySha) + " ]"
+                + " || [ \"$(dd if=" + disk + " bs=" + block + " skip=" + tailStartBlocks + " count=" + tailCountBlocks
+                + " 2>/dev/null | sha256sum | awk '{print $1}')\" != " + Mu300Internal.q(c.gptBackupSha) + " ]";
+    }
+
+    private static String superblockMismatchCondition(Candidate c) {
+        return "[ \"$(dd if=\"$D\" bs=1 skip=1024 count=1024 2>/dev/null | sha256sum | awk '{print $1}')\" != "
+                + Mu300Internal.q(c.superblockSha) + " ]";
+    }
+
+    static String replayScript(String remote, Candidate c) throws IOException {
         String lib = new String(c.pkg.storageLibrary, StandardCharsets.UTF_8);
         String loader = remote + "/" + LOADER_REL, e2fsck = remote + "/" + E2FSCK_REL;
         String libs = remote + "/lib:" + remote + "/usr/lib";
         String bootId = c.device.bootId;
         String cid = c.device.s.cid;
-        String dev = DEVICE;
+        String dev = c.devicePath();
+        if (dev.isEmpty() || !c.rootNode.equals(c.device.s.root))
+            throw new IOException("候选根分区路径无效或未绑定当前内核节点；拒绝启动 e2fsck");
+        long rootSize = Uninstall.sectorsBetween(c.root.start, c.root.end);
         return lib + "\nset +e\n"
-                + "R=" + Mu300Internal.q(remote) + "; D=" + Mu300Internal.q(dev) + "; N=" + ROOT_NODE + "; B=" + DISK_NODE + "\n"
+                + "R=" + Mu300Internal.q(remote) + "; D=" + Mu300Internal.q(dev) + "; N=" + Mu300Internal.q(c.rootNode)
+                + "; B=" + DISK_NODE + "; DEVFS=$(awk '$2==\"/dev\" {print $3; exit}' /proc/mounts)\n"
                 + "if [ \"$(mu300_storage_identity \"$B\")\" != " + Mu300Internal.q(cid) + " ]"
                 + " || [ \"$(mu300_storage_parent \"$N\")\" != \"$B\" ]"
                 + " || [ \"$(mu300_storage_part " + ROOT_LABEL + " \"$B\")\" != \"$N\" ]"
                 + " || [ \"$(cat /sys/class/block/$B/size 2>/dev/null)\" != " + c.device.s.diskSize + " ]"
                 + " || [ \"$(cat /sys/class/block/$B/queue/logical_block_size 2>/dev/null)\" != " + c.device.s.sectorSize + " ]"
                 + " || [ \"$(cat /sys/class/block/$N/start 2>/dev/null)\" != " + c.root.start + " ]"
-                + " || [ \"$(cat /sys/class/block/$N/size 2>/dev/null)\" != " + Uninstall.sectorsBetween(c.root.start, c.root.end) + " ]"
+                + " || [ \"$(cat /sys/class/block/$N/size 2>/dev/null)\" != " + rootSize + " ]"
                 + " || ! grep -qx PARTNAME=" + ROOT_LABEL + " /sys/class/block/$N/uevent 2>/dev/null"
                 + " || [ ! -b \"$D\" ] || [ \"$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)\" != " + Mu300Internal.q(bootId) + " ]"
-                + " || [ \"$(awk '$2==\"/dev\" {print $3; exit}' /proc/mounts)\" != tmpfs ] && [ \"$(awk '$2==\"/dev\" {print $3; exit}' /proc/mounts)\" != devtmpfs ]"
+                + " || " + gptMismatchConditions(c)
+                + " || " + superblockMismatchCondition(c)
+                + " || { [ \"$DEVFS\" != tmpfs ] && [ \"$DEVFS\" != devtmpfs ]; }"
                 + " || [ -n \"$(ls -A /sys/class/block/$N/holders 2>/dev/null)\" ]"
                 + " || awk -v n=\"$(cat /sys/class/block/$N/dev 2>/dev/null)\" '$3==n {busy=1} END {exit !busy}' /proc/self/mountinfo; then\n"
                 + "  echo OWRT-REPLAY-NOT-STARTED; exit 0\nfi\n"
@@ -613,21 +706,36 @@ final class Mu300Ext4Recovery {
                 + "cat \"$R/replay.log\" 2>/dev/null; echo \"$rc\" > \"$R/replay.rc\"; echo OWRT-E2FSCK-RC=$rc; exit 0";
     }
 
-    private static int runReadOnlyFsck(Mu300Internal.Io io, String remote, Candidate c) throws IOException {
+    static String readOnlyFsckScript(String remote, Candidate c) throws IOException {
         String loader = remote + "/" + LOADER_REL, e2fsck = remote + "/" + E2FSCK_REL;
         String libs = remote + "/lib:" + remote + "/usr/lib";
-        String cmd = new String(c.pkg.storageLibrary, StandardCharsets.UTF_8) + "\nset +e\n"
+        String dev = c.devicePath();
+        if (dev.isEmpty() || !c.rootNode.equals(c.device.s.root))
+            throw new IOException("只读核验路径未绑定当前候选节点");
+        long rootSize = Uninstall.sectorsBetween(c.root.start, c.root.end);
+        return new String(c.pkg.storageLibrary, StandardCharsets.UTF_8) + "\nset +e\n"
+                + "D=" + Mu300Internal.q(dev) + "; N=" + Mu300Internal.q(c.rootNode) + "; B=" + DISK_NODE + "\n"
                 + "if [ \"$(mu300_storage_identity " + DISK_NODE + ")\" != " + Mu300Internal.q(c.device.s.cid)
-                + " ] || [ \"$(mu300_storage_parent " + ROOT_NODE + ")\" != " + DISK_NODE
-                + " ] || [ \"$(mu300_storage_part " + ROOT_LABEL + " " + DISK_NODE + ")\" != " + ROOT_NODE
-                + " ] || [ \"$(cat /sys/class/block/" + ROOT_NODE + "/start 2>/dev/null)\" != " + c.root.start
-                + " ] || [ \"$(cat /sys/class/block/" + ROOT_NODE + "/size 2>/dev/null)\" != " + Uninstall.sectorsBetween(c.root.start, c.root.end)
-                + " ] || [ -n \"$(ls -A /sys/class/block/" + ROOT_NODE + "/holders 2>/dev/null)\" ]"
-                + " || awk -v n=\"$(cat /sys/class/block/" + ROOT_NODE + "/dev 2>/dev/null)\" '$3==n {busy=1} END {exit !busy}' /proc/self/mountinfo; then"
+                + " ] || [ \"$(mu300_storage_parent \"$N\")\" != \"$B\" ]"
+                + " || [ \"$(mu300_storage_part " + ROOT_LABEL + " \"$B\")\" != \"$N\" ]"
+                + " || [ \"$(cat /sys/class/block/$B/size 2>/dev/null)\" != " + c.device.s.diskSize + " ]"
+                + " || [ \"$(cat /sys/class/block/$B/queue/logical_block_size 2>/dev/null)\" != " + c.device.s.sectorSize + " ]"
+                + " || [ \"$(cat /sys/class/block/$N/start 2>/dev/null)\" != " + c.root.start
+                + " ] || [ \"$(cat /sys/class/block/$N/size 2>/dev/null)\" != " + rootSize
+                + " ] || ! grep -qx PARTNAME=" + ROOT_LABEL + " /sys/class/block/$N/uevent 2>/dev/null"
+                + " || [ ! -b \"$D\" ] || [ \"$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)\" != " + Mu300Internal.q(c.device.bootId) + " ]"
+                + " || " + gptMismatchConditions(c)
+                + " || " + superblockMismatchCondition(c)
+                + " || [ -n \"$(ls -A /sys/class/block/$N/holders 2>/dev/null)\" ]"
+                + " || awk -v n=\"$(cat /sys/class/block/$N/dev 2>/dev/null)\" '$3==n {busy=1} END {exit !busy}' /proc/self/mountinfo; then"
                 + " echo OWRT-VERIFY-NOT-STARTED; exit 0; fi\n"
                 + "LC_ALL=C " + Mu300Internal.q(loader) + " --library-path " + Mu300Internal.q(libs) + " "
-                + Mu300Internal.q(e2fsck) + " -f -n " + Mu300Internal.q(DEVICE) + " > " + Mu300Internal.q(remote + "/verify.log") + " 2>&1; rc=$?\n"
+                + Mu300Internal.q(e2fsck) + " -f -n \"$D\" > " + Mu300Internal.q(remote + "/verify.log") + " 2>&1; rc=$?\n"
                 + "cat " + Mu300Internal.q(remote + "/verify.log") + " 2>/dev/null; echo OWRT-READONLY-E2FSCK-RC=$rc; exit 0";
+    }
+
+    private static int runReadOnlyFsck(Mu300Internal.Io io, String remote, Candidate c) throws IOException {
+        String cmd = readOnlyFsckScript(remote, c);
         String out = io.sh(cmd, true, 1800, line -> io.status(line));
         if (out.contains("OWRT-VERIFY-NOT-STARTED")) throw new IOException("只读 e2fsck 前的设备/挂载复核失败");
         return parseRc(out, "OWRT-READONLY-E2FSCK-RC=");

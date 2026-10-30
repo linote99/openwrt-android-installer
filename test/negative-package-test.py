@@ -46,6 +46,14 @@ PROFILE_CASES = [
     ('profile mismatch between manifests', lambda zi, zo: copy(zi, zo, patch=relist({
         'files/tf-install.env': sub(b'PROFILE=k1', b'PROFILE=m8')})), '机型不一致'),
 ] if b'"k1"' in ORIG['files/device-profile.json'] else []
+if b'"yuanhang41s"' in ORIG['files/device-profile.json']:
+    PROFILE_CASES.append(('41S profile/model mismatch with hashes recomputed', lambda zi, zo: copy(zi, zo, patch=relist({
+        'files/device-profile.json': sub(b'ZTE 7546N', b'ZTE 9999'),
+        'files/tf-install.env': sub(b'ZTE 7546N', b'ZTE 9999')})), '与机型规则要求的'))
+if b'"changxing60"' in ORIG['files/device-profile.json']:
+    PROFILE_CASES.append(('Changxing60 profile/model mismatch with hashes recomputed', lambda zi, zo: copy(zi, zo, patch=relist({
+        'files/device-profile.json': sub(b'ZTE 7552N', b'ZTE 9999'),
+        'files/tf-install.env': sub(b'ZTE 7552N', b'ZTE 9999')})), '与机型规则要求的'))
 cases = PROFILE_CASES + [
     ('original-compatible prefix folder', lambda zi, zo: copy(zi, zo, rename=lambda n: 'e5-pkg/' + n), 'OK prefix=\'e5-pkg/\''),
     ('tampered installer script', lambda zi, zo: copy(zi, zo, patch={'files/android-tf.sh': lambda d: d + b'\n# x\n'}), '文件校验失败'),

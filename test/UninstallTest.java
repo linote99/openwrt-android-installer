@@ -12,6 +12,7 @@ import java.util.zip.ZipFile;
  */
 public class UninstallTest {
     static int passed, failed;
+    static String syntheticHex32(char c) { char[] x = new char[32]; Arrays.fill(x, c); return new String(x); }
     static void ok(boolean c, String s) { if (c) { passed++; System.out.println("PASS " + s); } else { failed++; System.out.println("FAIL " + s); } }
     static String msg(Throwable t) { return t == null ? "" : String.valueOf(t.getMessage()); }
     interface R { void run() throws Exception; }
@@ -98,7 +99,7 @@ public class UninstallTest {
         ok(trial[1] == 'b' && (trial[12] & 15) == 14 && (trial[14] & 15) == 15, family + " trial control selects other slot once");
         byte[] android = UninstallBoot.androidControl(bc, "a");
         UninstallBoot.checkAndroidHealthy(android, "a"); ok((android[12] & 0xff) == 159 && (android[14] & 0xff) == 30, family + " finish control restores Android slot");
-        Uninstall.Volume v = new Uninstall.Volume(); v.source="/dev/mmcblk0p39"; v.filesystem="ext4"; v.uuid="1234567890abcdef1234567890abcdef"; v.mappingOverhead=0; Uninstall.Device d = new Uninstall.Device(); d.s=new Mu300Internal.Storage(); d.s.node="mmcblk0p39"; d.s.state="unencrypted"; d.s.type=""; Uninstall.eligible(d,v); ok(true, family + " accepts eligible direct unencrypted ext4");
+        Uninstall.Volume v = new Uninstall.Volume(); v.source="/dev/mmcblk0p39"; v.filesystem="ext4"; v.uuid=syntheticHex32('b'); v.mappingOverhead=0; Uninstall.Device d = new Uninstall.Device(); d.s=new Mu300Internal.Storage(); d.s.node="mmcblk0p39"; d.s.state="unencrypted"; d.s.type=""; Uninstall.eligible(d,v); ok(true, family + " accepts eligible direct unencrypted ext4");
         d.s.state="encrypted"; rejects(() -> Uninstall.eligible(d,v), family + " refuses encrypted preservation");
     }
 
@@ -221,15 +222,15 @@ public class UninstallTest {
         File rootDir = new File(work, "lifecycle-root-" + family);
         File dir = new File(rootDir, "record");
         Mu300Internal.deleteTree(rootDir); if (!dir.mkdirs() && !dir.isDirectory()) throw new IOException("mkdir lifecycle");
-        LinkedHashMap<String,Object> r = new LinkedHashMap<>(); r.put("version", 1L); r.put("cid", "0123456789abcdef0123456789abcdef");
+        LinkedHashMap<String,Object> r = new LinkedHashMap<>(); r.put("version", 1L); r.put("cid", syntheticHex32('a'));
         r.put("family", family); r.put("complete", false); r.put("abandoned", false); r.put("stage", "uninstall_offline");
         r.put("plan", new LinkedHashMap<String,Object>()); r.put("uninstall", new LinkedHashMap<String,Object>());
         UninstallRun.Rec rec = new UninstallRun.Rec(dir, r); rec.save();
         ok(UninstallRun.pending(rootDir) != null, family + " pending record is discoverable");
         UninstallRun.Rec loaded = UninstallRun.load(dir); loaded.r.put("complete", true); loaded.stage("complete", null, null);
         ok(UninstallRun.pending(rootDir) == null, family + " completed record leaves pending queue");
-        loaded.r.put("complete", false); loaded.r.put("cid", "fedcba9876543210fedcba9876543210"); loaded.save();
-        ok(!loaded.s("cid").equals("0123456789abcdef0123456789abcdef"), family + " changed CID is not silently rebound");
+        loaded.r.put("complete", false); loaded.r.put("cid", syntheticHex32('f')); loaded.save();
+        ok(!loaded.s("cid").equals(syntheticHex32('a')), family + " changed CID is not silently rebound");
     }
     public static void main(String[] args) throws Exception {
         File work = new File(args.length > 0 ? args[0] : "build-test/uninstall"); Mu300Internal.deleteTree(work); if (!work.mkdirs()) throw new IOException("mkdir " + work);
